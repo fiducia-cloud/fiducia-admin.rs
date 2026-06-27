@@ -68,7 +68,12 @@ async fn main() {
         .route("/infra", get(infra_page))
         .route("/infra/scale", post(scale))
         .with_state(state)
-        .layer(TraceLayer::new_for_http());
+        // Hardening stack (outermost last): catch handler panics → 500, bound
+        // request time, and cap body size.
+        .layer(TraceLayer::new_for_http())
+        .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(CatchPanicLayer::new());
 
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8096);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

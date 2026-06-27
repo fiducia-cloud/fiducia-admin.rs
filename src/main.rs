@@ -29,11 +29,20 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tower_http::trace::TraceLayer;
+use std::time::Duration;
+use tower_http::{
+    catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 
 use session::Session;
 
 const SERVICE: &str = "fiducia-admin";
+
+/// Bound request handling time (slow-loris / hung-upstream protection).
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Cap request bodies (HTML form posts are tiny).
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
 struct AppState {
     auth_url: String,

@@ -156,3 +156,33 @@ pub fn infra(s: &Session, nodes: &[Value], placement: &[Value]) -> String {
     );
     page("Infra", Some(s), &body)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn esc_neutralizes_markup() {
+        assert_eq!(esc(r#"<script>&"'"#), "&lt;script&gt;&amp;&quot;&#x27;");
+        assert_eq!(esc("plain-name"), "plain-name");
+    }
+
+    #[test]
+    fn key_names_are_escaped_in_the_table() {
+        let s = Session {
+            user_id: "u".into(),
+            email: Some("a@b.c".into()),
+            orgs: vec!["org".into()],
+            is_admin: false,
+        };
+        let keys = vec![json!({
+            "name": "<script>alert(1)</script>",
+            "env": "live",
+            "key_id": "abc123",
+        })];
+        let html = keys(&s, &keys);
+        assert!(!html.contains("<script>alert(1)</script>"), "raw payload leaked");
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    }
+}

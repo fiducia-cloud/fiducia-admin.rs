@@ -117,10 +117,10 @@ pub fn keys(s: &Session, keys: &[Value]) -> String {
                 format!(
                     r#"<tr><td>{}</td><td><span class="tag">{}</span></td><td class="muted">{}</td>
 <td><form method="post" action="/keys/{}/revoke"><button class="btn btn--ghost">Revoke</button></form></td></tr>"#,
-                    k.get("name").and_then(Value::as_str).unwrap_or("—"),
-                    k.get("env").and_then(Value::as_str).unwrap_or("live"),
-                    k.get("key_id").and_then(Value::as_str).unwrap_or("—"),
-                    k.get("key_id").and_then(Value::as_str).unwrap_or(""),
+                    esc(k.get("name").and_then(Value::as_str).unwrap_or("—")),
+                    esc(k.get("env").and_then(Value::as_str).unwrap_or("live")),
+                    esc(k.get("key_id").and_then(Value::as_str).unwrap_or("—")),
+                    esc(k.get("key_id").and_then(Value::as_str).unwrap_or("")),
                 )
             })
             .collect::<String>()

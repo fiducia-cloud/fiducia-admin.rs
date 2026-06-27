@@ -60,7 +60,7 @@ pub fn page(title: &str, session: Option<&Session>, body: &str) -> String {
     let who = match session {
         Some(s) => format!(
             r#"<span class="who">{}{}</span>"#,
-            s.email.clone().unwrap_or_else(|| s.user_id.clone()),
+            esc(&s.email.clone().unwrap_or_else(|| s.user_id.clone())),
             if s.is_admin { " · admin" } else { "" }
         ),
         None => String::new(),

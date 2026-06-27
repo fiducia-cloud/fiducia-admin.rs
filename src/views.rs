@@ -53,7 +53,9 @@ pub fn page(title: &str, session: Option<&Session>, body: &str) -> String {
         } else {
             ""
         };
-        format!(r#"<a href="/">Dashboard</a><a href="/keys">API keys</a><a href="/account">Account</a>{admin}"#)
+        format!(
+            r#"<a href="/">Dashboard</a><a href="/keys">API keys</a><a href="/account">Account</a>{admin}"#
+        )
     } else {
         r#"<a href="/login">Sign in</a>"#.to_string()
     };
@@ -95,7 +97,11 @@ pub fn dashboard(s: &Session) -> String {
 {}</div>"#,
         esc(&s.email.clone().unwrap_or_else(|| s.user_id.clone())),
         esc(&s.orgs.join(", ")),
-        if s.is_admin { r#"<p><a href="/infra">Cluster &amp; infra ops →</a></p>"# } else { "" }
+        if s.is_admin {
+            r#"<p><a href="/infra">Cluster &amp; infra ops →</a></p>"#
+        } else {
+            ""
+        }
     );
     page("Dashboard", Some(s), &body)
 }
@@ -182,7 +188,10 @@ mod tests {
             "key_id": "abc123",
         })];
         let html = keys(&s, &key_list);
-        assert!(!html.contains("<script>alert(1)</script>"), "raw payload leaked");
+        assert!(
+            !html.contains("<script>alert(1)</script>"),
+            "raw payload leaked"
+        );
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     }
 }

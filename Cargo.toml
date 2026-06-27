@@ -16,5 +16,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Shared OpenTelemetry + tracing setup (one init() for all services).
 fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.rs", tag = "v0.1.0" }
 
+# Shared API payload contract generated from fiducia-interfaces.
+fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
+
 # NOTE: calling fiducia-auth (sessions/keys) and fiducia-brain (infra) needs an
 # HTTP client (reqwest). Stubbed in src/upstream.rs to keep the skeleton light.

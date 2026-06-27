@@ -41,12 +41,14 @@ struct AppState {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
     let state = Arc::new(AppState {
-        auth_url: std::env::var("FIDUCIA_AUTH_URL").unwrap_or_else(|_| "http://localhost:8097".into()),
-        brain_url: std::env::var("FIDUCIA_BRAIN_URL").unwrap_or_else(|_| "http://localhost:8095".into()),
+        auth_url: std::env::var("FIDUCIA_AUTH_URL")
+            .unwrap_or_else(|_| "http://localhost:8097".into()),
+        brain_url: std::env::var("FIDUCIA_BRAIN_URL")
+            .unwrap_or_else(|_| "http://localhost:8095".into()),
     });
 
     let app = Router::new()
@@ -61,11 +63,15 @@ async fn main() {
         .with_state(state)
         .layer(TraceLayer::new_for_http());
 
-    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8096);
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8096);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("{SERVICE} listening on http://{addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
 }
 
 async fn health() -> Json<Value> {
@@ -78,7 +84,9 @@ fn redirect(to: &str) -> Response {
 
 /// Require any signed-in user, else redirect to /login.
 async fn require(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {
-    session::current(headers, &st.auth_url).await.ok_or_else(|| redirect("/login"))
+    session::current(headers, &st.auth_url)
+        .await
+        .ok_or_else(|| redirect("/login"))
 }
 
 /// Require the admin role, else 403.
@@ -87,7 +95,15 @@ async fn require_admin(headers: &HeaderMap, st: &AppState) -> Result<Session, Re
     if s.is_admin {
         Ok(s)
     } else {
-        Err((StatusCode::FORBIDDEN, Html(views::page("Forbidden", Some(&s), "<h1>403</h1><p class=\"muted\">Admin role required.</p>"))).into_response())
+        Err((
+            StatusCode::FORBIDDEN,
+            Html(views::page(
+                "Forbidden",
+                Some(&s),
+                "<h1>403</h1><p class=\"muted\">Admin role required.</p>",
+            )),
+        )
+            .into_response())
     }
 }
 
@@ -110,7 +126,10 @@ async fn account(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respons
 }
 
 async fn keys_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let s = match require(&headers, &st).await { Ok(s) => s, Err(r) => return r };
+    let s = match require(&headers, &st).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let org = s.orgs.first().cloned().unwrap_or_default();
     let keys = upstream::list_keys(&st.auth_url, &org).await;
     Html(views::keys(&s, &keys)).into_response()
@@ -126,7 +145,10 @@ async fn create_key(
     headers: HeaderMap,
     Form(form): Form<CreateKeyForm>,
 ) -> Response {
-    let s = match require(&headers, &st).await { Ok(s) => s, Err(r) => return r };
+    let s = match require(&headers, &st).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let org = s.orgs.first().cloned().unwrap_or_default();
     let _ = upstream::create_key(&st.auth_url, &org, &form.name).await;
     // TODO: surface the raw key once on a confirmation page.
@@ -138,14 +160,20 @@ async fn revoke_key(
     headers: HeaderMap,
     Path(key_id): Path<String>,
 ) -> Response {
-    let s = match require(&headers, &st).await { Ok(s) => s, Err(r) => return r };
+    let s = match require(&headers, &st).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let org = s.orgs.first().cloned().unwrap_or_default();
     let _ = upstream::revoke_key(&st.auth_url, &org, &key_id).await;
     redirect("/keys")
 }
 
 async fn infra_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let s = match require_admin(&headers, &st).await { Ok(s) => s, Err(r) => return r };
+    let s = match require_admin(&headers, &st).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
     let nodes = upstream::nodes(&st.brain_url).await;
     let placement = upstream::placement(&st.brain_url).await;
     Html(views::infra(&s, &nodes, &placement)).into_response()

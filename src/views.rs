@@ -1,12 +1,31 @@
 //! Server-rendered HTML (skeleton).
 //!
-//! Plain Rust string templates to stay dependency-light. For a real build, move
-//! to a compile-checked template engine (`maud`/`askama`) and HTML-escape all
-//! dynamic values (the stubbed data here is static, so escaping is a `TODO`).
+//! Plain Rust string templates to stay dependency-light. For a real build,
+//! consider a compile-checked template engine (`maud`/`askama`). All dynamic
+//! values are routed through [`esc`] so untrusted input (API key names, session
+//! email/org ids from the IdP) cannot inject markup.
 
 use serde_json::Value;
 
 use crate::session::Session;
+
+/// HTML-escape a value for use in text and double-quoted attribute contexts.
+/// Cheap, no deps — every dynamic interpolation below goes through this so a key
+/// name like `<script>…` renders inert instead of executing (stored XSS).
+fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
 
 const CSS: &str = r#"
 :root{--bg:#0a1024;--panel:#121a36;--line:#243066;--ink:#e9ecf8;--dim:#9aa3c7;--grad:linear-gradient(135deg,#c084fc,#6366f1)}
@@ -41,7 +60,7 @@ pub fn page(title: &str, session: Option<&Session>, body: &str) -> String {
     let who = match session {
         Some(s) => format!(
             r#"<span class="who">{}{}</span>"#,
-            s.email.clone().unwrap_or_else(|| s.user_id.clone()),
+            esc(&s.email.clone().unwrap_or_else(|| s.user_id.clone())),
             if s.is_admin { " · admin" } else { "" }
         ),
         None => String::new(),
@@ -74,8 +93,8 @@ pub fn dashboard(s: &Session) -> String {
 <p class="muted">Signed in as <b>{}</b>. Orgs: {}.</p>
 <p><a href="/keys">Manage API keys →</a></p>
 {}</div>"#,
-        s.email.clone().unwrap_or_else(|| s.user_id.clone()),
-        s.orgs.join(", "),
+        esc(&s.email.clone().unwrap_or_else(|| s.user_id.clone())),
+        esc(&s.orgs.join(", ")),
         if s.is_admin { r#"<p><a href="/infra">Cluster &amp; infra ops →</a></p>"# } else { "" }
     );
     page("Dashboard", Some(s), &body)
@@ -98,10 +117,10 @@ pub fn keys(s: &Session, keys: &[Value]) -> String {
                 format!(
                     r#"<tr><td>{}</td><td><span class="tag">{}</span></td><td class="muted">{}</td>
 <td><form method="post" action="/keys/{}/revoke"><button class="btn btn--ghost">Revoke</button></form></td></tr>"#,
-                    k.get("name").and_then(Value::as_str).unwrap_or("—"),
-                    k.get("env").and_then(Value::as_str).unwrap_or("live"),
-                    k.get("key_id").and_then(Value::as_str).unwrap_or("—"),
-                    k.get("key_id").and_then(Value::as_str).unwrap_or(""),
+                    esc(k.get("name").and_then(Value::as_str).unwrap_or("—")),
+                    esc(k.get("env").and_then(Value::as_str).unwrap_or("live")),
+                    esc(k.get("key_id").and_then(Value::as_str).unwrap_or("—")),
+                    esc(k.get("key_id").and_then(Value::as_str).unwrap_or("")),
                 )
             })
             .collect::<String>()
@@ -136,4 +155,34 @@ pub fn infra(s: &Session, nodes: &[Value], placement: &[Value]) -> String {
         placement.len()
     );
     page("Infra", Some(s), &body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn esc_neutralizes_markup() {
+        assert_eq!(esc(r#"<script>&"'"#), "&lt;script&gt;&amp;&quot;&#x27;");
+        assert_eq!(esc("plain-name"), "plain-name");
+    }
+
+    #[test]
+    fn key_names_are_escaped_in_the_table() {
+        let s = Session {
+            user_id: "u".into(),
+            email: Some("a@b.c".into()),
+            orgs: vec!["org".into()],
+            is_admin: false,
+        };
+        let key_list = vec![json!({
+            "name": "<script>alert(1)</script>",
+            "env": "live",
+            "key_id": "abc123",
+        })];
+        let html = keys(&s, &key_list);
+        assert!(!html.contains("<script>alert(1)</script>"), "raw payload leaked");
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    }
 }

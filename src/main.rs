@@ -29,11 +29,20 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tower_http::trace::TraceLayer;
+use std::time::Duration;
+use tower_http::{
+    catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 
 use session::Session;
 
 const SERVICE: &str = "fiducia-admin";
+
+/// Bound request handling time (slow-loris / hung-upstream protection).
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Cap request bodies (HTML form posts are tiny).
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
 struct AppState {
     auth_url: String,
@@ -59,7 +68,12 @@ async fn main() {
         .route("/infra", get(infra_page))
         .route("/infra/scale", post(scale))
         .with_state(state)
-        .layer(TraceLayer::new_for_http());
+        // Hardening stack (outermost last): catch handler panics → 500, bound
+        // request time, and cap body size.
+        .layer(TraceLayer::new_for_http())
+        .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(CatchPanicLayer::new());
 
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8096);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

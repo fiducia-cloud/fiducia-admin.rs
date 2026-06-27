@@ -43,6 +43,11 @@ through `fiducia-auth`.
 FIDUCIA_ADMIN_DEV_SESSION=admin cargo run    # :8096, click through the UI without real auth
 ```
 
+> **Security:** `FIDUCIA_ADMIN_DEV_SESSION` is a full auth bypass (any request
+> becomes that user). It is honored **only in debug builds**. A release binary
+> ignores it and logs an error, unless you also set
+> `FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1` — never do that in production.
+
 Env: `PORT`, `FIDUCIA_AUTH_URL`, `FIDUCIA_BRAIN_URL`, `OTEL_EXPORTER_OTLP_ENDPOINT`.
 Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-telemetry.rs).
 

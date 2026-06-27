@@ -93,8 +93,8 @@ pub fn dashboard(s: &Session) -> String {
 <p class="muted">Signed in as <b>{}</b>. Orgs: {}.</p>
 <p><a href="/keys">Manage API keys →</a></p>
 {}</div>"#,
-        s.email.clone().unwrap_or_else(|| s.user_id.clone()),
-        s.orgs.join(", "),
+        esc(&s.email.clone().unwrap_or_else(|| s.user_id.clone())),
+        esc(&s.orgs.join(", ")),
         if s.is_admin { r#"<p><a href="/infra">Cluster &amp; infra ops →</a></p>"# } else { "" }
     );
     page("Dashboard", Some(s), &body)

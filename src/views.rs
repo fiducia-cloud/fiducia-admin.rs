@@ -176,12 +176,12 @@ mod tests {
             orgs: vec!["org".into()],
             is_admin: false,
         };
-        let keys = vec![json!({
+        let key_list = vec![json!({
             "name": "<script>alert(1)</script>",
             "env": "live",
             "key_id": "abc123",
         })];
-        let html = keys(&s, &keys);
+        let html = keys(&s, &key_list);
         assert!(!html.contains("<script>alert(1)</script>"), "raw payload leaked");
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
     }

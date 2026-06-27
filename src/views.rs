@@ -1,12 +1,31 @@
 //! Server-rendered HTML (skeleton).
 //!
-//! Plain Rust string templates to stay dependency-light. For a real build, move
-//! to a compile-checked template engine (`maud`/`askama`) and HTML-escape all
-//! dynamic values (the stubbed data here is static, so escaping is a `TODO`).
+//! Plain Rust string templates to stay dependency-light. For a real build,
+//! consider a compile-checked template engine (`maud`/`askama`). All dynamic
+//! values are routed through [`esc`] so untrusted input (API key names, session
+//! email/org ids from the IdP) cannot inject markup.
 
 use serde_json::Value;
 
 use crate::session::Session;
+
+/// HTML-escape a value for use in text and double-quoted attribute contexts.
+/// Cheap, no deps — every dynamic interpolation below goes through this so a key
+/// name like `<script>…` renders inert instead of executing (stored XSS).
+fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
 
 const CSS: &str = r#"
 :root{--bg:#0a1024;--panel:#121a36;--line:#243066;--ink:#e9ecf8;--dim:#9aa3c7;--grad:linear-gradient(135deg,#c084fc,#6366f1)}

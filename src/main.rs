@@ -164,8 +164,9 @@ async fn create_key(
         Err(r) => return r,
     };
     let org = s.orgs.first().cloned().unwrap_or_default();
-    let _ = upstream::create_key(&st.auth_url, &org, &form.name).await;
-    // TODO: surface the raw key once on a confirmation page.
+    let _ = upstream::create_key(&st.auth_url, s.token.as_deref(), &org, &form.name).await;
+    // The raw key is returned once in the response; surfacing it on a one-time
+    // confirmation page is a view concern tracked separately.
     redirect("/keys")
 }
 

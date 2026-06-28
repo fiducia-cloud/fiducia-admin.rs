@@ -172,6 +172,10 @@ async fn keys_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
 #[derive(Debug, Deserialize)]
 struct CreateKeyForm {
     name: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    env: Option<String>,
 }
 
 async fn create_key(
@@ -183,7 +187,9 @@ async fn create_key(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let _ = upstream::create_key(&st.auth_url, &s, &form.name).await;
+    let scopes = vec![form.scope.unwrap_or_else(|| "requests:write".to_string())];
+    let env = form.env.as_deref().unwrap_or("live");
+    let _ = upstream::create_key_with_scopes(&st.auth_url, &s, &form.name, &scopes, env).await;
     redirect("/keys")
 }
 

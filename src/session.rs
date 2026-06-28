@@ -29,9 +29,7 @@ pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
         }
     }
 
-    let Some(role) = std::env::var("FIDUCIA_ADMIN_DEV_SESSION").ok() else {
-        return None;
-    };
+    let role = std::env::var("FIDUCIA_ADMIN_DEV_SESSION").ok()?;
 
     if !dev_session_allowed() {
         tracing::error!(
@@ -163,5 +161,45 @@ mod tests {
         );
 
         assert_eq!(session_cookie(&headers).as_deref(), Some("jwt.123"));
+    }
+
+    #[test]
+    fn session_cookie_ignores_empty_fiducia_session_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_static("fiducia_session= ; theme=dark"),
+        );
+
+        assert_eq!(session_cookie(&headers), None);
+    }
+
+    #[test]
+    fn session_cookie_scans_all_cookie_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append("cookie", HeaderValue::from_static("theme=dark"));
+        headers.append(
+            "cookie",
+            HeaderValue::from_static("fiducia_session=jwt.456"),
+        );
+
+        assert_eq!(session_cookie(&headers).as_deref(), Some("jwt.456"));
+    }
+
+    #[test]
+    fn env_list_contains_trims_items_and_ignores_blanks() {
+        std::env::set_var(
+            "FIDUCIA_ADMIN_TEST_LIST",
+            " admin@example.com, ,owner@example.com ",
+        );
+
+        assert!(env_list_contains(
+            "FIDUCIA_ADMIN_TEST_LIST",
+            "owner@example.com"
+        ));
+        assert!(!env_list_contains(
+            "FIDUCIA_ADMIN_TEST_LIST",
+            "missing@example.com"
+        ));
     }
 }

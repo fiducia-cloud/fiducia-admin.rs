@@ -27,19 +27,45 @@ pub async fn list_keys(auth_url: &str, session: &Session) -> Vec<Value> {
     }
 }
 
-/// `fiducia-auth`: create a key. Returns the raw key (shown once) + meta.
-pub async fn create_key(auth_url: &str, session: &Session, name: &str) -> Value {
+/// `fiducia-auth`: create a scoped key. Returns the raw key (shown once) + meta.
+pub async fn create_key_with_scopes(
+    auth_url: &str,
+    session: &Session,
+    name: &str,
+    scopes: &[String],
+    env: &str,
+) -> Value {
     let Some(token) = session.bearer_token.as_deref() else {
         return json!({ "error": "missing_bearer_session" });
+    };
+    let scopes = normalized_scopes(scopes);
+    let env = match env.trim() {
+        "" => "live",
+        value => value,
     };
     let url = format!("{}/v1/keys", auth_url.trim_end_matches('/'));
     post_json(
         url,
         Some(token),
-        json!({ "name": name, "org_id": session.orgs.first(), "scopes": [], "env": "live" }),
+        json!({ "name": name, "org_id": session.orgs.first(), "scopes": scopes, "env": env }),
     )
     .await
     .unwrap_or_else(|err| json!({ "error": "upstream_failed", "detail": err.to_string() }))
+}
+
+fn normalized_scopes(scopes: &[String]) -> Vec<String> {
+    let mut out = scopes
+        .iter()
+        .map(|scope| scope.trim())
+        .filter(|scope| !scope.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if out.is_empty() {
+        out.push("requests:write".to_string());
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// `fiducia-auth`: revoke a key.

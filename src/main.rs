@@ -145,7 +145,7 @@ async fn keys_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         Err(r) => return r,
     };
     let org = s.orgs.first().cloned().unwrap_or_default();
-    let keys = upstream::list_keys(&st.auth_url, &org).await;
+    let keys = upstream::list_keys(&st.auth_url, s.token.as_deref(), &org).await;
     Html(views::keys(&s, &keys)).into_response()
 }
 
@@ -164,8 +164,9 @@ async fn create_key(
         Err(r) => return r,
     };
     let org = s.orgs.first().cloned().unwrap_or_default();
-    let _ = upstream::create_key(&st.auth_url, &org, &form.name).await;
-    // TODO: surface the raw key once on a confirmation page.
+    let _ = upstream::create_key(&st.auth_url, s.token.as_deref(), &org, &form.name).await;
+    // The raw key is returned once in the response; surfacing it on a one-time
+    // confirmation page is a view concern tracked separately.
     redirect("/keys")
 }
 
@@ -179,7 +180,7 @@ async fn revoke_key(
         Err(r) => return r,
     };
     let org = s.orgs.first().cloned().unwrap_or_default();
-    let _ = upstream::revoke_key(&st.auth_url, &org, &key_id).await;
+    let _ = upstream::revoke_key(&st.auth_url, s.token.as_deref(), &org, &key_id).await;
     redirect("/keys")
 }
 

@@ -145,7 +145,7 @@ async fn keys_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         Err(r) => return r,
     };
     let org = s.orgs.first().cloned().unwrap_or_default();
-    let keys = upstream::list_keys(&st.auth_url, &org).await;
+    let keys = upstream::list_keys(&st.auth_url, s.token.as_deref(), &org).await;
     Html(views::keys(&s, &keys)).into_response()
 }
 

@@ -180,7 +180,7 @@ async fn revoke_key(
         Err(r) => return r,
     };
     let org = s.orgs.first().cloned().unwrap_or_default();
-    let _ = upstream::revoke_key(&st.auth_url, &org, &key_id).await;
+    let _ = upstream::revoke_key(&st.auth_url, s.token.as_deref(), &org, &key_id).await;
     redirect("/keys")
 }
 

@@ -33,9 +33,9 @@ through `fiducia-auth`.
 | File | Responsibility |
 |------|----------------|
 | `src/main.rs` | routes + role gating (`require` / `require_admin`) |
-| `src/views.rs` | server-rendered HTML (plain templates; `TODO`: maud/askama + escaping) |
+| `src/views.rs` | server-rendered HTML templates |
 | `src/session.rs` | Supabase session resolution (verified via fiducia-auth) |
-| `src/upstream.rs` | calls to fiducia-auth / fiducia-brain (stubbed) |
+| `src/upstream.rs` | HTTP calls to fiducia-auth / fiducia-brain |
 
 ## Run locally
 

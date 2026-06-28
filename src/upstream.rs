@@ -1,40 +1,119 @@
-//! Calls to the other fiducia services (skeleton).
+//! Calls to the other fiducia services.
 //!
 //! The admin app is a thin web tier: it renders HTML but the data and actions
 //! live elsewhere — **accounts/API keys** in `fiducia-auth`, **infra** in
-//! `fiducia-brain`. These are stubbed; wire them with an HTTP client (reqwest)
-//! plus the caller's session for authz.
+//! `fiducia-brain`.
 
 use serde_json::{json, Value};
 
-/// `fiducia-auth`: list an org's API keys (masked).
-/// TODO: GET `{auth_url}/v1/keys` with the user's session.
-pub async fn list_keys(_auth_url: &str, _org: &str) -> Vec<Value> {
-    vec![]
+use crate::session::Session;
+
+/// `fiducia-auth`: list the caller's org API keys (masked).
+pub async fn list_keys(auth_url: &str, session: &Session) -> Vec<Value> {
+    let Some(token) = session.bearer_token.as_deref() else {
+        return vec![];
+    };
+    let url = format!("{}/v1/keys", auth_url.trim_end_matches('/'));
+    match get_json(reqwest::Client::new().get(url).bearer_auth(token)).await {
+        Ok(value) => value
+            .get("keys")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to list API keys via fiducia-auth");
+            vec![]
+        }
+    }
 }
 
 /// `fiducia-auth`: create a key. Returns the raw key (shown once) + meta.
-/// TODO: POST `{auth_url}/v1/keys`.
-pub async fn create_key(_auth_url: &str, _org: &str, _name: &str) -> Value {
-    json!({ "todo": "create via fiducia-auth" })
+pub async fn create_key(auth_url: &str, session: &Session, name: &str) -> Value {
+    let Some(token) = session.bearer_token.as_deref() else {
+        return json!({ "error": "missing_bearer_session" });
+    };
+    let url = format!("{}/v1/keys", auth_url.trim_end_matches('/'));
+    post_json(
+        url,
+        Some(token),
+        json!({ "name": name, "org_id": session.orgs.first(), "scopes": [], "env": "live" }),
+    )
+    .await
+    .unwrap_or_else(|err| json!({ "error": "upstream_failed", "detail": err.to_string() }))
 }
 
-/// `fiducia-auth`: revoke a key. TODO: DELETE `{auth_url}/v1/keys/{id}`.
-pub async fn revoke_key(_auth_url: &str, _org: &str, _key_id: &str) -> bool {
-    false
+/// `fiducia-auth`: revoke a key.
+pub async fn revoke_key(auth_url: &str, session: &Session, key_id: &str) -> bool {
+    let Some(token) = session.bearer_token.as_deref() else {
+        return false;
+    };
+    let url = format!("{}/v1/keys/{}", auth_url.trim_end_matches('/'), key_id);
+    match get_json(reqwest::Client::new().delete(url).bearer_auth(token)).await {
+        Ok(value) => value
+            .get("revoked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        Err(err) => {
+            tracing::warn!(error = %err, key_id, "failed to revoke API key via fiducia-auth");
+            false
+        }
+    }
 }
 
-/// `fiducia-brain`: cluster membership. TODO: GET `{brain_url}/v1/nodes`.
-pub async fn nodes(_brain_url: &str) -> Vec<Value> {
-    vec![]
+/// `fiducia-brain`: cluster membership.
+pub async fn nodes(brain_url: &str) -> Vec<Value> {
+    get_array(brain_url, "/v1/nodes", "nodes").await
 }
 
-/// `fiducia-brain`: shard placement map. TODO: GET `{brain_url}/v1/placement`.
-pub async fn placement(_brain_url: &str) -> Vec<Value> {
-    vec![]
+/// `fiducia-brain`: shard placement map.
+pub async fn placement(brain_url: &str) -> Vec<Value> {
+    get_array(brain_url, "/v1/placement", "shards").await
 }
 
-/// `fiducia-brain`: set the desired scale plan. TODO: POST `{brain_url}/v1/scale`.
-pub async fn set_scale(_brain_url: &str, _target_nodes: u32) -> bool {
-    false
+/// `fiducia-brain`: set the desired scale plan.
+pub async fn set_scale(brain_url: &str, target_nodes: u32) -> bool {
+    let url = format!("{}/v1/scale", brain_url.trim_end_matches('/'));
+    post_json(
+        url,
+        None,
+        json!({ "target_nodes": target_nodes, "replication_factor": 3 }),
+    )
+    .await
+    .map(|value| value.get("ok").and_then(Value::as_bool).unwrap_or(false))
+    .unwrap_or(false)
+}
+
+async fn get_array(base_url: &str, path: &str, field: &str) -> Vec<Value> {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    match get_json(reqwest::Client::new().get(url)).await {
+        Ok(value) => value
+            .get(field)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        Err(err) => {
+            tracing::warn!(error = %err, path, "failed to fetch admin upstream data");
+            vec![]
+        }
+    }
+}
+
+async fn get_json(
+    request: reqwest::RequestBuilder,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(request.send().await?.error_for_status()?.json().await?)
+}
+
+async fn post_json(
+    url: String,
+    bearer: Option<&str>,
+    body: Value,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::new();
+    let mut request = client.post(url).json(&body);
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    let value = request.send().await?.error_for_status()?.json().await?;
+    Ok(value)
 }

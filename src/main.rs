@@ -9,9 +9,9 @@
 //! authenticated app — distinct from `fiducia-backend`, which serves the public
 //! marketing site.
 //!
-//! Skeleton: routing + HTML are real; session verification and the upstream
-//! calls are stubbed (`FIDUCIA_ADMIN_DEV_SESSION=admin|user` lets you click
-//! through the UI). See `session.rs` / `upstream.rs`.
+//! Routing, HTML, session verification, and upstream service calls are wired.
+//! `FIDUCIA_ADMIN_DEV_SESSION=admin|user` remains available as an explicit local
+//! development bypass.
 
 mod session;
 mod upstream;
@@ -22,7 +22,10 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Form, Path, State},
-    http::{header::LOCATION, HeaderMap, StatusCode},
+    http::{
+        header::{LOCATION, SET_COOKIE},
+        HeaderMap, StatusCode,
+    },
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -62,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/healthz", get(health))
-        .route("/login", get(login))
+        .route("/login", get(login).post(login_submit))
         .route("/", get(dashboard))
         .route("/account", get(account))
         .route("/keys", get(keys_page).post(create_key))
@@ -125,6 +128,24 @@ async fn login() -> Html<String> {
     Html(views::login())
 }
 
+#[derive(Debug, Deserialize)]
+struct LoginForm {
+    token: String,
+}
+
+async fn login_submit(Form(form): Form<LoginForm>) -> Response {
+    let token = form.token.trim();
+    if token.is_empty() {
+        return redirect("/login");
+    }
+    let cookie = format!("fiducia_session={token}; Path=/; HttpOnly; SameSite=Lax");
+    (
+        StatusCode::SEE_OTHER,
+        [(LOCATION, "/".to_string()), (SET_COOKIE, cookie)],
+    )
+        .into_response()
+}
+
 async fn dashboard(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     match require(&headers, &st).await {
         Ok(s) => Html(views::dashboard(&s)).into_response(),
@@ -144,14 +165,17 @@ async fn keys_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         Ok(s) => s,
         Err(r) => return r,
     };
-    let org = s.orgs.first().cloned().unwrap_or_default();
-    let keys = upstream::list_keys(&st.auth_url, s.token.as_deref(), &org).await;
+    let keys = upstream::list_keys(&st.auth_url, &s).await;
     Html(views::keys(&s, &keys)).into_response()
 }
 
 #[derive(Debug, Deserialize)]
 struct CreateKeyForm {
     name: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    env: Option<String>,
 }
 
 async fn create_key(
@@ -163,10 +187,9 @@ async fn create_key(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let org = s.orgs.first().cloned().unwrap_or_default();
-    let _ = upstream::create_key(&st.auth_url, s.token.as_deref(), &org, &form.name).await;
-    // The raw key is returned once in the response; surfacing it on a one-time
-    // confirmation page is a view concern tracked separately.
+    let scopes = vec![form.scope.unwrap_or_else(|| "requests:write".to_string())];
+    let env = form.env.as_deref().unwrap_or("live");
+    let _ = upstream::create_key_with_scopes(&st.auth_url, &s, &form.name, &scopes, env).await;
     redirect("/keys")
 }
 
@@ -179,8 +202,7 @@ async fn revoke_key(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let org = s.orgs.first().cloned().unwrap_or_default();
-    let _ = upstream::revoke_key(&st.auth_url, s.token.as_deref(), &org, &key_id).await;
+    let _ = upstream::revoke_key(&st.auth_url, &s, &key_id).await;
     redirect("/keys")
 }
 

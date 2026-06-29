@@ -1,4 +1,4 @@
-//! Server-rendered HTML (skeleton).
+//! Server-rendered HTML.
 //!
 //! Plain Rust string templates to stay dependency-light. For a real build,
 //! consider a compile-checked template engine (`maud`/`askama`). All dynamic
@@ -81,9 +81,13 @@ pub fn login() -> String {
 <div class="card">
   <p class="muted">Authenticate with your Supabase account. The dashboard verifies the
   session via <code>fiducia-auth</code>.</p>
-  <p class="muted">TODO: embed the Supabase JS client here; on success store the session
-  cookie and redirect to <code>/</code>.</p>
-  <p><a class="btn" href="/">Continue (dev)</a></p>
+  <form method="post" action="/login">
+    <label>Supabase access token</label>
+    <input name="token" type="password" autocomplete="current-password" required>
+    <button class="btn">Sign in</button>
+  </form>
+  <p class="muted">For local development, <code>FIDUCIA_ADMIN_DEV_SESSION=admin</code>
+  still enables the explicit dev bypass.</p>
 </div>"#;
     page("Sign in", None, body)
 }
@@ -107,25 +111,50 @@ pub fn dashboard(s: &Session) -> String {
 }
 
 pub fn account(s: &Session) -> String {
-    let body = r#"<h1>Account</h1>
+    let orgs = if s.orgs.is_empty() {
+        r#"<p class="muted">No organizations are attached to this session.</p>"#.to_string()
+    } else {
+        format!(
+            "<ul>{}</ul>",
+            s.orgs
+                .iter()
+                .map(|org| format!("<li>{}</li>", esc(org)))
+                .collect::<String>()
+        )
+    };
+    let body = format!(
+        r#"<h1>Account</h1>
 <div class="card"><h2>Organization &amp; members</h2>
-<p class="muted">TODO: org details + member management (invite/remove, roles), backed by
-Supabase. Identity comes from the verified session.</p></div>"#;
-    page("Account", Some(s), body)
+<p class="muted">Identity and organization membership come from the verified session.</p>
+{orgs}</div>"#
+    );
+    page("Account", Some(s), &body)
 }
 
 pub fn keys(s: &Session, keys: &[Value]) -> String {
     let rows = if keys.is_empty() {
-        r#"<tr><td colspan="4" class="muted">No keys yet — create one above. (Live data comes from fiducia-auth.)</td></tr>"#.to_string()
+        r#"<tr><td colspan="5" class="muted">No keys yet — create one above. (Live data comes from fiducia-auth.)</td></tr>"#.to_string()
     } else {
         keys.iter()
             .map(|k| {
+                let scopes = k
+                    .get("scopes")
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_else(|| "—".to_string());
                 format!(
-                    r#"<tr><td>{}</td><td><span class="tag">{}</span></td><td class="muted">{}</td>
+                    r#"<tr><td>{}</td><td><span class="tag">{}</span></td><td class="muted">{}</td><td class="muted">{}</td>
 <td><form method="post" action="/keys/{}/revoke"><button class="btn btn--ghost">Revoke</button></form></td></tr>"#,
                     esc(k.get("name").and_then(Value::as_str).unwrap_or("—")),
                     esc(k.get("env").and_then(Value::as_str).unwrap_or("live")),
                     esc(k.get("key_id").and_then(Value::as_str).unwrap_or("—")),
+                    esc(&scopes),
                     esc(k.get("key_id").and_then(Value::as_str).unwrap_or("")),
                 )
             })
@@ -134,13 +163,28 @@ pub fn keys(s: &Session, keys: &[Value]) -> String {
     let body = format!(
         r#"<h1>API keys</h1>
 <div class="card"><h2>Create a key</h2>
-<form method="post" action="/keys" style="display:flex;gap:.6rem">
+<form method="post" action="/keys" style="display:flex;gap:.6rem;flex-wrap:wrap">
   <input name="name" placeholder="key name (e.g. prod-checkout)" required>
+  <select name="scope" aria-label="Scope">
+    <option value="requests:write">requests:write</option>
+    <option value="locks:write">locks:write</option>
+    <option value="kv:read">kv:read</option>
+    <option value="kv:write">kv:write</option>
+    <option value="services:read">services:read</option>
+    <option value="services:write">services:write</option>
+    <option value="elections:write">elections:write</option>
+    <option value="cron:write">cron:write</option>
+    <option value="rate-limit:write">rate-limit:write</option>
+  </select>
+  <select name="env" aria-label="Environment">
+    <option value="live">live</option>
+    <option value="test">test</option>
+  </select>
   <button class="btn" type="submit">Create</button>
 </form>
 <p class="muted">The raw key is shown once on creation. Only its hash is stored.</p></div>
 <div class="card"><h2>Your keys</h2>
-<table><tr><th>Name</th><th>Env</th><th>Key ID</th><th></th></tr>{rows}</table></div>"#
+<table><tr><th>Name</th><th>Env</th><th>Key ID</th><th>Scopes</th><th></th></tr>{rows}</table></div>"#
     );
     page("API keys", Some(s), &body)
 }
@@ -181,7 +225,7 @@ mod tests {
             email: Some("a@b.c".into()),
             orgs: vec!["org".into()],
             is_admin: false,
-            token: None,
+            bearer_token: None,
         };
         let key_list = vec![json!({
             "name": "<script>alert(1)</script>",

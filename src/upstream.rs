@@ -142,11 +142,9 @@ pub async fn placement(brain_url: &str) -> Vec<Value> {
 /// admin form only changes the node count.
 pub async fn set_scale(brain_url: &str, target_nodes: u32) -> bool {
     let url = format!("{}/v1/scale", brain_url.trim_end_matches('/'));
-    post_json(
-        url,
-        None,
-        json!({ "target_nodes": target_nodes, "replication_factor": 3 }),
-    )
+    get_json(attach_internal(client().post(url).json(
+        &json!({ "target_nodes": target_nodes, "replication_factor": 3 }),
+    )))
     .await
     .map(|value| value.get("ok").and_then(Value::as_bool).unwrap_or(false))
     .unwrap_or(false)

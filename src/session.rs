@@ -136,6 +136,22 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// Pull the bearer token from the `Authorization` header, else fall back to the
+/// `fiducia_session` cookie — so both browser (cookie) and API (header) callers
+/// work, as the module contract promises.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(jwt) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+    {
+        if !jwt.is_empty() {
+            return Some(jwt.to_string());
+        }
+    }
+    session_cookie(headers)
+}
+
 fn admin_all_users() -> bool {
     matches!(
         std::env::var("FIDUCIA_ADMIN_ALL_USERS").as_deref(),

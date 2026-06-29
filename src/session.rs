@@ -172,6 +172,20 @@ fn env_list_contains(name: &str, needle: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `admin` iff the verified email is listed in `FIDUCIA_ADMIN_EMAILS` (comma or
+/// whitespace separated), matched case-insensitively since email is. No list
+/// configured → no admins (infra pages locked).
+fn is_admin_email(email: &str) -> bool {
+    let Ok(list) = std::env::var("FIDUCIA_ADMIN_EMAILS") else {
+        return false;
+    };
+    let email = email.trim().to_ascii_lowercase();
+    list.split([',', ' ', '\t', '\n'])
+        .map(|e| e.trim().to_ascii_lowercase())
+        .filter(|e| !e.is_empty())
+        .any(|e| e == email)
+}
+
 /// The dev auth bypass is allowed only in debug builds, or when an operator
 /// explicitly opts in via `FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1`.
 fn dev_session_allowed() -> bool {

@@ -187,16 +187,9 @@ async fn create_key(
         Ok(s) => s,
         Err(r) => return r,
     };
-<<<<<<< HEAD
-    let org = s.orgs.first().cloned().unwrap_or_default();
-    let _ = upstream::create_key(&st.auth_url, s.token.as_deref(), &org, &form.name).await;
-    // The raw key is returned once in the response; surfacing it on a one-time
-    // confirmation page is a view concern tracked separately.
-=======
     let scopes = vec![form.scope.unwrap_or_else(|| "requests:write".to_string())];
     let env = form.env.as_deref().unwrap_or("live");
     let _ = upstream::create_key_with_scopes(&st.auth_url, &s, &form.name, &scopes, env).await;
->>>>>>> origin/main
     redirect("/keys")
 }
 

@@ -95,7 +95,9 @@ struct AuthUser {
 
 async fn current_from_auth(auth_url: &str, token: &str) -> Result<Session, reqwest::Error> {
     let url = format!("{}/v1/me", auth_url.trim_end_matches('/'));
-    let user = reqwest::Client::new()
+    let user = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?
         .get(url)
         .bearer_auth(token)
         .send()
@@ -106,10 +108,7 @@ async fn current_from_auth(auth_url: &str, token: &str) -> Result<Session, reqwe
         .user;
     let is_admin = admin_all_users()
         || env_list_contains("FIDUCIA_ADMIN_USER_IDS", &user.user_id)
-        || user
-            .email
-            .as_deref()
-            .is_some_and(|email| env_list_contains("FIDUCIA_ADMIN_EMAILS", email));
+        || user.email.as_deref().is_some_and(is_admin_email);
 
     Ok(Session {
         user_id: user.user_id,

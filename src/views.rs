@@ -225,11 +225,7 @@ mod tests {
             email: Some("a@b.c".into()),
             orgs: vec!["org".into()],
             is_admin: false,
-<<<<<<< HEAD
-            token: None,
-=======
             bearer_token: None,
->>>>>>> origin/main
         };
         let key_list = vec![json!({
             "name": "<script>alert(1)</script>",

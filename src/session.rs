@@ -74,11 +74,7 @@ pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
             email: Some("user@example.com".into()),
             orgs: vec!["org_dev".into()],
             is_admin: false,
-<<<<<<< HEAD
-            token: None,
-=======
             bearer_token: None,
->>>>>>> origin/main
         }),
         _ => None,
     }

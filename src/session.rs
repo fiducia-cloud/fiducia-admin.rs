@@ -284,6 +284,5 @@ mod tests {
             "FIDUCIA_ADMIN_TEST_LIST",
             "missing@example.com"
         ));
->>>>>>> origin/main
     }
 }

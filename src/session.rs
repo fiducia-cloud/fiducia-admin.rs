@@ -18,17 +18,16 @@ pub struct Session {
     pub email: Option<String>,
     pub orgs: Vec<String>,
     pub is_admin: bool,
-<<<<<<< HEAD
     /// The caller's bearer token, kept so key actions can be proxied to
     /// `fiducia-auth` as the same identity. `None` for a dev-bypass session.
-    pub token: Option<String>,
+    pub bearer_token: Option<String>,
 }
 
 /// Resolve the session for a request, or `None` if not signed in.
 ///
-/// Reads the bearer (from the `Authorization` header or the `fiducia_session`
-/// cookie) and verifies it with `fiducia-auth`; on success loads org(s) and
-/// derives admin from `FIDUCIA_ADMIN_EMAILS`.
+/// Tries real auth first — the bearer from the `Authorization` header or the
+/// `fiducia_session` cookie, verified with `fiducia-auth` `GET /v1/me` — and only
+/// then falls back to the dev bypass.
 ///
 /// A dev bypass (`FIDUCIA_ADMIN_DEV_SESSION=user|admin`) lets you click through
 /// the UI before auth is wired. It is a **full authentication bypass** — anyone
@@ -37,101 +36,7 @@ pub struct Session {
 /// Release builds otherwise refuse it and log loudly, so a stray env var in
 /// production can't silently hand out admin.
 pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
-    if let Some(session) = dev_session() {
-        return Some(session);
-    }
-
-    let token = bearer_token(headers)?;
-    verify_with_auth(auth_url, &token).await
-}
-
-/// Verify a bearer with `fiducia-auth` `GET /v1/me` and build a [`Session`].
-async fn verify_with_auth(auth_url: &str, token: &str) -> Option<Session> {
-    let url = format!("{}/v1/me", auth_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .ok()?;
-    let resp = match client.get(&url).bearer_auth(token).send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            tracing::warn!(error = %e, "session: fiducia-auth unreachable");
-            return None;
-        }
-    };
-    if !resp.status().is_success() {
-        return None; // 401/403 → not signed in
-    }
-    let body: serde_json::Value = resp.json().await.ok()?;
-    let user = body.get("user")?;
-    let user_id = user.get("user_id")?.as_str()?.to_string();
-    let email = user
-        .get("email")
-        .and_then(|e| e.as_str())
-        .map(str::to_string);
-    let orgs = user
-        .get("orgs")
-        .and_then(|o| o.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Some(Session {
-        user_id,
-        is_admin: email.as_deref().map(is_admin_email).unwrap_or(false),
-        email,
-        orgs,
-        token: Some(token.to_string()),
-    })
-}
-
-/// Pull the bearer token from the `Authorization` header, else the
-/// `fiducia_session` cookie.
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(jwt) = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-    {
-        return Some(jwt.to_string());
-    }
-    let cookies = headers.get("cookie").and_then(|v| v.to_str().ok())?;
-    for pair in cookies.split(';') {
-        let pair = pair.trim();
-        if let Some(value) = pair.strip_prefix("fiducia_session=") {
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// `admin` iff the verified email is listed in `FIDUCIA_ADMIN_EMAILS` (comma or
-/// whitespace separated). No list configured → no admins (infra pages locked).
-fn is_admin_email(email: &str) -> bool {
-    let Ok(list) = std::env::var("FIDUCIA_ADMIN_EMAILS") else {
-        return false;
-    };
-    let email = email.trim().to_ascii_lowercase();
-    list.split([',', ' ', '\t', '\n'])
-        .map(|e| e.trim().to_ascii_lowercase())
-        .filter(|e| !e.is_empty())
-        .any(|e| e == email)
-}
-
-/// The optional dev-only auth bypass.
-fn dev_session() -> Option<Session> {
-=======
-    pub bearer_token: Option<String>,
-}
-
-/// Resolve the session for a request, or `None` if not signed in.
-pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
-    if let Some(token) = session_cookie(headers) {
+    if let Some(token) = bearer_token(headers) {
         match current_from_auth(auth_url, &token).await {
             Ok(session) => return Some(session),
             Err(err) => {
@@ -140,7 +45,7 @@ pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
         }
     }
 
->>>>>>> origin/main
+
     let role = std::env::var("FIDUCIA_ADMIN_DEV_SESSION").ok()?;
 
     if !dev_session_allowed() {

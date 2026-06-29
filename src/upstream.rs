@@ -21,6 +21,29 @@ fn client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// The cluster trusted-hop secret, read once. The brain's `/v1` enforces it when
+/// configured, so admin's brain calls (membership / placement / scale) must
+/// present it. (Auth calls use the caller's bearer token instead.)
+fn internal_secret() -> Option<&'static str> {
+    static SECRET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SECRET
+        .get_or_init(|| {
+            std::env::var("FIDUCIA_INTERNAL_SECRET")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
+/// Attach the trusted-hop header to an outbound brain request when configured.
+fn attach_internal(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match internal_secret() {
+        Some(secret) => builder.header("x-fiducia-internal-auth", secret),
+        None => builder,
+    }
+}
+
 /// `fiducia-auth`: list the caller's org API keys (masked). Forwards the caller's
 /// session bearer so auth resolves the same identity the dashboard authenticated.
 pub async fn list_keys(auth_url: &str, session: &Session) -> Vec<Value> {

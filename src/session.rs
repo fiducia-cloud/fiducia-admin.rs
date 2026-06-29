@@ -196,7 +196,7 @@ fn dev_session_allowed() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-<<<<<<< HEAD
+    use axum::http::HeaderValue;
 
     fn headers_with(name: &str, value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();

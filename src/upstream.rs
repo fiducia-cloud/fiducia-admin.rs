@@ -152,7 +152,9 @@ pub async fn set_scale(brain_url: &str, target_nodes: u32) -> bool {
 
 async fn get_array(base_url: &str, path: &str, field: &str) -> Vec<Value> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-    match get_json(client().get(url)).await {
+    // get_array only fetches from the brain (nodes / placement), so always present
+    // the trusted-hop secret.
+    match get_json(attach_internal(client().get(url))).await {
         Ok(value) => value
             .get(field)
             .and_then(Value::as_array)

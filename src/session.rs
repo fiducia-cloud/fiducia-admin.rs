@@ -233,8 +233,7 @@ mod tests {
         assert!(!is_admin_email("intern@acme.com"));
         std::env::remove_var("FIDUCIA_ADMIN_EMAILS");
         assert!(!is_admin_email("boss@acme.com"));
-=======
-    use axum::http::HeaderValue;
+    }
 
     #[test]
     fn session_cookie_reads_fiducia_session_from_cookie_header() {

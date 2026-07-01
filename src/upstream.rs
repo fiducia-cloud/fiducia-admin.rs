@@ -21,6 +21,29 @@ fn client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// The cluster trusted-hop secret, read once. The brain's `/v1` enforces it when
+/// configured, so admin's brain calls (membership / placement / scale) must
+/// present it. (Auth calls use the caller's bearer token instead.)
+fn internal_secret() -> Option<&'static str> {
+    static SECRET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SECRET
+        .get_or_init(|| {
+            std::env::var("FIDUCIA_INTERNAL_SECRET")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
+/// Attach the trusted-hop header to an outbound brain request when configured.
+fn attach_internal(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match internal_secret() {
+        Some(secret) => builder.header("x-fiducia-internal-auth", secret),
+        None => builder,
+    }
+}
+
 /// `fiducia-auth`: list the caller's org API keys (masked). Forwards the caller's
 /// session bearer so auth resolves the same identity the dashboard authenticated.
 pub async fn list_keys(auth_url: &str, session: &Session) -> Vec<Value> {
@@ -119,11 +142,9 @@ pub async fn placement(brain_url: &str) -> Vec<Value> {
 /// admin form only changes the node count.
 pub async fn set_scale(brain_url: &str, target_nodes: u32) -> bool {
     let url = format!("{}/v1/scale", brain_url.trim_end_matches('/'));
-    post_json(
-        url,
-        None,
-        json!({ "target_nodes": target_nodes, "replication_factor": 3 }),
-    )
+    get_json(attach_internal(client().post(url).json(
+        &json!({ "target_nodes": target_nodes, "replication_factor": 3 }),
+    )))
     .await
     .map(|value| value.get("ok").and_then(Value::as_bool).unwrap_or(false))
     .unwrap_or(false)
@@ -131,7 +152,9 @@ pub async fn set_scale(brain_url: &str, target_nodes: u32) -> bool {
 
 async fn get_array(base_url: &str, path: &str, field: &str) -> Vec<Value> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-    match get_json(client().get(url)).await {
+    // get_array only fetches from the brain (nodes / placement), so always present
+    // the trusted-hop secret.
+    match get_json(attach_internal(client().get(url))).await {
         Ok(value) => value
             .get(field)
             .and_then(Value::as_array)

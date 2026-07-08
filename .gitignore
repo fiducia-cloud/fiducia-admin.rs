@@ -7,5 +7,8 @@
 *.log
 .DS_Store
 
+# Browser E2E deps (playwright/puppeteer/@fiducia/test-config)
+node_modules/
+
 # Scratch / git worktrees (tmp/worktrees/*)
 tmp/

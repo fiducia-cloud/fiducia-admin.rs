@@ -398,6 +398,7 @@ dependencies = [
  "axum",
  "fiducia-interfaces",
  "fiducia-interfaces-db",
+ "fiducia-sync-core",
  "fiducia-telemetry",
  "maud",
  "reqwest",
@@ -428,6 +429,14 @@ dependencies = [
  "serde_json",
  "sqlx",
  "uuid",
+]
+
+[[package]]
+name = "fiducia-sync-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

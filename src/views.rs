@@ -358,6 +358,7 @@ pub fn infra(s: &Session, nodes: &[Value], placement: &[Value], recent: &[Value]
             }
             // htmx swap target: the scale handler returns `infra_panel`.
             div id="infra-panel" { (infra_panel(nodes, placement, recent, None)) }
+            }
         },
     )
 }

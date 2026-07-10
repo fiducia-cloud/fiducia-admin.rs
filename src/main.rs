@@ -75,7 +75,14 @@ struct AppState {
     pool: Option<PgPool>,
     /// Fans `fiducia:sync` frames out to `/admin/ws` subscribers.
     stream_tx: broadcast::Sender<String>,
+    /// Idempotency-Key → committed_version: a retried sync write replays its
+    /// original ack instead of re-running the UPDATE (which would re-bump version).
+    /// In-process + bounded (retries are short-lived). AppState is shared via Arc.
+    idempotency: Mutex<HashMap<String, i64>>,
 }
+
+/// Coarse bound on the in-process idempotency cache (cleared wholesale past this).
+const IDEMPOTENCY_CACHE_CAP: usize = 10_000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

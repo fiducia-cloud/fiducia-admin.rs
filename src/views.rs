@@ -78,10 +78,34 @@ pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
                     }
                 }
                 div class="wrap" { (body) }
+                // Bring up admin-plane sync only on pages that declare synced
+                // tables via `data-fiducia-sync` (deferred scripts above have run
+                // by DOMContentLoaded, so window.FiduciaSyncAdmin + htmx exist).
+                script { (PreEscaped(SYNC_INIT_JS)) }
             }
         }
     }
 }
+
+/// Gated bring-up: reads `data-fiducia-sync="table[,table]"` markers on the page
+/// and, if any, boots the vendored @fiducia/sync admin client for those tables
+/// (opening IndexedDB, subscribing /admin/ws, registering the htmx-optimistic ext).
+const SYNC_INIT_JS: &str = r#"
+window.addEventListener("DOMContentLoaded", function () {
+  var nodes = document.querySelectorAll("[data-fiducia-sync]");
+  if (!nodes.length || !window.FiduciaSyncAdmin) return;
+  var tables = [];
+  nodes.forEach(function (n) {
+    (n.getAttribute("data-fiducia-sync") || "").split(",").forEach(function (t) {
+      t = t.trim(); if (t && tables.indexOf(t) === -1) tables.push(t);
+    });
+  });
+  if (!tables.length) return;
+  window.FiduciaSyncAdmin.init({ tables: tables, htmx: window.htmx }).then(function (sync) {
+    window.__fiduciaSync = sync; // exposed for debugging / future optimistic writes
+  }).catch(function (e) { console.error("fiducia-sync init failed", e); });
+});
+"#;
 
 /// 403 body for the admin gate (`require_admin`).
 pub fn forbidden(s: &Session) -> Markup {

@@ -481,5 +481,8 @@ mod tests {
         assert!(html.contains(r#"name="target_nodes""#));
         assert!(html.contains("Apply"));
         assert!(html.contains("Recent operations"));
+        // Opts the page into the local-first sync client + loads the vendored bundle.
+        assert!(html.contains(r#"data-fiducia-sync="infra_operations""#));
+        assert!(html.contains(r#"src="/assets/fiducia-sync.js""#));
     }
 }

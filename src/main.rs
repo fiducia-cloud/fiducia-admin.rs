@@ -68,6 +68,11 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 /// without a network round-trip or a third-party origin in the trust boundary.
 const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
 
+/// The vendored, self-contained @fiducia/sync admin browser bundle (wasm inlined),
+/// served same-origin at `/assets/fiducia-sync.js`. Built by
+/// `fiducia-sync/sdk: npm run build:admin-bundle`. Single-binary, no CDN.
+const SYNC_JS: &str = include_str!("../assets/fiducia-sync.js");
+
 struct AppState {
     auth_url: String,
     brain_url: String,
@@ -104,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/assets/htmx.min.js", get(htmx_js))
+        .route("/assets/fiducia-sync.js", get(sync_js))
         .route("/login", get(login).post(login_submit))
         .route("/", get(dashboard))
         .route("/account", get(account))
@@ -162,6 +168,14 @@ async fn htmx_js() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
         HTMX_JS,
+    )
+}
+
+/// Serve the vendored, self-contained @fiducia/sync admin bundle (same-origin).
+async fn sync_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        SYNC_JS,
     )
 }
 
@@ -605,6 +619,20 @@ mod sync_tests {
         // A table with no DB-wired handler still returns a valid ack (generic route).
         let other = post_sync(test_state(), "operators", None, 0).await;
         assert_eq!(other["committed_version"], 1);
+    }
+
+    #[tokio::test]
+    async fn serves_the_vendored_sync_bundle() {
+        let app = Router::new().route("/assets/fiducia-sync.js", get(sync_js));
+        let resp = app
+            .oneshot(Request::builder().uri("/assets/fiducia-sync.js").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert!(ct.contains("javascript"), "ct={ct}");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("FiduciaSyncAdmin"));
     }
 
     #[tokio::test]

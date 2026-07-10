@@ -563,6 +563,62 @@ async fn admin_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<Stri
 }
 
 #[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            auth_url: "http://localhost:8097".into(),
+            brain_url: "http://localhost:8095".into(),
+            pool: None, // no DB -> fallback monotonic ack path
+            stream_tx: broadcast::channel(16).0,
+            idempotency: Mutex::new(HashMap::new()),
+        })
+    }
+
+    async fn post_sync(state: Arc<AppState>, table: &str, key: Option<&str>, base: i64) -> Value {
+        let app = Router::new()
+            .route("/api/admin/sync/:table", post(sync_write))
+            .with_state(state);
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/api/admin/sync/{table}"))
+            .header(CONTENT_TYPE, "application/json");
+        if let Some(k) = key {
+            builder = builder.header("idempotency-key", k);
+        }
+        let body = json!({ "id": "op1", "op": "upsert", "base_version": base }).to_string();
+        let resp = app.oneshot(builder.body(Body::from(body)).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_write_is_generic_and_acks_a_monotonic_version() {
+        let acked = post_sync(test_state(), "infra_operations", None, 4).await;
+        assert_eq!(acked["id"], "op1");
+        assert_eq!(acked["committed_version"], 5);
+        // A table with no DB-wired handler still returns a valid ack (generic route).
+        let other = post_sync(test_state(), "operators", None, 0).await;
+        assert_eq!(other["committed_version"], 1);
+    }
+
+    #[tokio::test]
+    async fn sync_write_idempotency_key_replays_the_same_ack() {
+        let state = test_state();
+        let first = post_sync(state.clone(), "infra_operations", Some("infra_operations:op1:upsert:7"), 7).await;
+        assert_eq!(first["committed_version"], 8);
+        // Same key, different base -> the ORIGINAL ack is replayed, not 1000.
+        let retry = post_sync(state.clone(), "infra_operations", Some("infra_operations:op1:upsert:7"), 999).await;
+        assert_eq!(retry["committed_version"], 8);
+    }
+}
+
+#[cfg(test)]
 mod interface_contract_tests {
     use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
 

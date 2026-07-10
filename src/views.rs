@@ -54,6 +54,9 @@ pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
                 title { (title) " · Fiducia Admin" }
                 style { (PreEscaped(CSS)) }
                 script src="/assets/htmx.min.js" defer {}
+                // Local-first sync client (@fiducia/sync), vendored self-contained
+                // (wasm inlined) and served same-origin — no CDN, no bundler.
+                script src="/assets/fiducia-sync.js" defer {}
             }
             body {
                 nav class="nav" {

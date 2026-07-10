@@ -344,7 +344,10 @@ pub fn infra(s: &Session, nodes: &[Value], placement: &[Value], recent: &[Value]
     page(
         "Infra",
         Some(s),
+        // `data-fiducia-sync` opts this page into the local-first sync client:
+        // infra_operations changes stream over /admin/ws into IndexedDB.
         html! {
+            div data-fiducia-sync="infra_operations" {
             h1 { "Cluster & infra" }
             div class="card" {
                 h2 { "Scale" }

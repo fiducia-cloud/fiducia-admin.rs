@@ -98,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "http://localhost:8095".into()),
         pool,
         stream_tx,
+        idempotency: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()

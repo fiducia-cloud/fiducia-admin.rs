@@ -622,6 +622,20 @@ mod sync_tests {
     }
 
     #[tokio::test]
+    async fn serves_the_vendored_sync_bundle() {
+        let app = Router::new().route("/assets/fiducia-sync.js", get(sync_js));
+        let resp = app
+            .oneshot(Request::builder().uri("/assets/fiducia-sync.js").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert!(ct.contains("javascript"), "ct={ct}");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("FiduciaSyncAdmin"));
+    }
+
+    #[tokio::test]
     async fn sync_write_idempotency_key_replays_the_same_ack() {
         let state = test_state();
         let first = post_sync(state.clone(), "infra_operations", Some("infra_operations:op1:upsert:7"), 7).await;

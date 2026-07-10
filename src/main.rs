@@ -171,6 +171,14 @@ async fn htmx_js() -> impl IntoResponse {
     )
 }
 
+/// Serve the vendored, self-contained @fiducia/sync admin bundle (same-origin).
+async fn sync_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        SYNC_JS,
+    )
+}
+
 fn redirect(to: &str) -> Response {
     (StatusCode::SEE_OTHER, [(LOCATION, to)]).into_response()
 }

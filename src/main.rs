@@ -114,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Local-first sync write path (mirrors the customer plane): the sync
         // client POSTs a queued optimistic write; we persist via SQLx and return
         // the committed row version, then broadcast the change to WS subscribers.
-        .route("/api/admin/sync/infra_operations", post(sync_write_infra_operations))
+        .route("/api/admin/sync/:table", post(sync_write))
         .route("/admin/ws", get(admin_ws))
         .with_state(state)
         // Hardening stack (outermost last): catch handler panics → 500, bound

@@ -109,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/assets/htmx.min.js", get(htmx_js))
+        .route("/assets/fiducia-sync.js", get(sync_js))
         .route("/login", get(login).post(login_submit))
         .route("/", get(dashboard))
         .route("/account", get(account))

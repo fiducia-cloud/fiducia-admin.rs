@@ -68,6 +68,11 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 /// without a network round-trip or a third-party origin in the trust boundary.
 const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
 
+/// The vendored, self-contained @fiducia/sync admin browser bundle (wasm inlined),
+/// served same-origin at `/assets/fiducia-sync.js`. Built by
+/// `fiducia-sync/sdk: npm run build:admin-bundle`. Single-binary, no CDN.
+const SYNC_JS: &str = include_str!("../assets/fiducia-sync.js");
+
 struct AppState {
     auth_url: String,
     brain_url: String,

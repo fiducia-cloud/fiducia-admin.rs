@@ -39,10 +39,13 @@ use axum::{
     Json, Router,
 };
 use fiducia_interfaces_db::admin::InfraOperationsRow;
+use fiducia_sync_core::{ChangeEvent, ChangeOp, WriteAck};
 use maud::Markup;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
 use tower_http::{

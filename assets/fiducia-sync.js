@@ -1,3 +1,6 @@
+// Vendored, self-contained @fiducia/sync admin browser bundle (wasm inlined),
+// served same-origin at /assets/fiducia-sync.js. Generated build artifact —
+// rebuild via fiducia-sync/sdk `npm run build:admin-bundle`, do not hand-edit.
 (() => {
   var __defProp = Object.defineProperty;
   var __getOwnPropNames = Object.getOwnPropertyNames;

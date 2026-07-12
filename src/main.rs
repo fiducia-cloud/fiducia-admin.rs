@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Form, Path, State,
+        Form, Path, Query, State,
     },
     http::{
         header::{CONTENT_TYPE, LOCATION, SET_COOKIE},
@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Local-first sync write path (mirrors the customer plane): the sync
         // client POSTs a queued optimistic write; we persist via SQLx and return
         // the committed row version, then broadcast the change to WS subscribers.
-        .route("/api/admin/sync/:table", post(sync_write))
+        .route("/api/admin/sync/:table", post(sync_write).get(sync_catchup))
         .route("/admin/ws", get(admin_ws))
         .with_state(state)
         // Hardening stack (outermost last): catch handler panics → 500, bound
@@ -437,8 +437,11 @@ async fn sync_write(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     if let Some(key) = &idem_key {
-        if let Some(v) = st.idempotency.lock().unwrap().get(key).copied() {
-            return ack(&req.id, v);
+        match idempotency_begin(&st, key).await {
+            Idem::Replay(v) => return ack(&req.id, v),
+            // A concurrent identical request holds the claim; don't re-run.
+            Idem::InFlight => return ack(&req.id, req.base_version.unwrap_or(0) + 1),
+            Idem::Proceed => {}
         }
     }
 
@@ -449,14 +452,110 @@ async fn sync_write(
     };
     let version = committed.unwrap_or_else(|| req.base_version.unwrap_or(0) + 1);
 
-    if let Some(key) = idem_key {
+    if let Some(key) = &idem_key {
+        idempotency_commit(&st, key, version).await;
+    }
+    ack(&req.id, version)
+}
+
+/// Idempotency decision for a claimed/seen key.
+enum Idem {
+    Replay(i64),
+    InFlight,
+    Proceed,
+}
+
+/// Begin idempotent handling of `key`. Durable (survives restarts) when a pool is
+/// present — claim-first so only the first request runs the mutation; otherwise an
+/// in-process cache (the mock/no-DB path used in tests).
+async fn idempotency_begin(st: &AppState, key: &str) -> Idem {
+    if let Some(pool) = &st.pool {
+        // Claim: insert returns a row only if we won it.
+        let claimed = sqlx::query_scalar::<_, i32>(
+            "insert into sync_idempotency_keys (key) values ($1) \
+             on conflict (key) do nothing returning 1",
+        )
+        .bind(key)
+        .fetch_optional(pool)
+        .await;
+        match claimed {
+            Ok(Some(_)) => Idem::Proceed,
+            Ok(None) => {
+                // Existed already — replay the committed version (null => in-flight).
+                match sqlx::query_scalar::<_, Option<i64>>(
+                    "select committed_version from sync_idempotency_keys where key = $1",
+                )
+                .bind(key)
+                .fetch_optional(pool)
+                .await
+                {
+                    Ok(Some(Some(v))) => Idem::Replay(v),
+                    Ok(Some(None)) => Idem::InFlight,
+                    _ => Idem::Proceed,
+                }
+            }
+            Err(_) => Idem::Proceed, // ledger error must not block the write
+        }
+    } else if let Some(v) = st.idempotency.lock().unwrap().get(key).copied() {
+        Idem::Replay(v)
+    } else {
+        Idem::Proceed
+    }
+}
+
+/// Record the committed version for `key` (durable when pooled, else in-process).
+async fn idempotency_commit(st: &AppState, key: &str, version: i64) {
+    if let Some(pool) = &st.pool {
+        let _ = sqlx::query("update sync_idempotency_keys set committed_version = $2 where key = $1")
+            .bind(key)
+            .bind(version)
+            .execute(pool)
+            .await;
+    } else {
         let mut cache = st.idempotency.lock().unwrap();
         if cache.len() >= IDEMPOTENCY_CACHE_CAP {
             cache.clear();
         }
-        cache.insert(key, version);
+        cache.insert(key.to_owned(), version);
     }
-    ack(&req.id, version)
+}
+
+#[derive(Debug, Deserialize)]
+struct CatchupParams {
+    #[serde(default)]
+    since: i64,
+}
+
+/// Catch-up hydration: `GET /api/admin/sync/{table}?since=<version>` returns the
+/// control-plane rows newer than the client's cursor, ordered by version
+/// (index-backed by `infra_operations_version_idx`). Feeds the SDK's `hydrate()`.
+async fn sync_catchup(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(params): Query<CatchupParams>,
+) -> Response {
+    let rows: Vec<serde_json::Value> = match (table.as_str(), &st.pool) {
+        ("infra_operations", Some(pool)) => {
+            match sqlx::query_as::<_, InfraOperationsRow>(
+                "select * from infra_operations where version > $1 order by version asc limit 500",
+            )
+            .bind(params.since)
+            .fetch_all(pool)
+            .await
+            {
+                Ok(rows) => rows
+                    .iter()
+                    .map(|r| serde_json::to_value(r).unwrap_or_default())
+                    .collect(),
+                Err(err) => {
+                    tracing::error!("infra_operations catch-up failed: {err}");
+                    vec![]
+                }
+            }
+        }
+        _ => vec![],
+    };
+    Json(json!({ "table": table, "since": params.since, "rows": rows })).into_response()
 }
 
 /// Build the shared write-ack the @fiducia/sync client reconciles against.
@@ -664,5 +763,70 @@ mod interface_contract_tests {
             ProposeErrorReason::NotLeader,
             ProposeErrorReason::NotLeader
         ));
+    }
+}
+
+// DB-behavior tests for the sync durability layer (durable idempotency + indexed
+// catch-up), gated on `TEST_DATABASE_URL` — unset → skip, so `cargo test` stays
+// green with no DB. Run against a real Postgres with admin.sql applied.
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    const SCHEMA: &str = include_str!("../../fiducia-interfaces/sql/admin.sql");
+
+    fn state_with(pool: PgPool) -> AppState {
+        AppState {
+            auth_url: "x".into(),
+            brain_url: "x".into(),
+            pool: Some(pool),
+            stream_tx: broadcast::channel(4).0,
+            idempotency: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // One test, one pool, one runtime: `#[tokio::test]` gives each test its own
+    // runtime, and an sqlx pool is bound to the runtime that created it — so a
+    // pool shared across tests dies with the first test's runtime. Keeping the
+    // whole sync-durability check in a single test sidesteps that entirely.
+    #[tokio::test]
+    async fn sync_durability_against_real_postgres() {
+        let Some(url) = std::env::var("TEST_DATABASE_URL").ok().filter(|v| !v.is_empty()) else {
+            eprintln!("skip sync_durability_against_real_postgres: TEST_DATABASE_URL unset");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+        sqlx::raw_sql(SCHEMA).execute(&pool).await.expect("apply admin.sql");
+        let st = state_with(pool.clone());
+
+        // --- Durable idempotency: claim -> in-flight -> record -> replay ---------
+        let key = format!("infra_operations:{}:upsert:7", Uuid::new_v4().simple());
+        assert!(matches!(idempotency_begin(&st, &key).await, Idem::Proceed), "first claim owns it");
+        assert!(matches!(idempotency_begin(&st, &key).await, Idem::InFlight), "second sees in-flight");
+        idempotency_commit(&st, &key, 8).await;
+        assert!(matches!(idempotency_begin(&st, &key).await, Idem::Replay(8)), "replays committed");
+        // Survives a "restart": a fresh AppState (empty in-process cache) still replays.
+        let fresh = state_with(pool.clone());
+        assert!(matches!(idempotency_begin(&fresh, &key).await, Idem::Replay(8)), "durable across restart");
+
+        // --- Indexed catch-up: rows newer than the cursor, ordered by version ----
+        let a: Uuid = sqlx::query_scalar("insert into infra_operations (action) values ('scale') returning id")
+            .fetch_one(&pool).await.unwrap();
+        let _b: Uuid = sqlx::query_scalar("insert into infra_operations (action) values ('drain') returning id")
+            .fetch_one(&pool).await.unwrap();
+        sqlx::query("update infra_operations set status = 'applied' where id = $1")
+            .bind(a).execute(&pool).await.unwrap(); // bump `a` to version 2
+
+        let newer: Vec<InfraOperationsRow> = sqlx::query_as(
+            "select * from infra_operations where version > $1 order by version asc limit 500",
+        ).bind(1_i64).fetch_all(&pool).await.unwrap();
+        assert!(newer.iter().any(|r| r.id == a && r.version > 1), "bumped row present");
+        assert!(newer.iter().all(|r| r.version > 1), "cursor excludes v1 rows");
+        assert!(newer.windows(2).all(|w| w[0].version <= w[1].version), "ordered by version");
     }
 }

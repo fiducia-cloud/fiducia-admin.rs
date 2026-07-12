@@ -1,3 +1,5 @@
+// Puppeteer browser E2E: boots the real axum admin server (dev session, no DB)
+// and drives the dashboard, API-keys create, and infra-scale HTMX swap flows.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import puppeteer from "puppeteer";

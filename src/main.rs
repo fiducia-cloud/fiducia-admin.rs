@@ -765,3 +765,100 @@ mod interface_contract_tests {
         ));
     }
 }
+
+// DB-behavior tests for the sync durability layer (durable idempotency + indexed
+// catch-up), gated on `TEST_DATABASE_URL` — unset → skip, so `cargo test` stays
+// green with no DB. Run against a real Postgres with admin.sql applied.
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    const SCHEMA: &str = include_str!("../../fiducia-interfaces/sql/admin.sql");
+
+    // One shared pool + one schema apply for the module (see the customer plane's
+    // store tests: per-test `create or replace function` races two sessions).
+    static POOL: tokio::sync::OnceCell<Option<PgPool>> = tokio::sync::OnceCell::const_new();
+
+    async fn pool_or_skip() -> Option<PgPool> {
+        POOL.get_or_init(|| async {
+            let url = std::env::var("TEST_DATABASE_URL").ok().filter(|v| !v.is_empty())?;
+            let pool = PgPoolOptions::new()
+                .max_connections(8)
+                .connect(&url)
+                .await
+                .expect("connect TEST_DATABASE_URL");
+            sqlx::raw_sql(SCHEMA).execute(&pool).await.expect("apply admin.sql");
+            Some(pool)
+        })
+        .await
+        .clone()
+    }
+
+    fn state_with(pool: PgPool) -> AppState {
+        AppState {
+            auth_url: "x".into(),
+            brain_url: "x".into(),
+            pool: Some(pool),
+            stream_tx: broadcast::channel(4).0,
+            idempotency: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn insert_op(pool: &PgPool, action: &str) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>("insert into infra_operations (action) values ($1) returning id")
+            .bind(action)
+            .fetch_one(pool)
+            .await
+            .expect("insert infra_operations")
+    }
+
+    #[tokio::test]
+    async fn durable_idempotency_claims_then_replays() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip durable_idempotency_claims_then_replays: TEST_DATABASE_URL unset");
+            return;
+        };
+        let st = state_with(pool);
+        let key = format!("infra_operations:{}:upsert:7", Uuid::new_v4().simple());
+
+        // First caller owns the claim; a concurrent one sees it in-flight.
+        assert!(matches!(idempotency_begin(&st, &key).await, Idem::Proceed));
+        assert!(matches!(idempotency_begin(&st, &key).await, Idem::InFlight));
+
+        // After recording, every future lookup replays — this is what survives a
+        // process restart (a fresh AppState with a null in-process cache still replays).
+        idempotency_commit(&st, &key, 8).await;
+        assert!(matches!(idempotency_begin(&st, &key).await, Idem::Replay(8)));
+        let fresh = state_with(st.pool.clone().unwrap());
+        assert!(matches!(idempotency_begin(&fresh, &key).await, Idem::Replay(8)));
+    }
+
+    #[tokio::test]
+    async fn catchup_returns_rows_newer_than_the_cursor_ordered() {
+        let Some(pool) = pool_or_skip().await else {
+            eprintln!("skip catchup_returns_rows_newer_than_the_cursor_ordered: TEST_DATABASE_URL unset");
+            return;
+        };
+        let a = insert_op(&pool, "scale").await;
+        let _b = insert_op(&pool, "drain").await;
+        // Bump `a` to version 2 so a cursor of 1 separates it from the v1 rows.
+        sqlx::query("update infra_operations set status = 'applied' where id = $1")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let newer: Vec<InfraOperationsRow> = sqlx::query_as(
+            "select * from infra_operations where version > $1 order by version asc limit 500",
+        )
+        .bind(1_i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert!(newer.iter().any(|r| r.id == a && r.version > 1), "bumped row present");
+        assert!(newer.iter().all(|r| r.version > 1), "cursor excludes v1 rows");
+        assert!(newer.windows(2).all(|w| w[0].version <= w[1].version), "ordered by version");
+    }
+}

@@ -54,6 +54,9 @@ pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
                 title { (title) " · Fiducia Admin" }
                 style { (PreEscaped(CSS)) }
                 script src="/assets/htmx.min.js" defer {}
+                // Local-first sync client (@fiducia/sync), vendored self-contained
+                // (wasm inlined) and served same-origin — no CDN, no bundler.
+                script src="/assets/fiducia-sync.js" defer {}
             }
             body {
                 nav class="nav" {
@@ -75,10 +78,34 @@ pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
                     }
                 }
                 div class="wrap" { (body) }
+                // Bring up admin-plane sync only on pages that declare synced
+                // tables via `data-fiducia-sync` (deferred scripts above have run
+                // by DOMContentLoaded, so window.FiduciaSyncAdmin + htmx exist).
+                script { (PreEscaped(SYNC_INIT_JS)) }
             }
         }
     }
 }
+
+/// Gated bring-up: reads `data-fiducia-sync="table[,table]"` markers on the page
+/// and, if any, boots the vendored @fiducia/sync admin client for those tables
+/// (opening IndexedDB, subscribing /admin/ws, registering the htmx-optimistic ext).
+const SYNC_INIT_JS: &str = r#"
+window.addEventListener("DOMContentLoaded", function () {
+  var nodes = document.querySelectorAll("[data-fiducia-sync]");
+  if (!nodes.length || !window.FiduciaSyncAdmin) return;
+  var tables = [];
+  nodes.forEach(function (n) {
+    (n.getAttribute("data-fiducia-sync") || "").split(",").forEach(function (t) {
+      t = t.trim(); if (t && tables.indexOf(t) === -1) tables.push(t);
+    });
+  });
+  if (!tables.length) return;
+  window.FiduciaSyncAdmin.init({ tables: tables, htmx: window.htmx }).then(function (sync) {
+    window.__fiduciaSync = sync; // exposed for debugging / future optimistic writes
+  }).catch(function (e) { console.error("fiducia-sync init failed", e); });
+});
+"#;
 
 /// 403 body for the admin gate (`require_admin`).
 pub fn forbidden(s: &Session) -> Markup {
@@ -317,7 +344,10 @@ pub fn infra(s: &Session, nodes: &[Value], placement: &[Value], recent: &[Value]
     page(
         "Infra",
         Some(s),
+        // `data-fiducia-sync` opts this page into the local-first sync client:
+        // infra_operations changes stream over /admin/ws into IndexedDB.
         html! {
+            div data-fiducia-sync="infra_operations" {
             h1 { "Cluster & infra" }
             div class="card" {
                 h2 { "Scale" }
@@ -328,6 +358,7 @@ pub fn infra(s: &Session, nodes: &[Value], placement: &[Value], recent: &[Value]
             }
             // htmx swap target: the scale handler returns `infra_panel`.
             div id="infra-panel" { (infra_panel(nodes, placement, recent, None)) }
+            }
         },
     )
 }
@@ -450,5 +481,8 @@ mod tests {
         assert!(html.contains(r#"name="target_nodes""#));
         assert!(html.contains("Apply"));
         assert!(html.contains("Recent operations"));
+        // Opts the page into the local-first sync client + loads the vendored bundle.
+        assert!(html.contains(r#"data-fiducia-sync="infra_operations""#));
+        assert!(html.contains(r#"src="/assets/fiducia-sync.js""#));
     }
 }

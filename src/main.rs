@@ -39,10 +39,13 @@ use axum::{
     Json, Router,
 };
 use fiducia_interfaces_db::admin::InfraOperationsRow;
+use fiducia_sync_core::{ChangeEvent, ChangeOp, WriteAck};
 use maud::Markup;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
 use tower_http::{
@@ -65,6 +68,11 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 /// without a network round-trip or a third-party origin in the trust boundary.
 const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
 
+/// The vendored, self-contained @fiducia/sync admin browser bundle (wasm inlined),
+/// served same-origin at `/assets/fiducia-sync.js`. Built by
+/// `fiducia-sync/sdk: npm run build:admin-bundle`. Single-binary, no CDN.
+const SYNC_JS: &str = include_str!("../assets/fiducia-sync.js");
+
 struct AppState {
     auth_url: String,
     brain_url: String,
@@ -72,7 +80,14 @@ struct AppState {
     pool: Option<PgPool>,
     /// Fans `fiducia:sync` frames out to `/admin/ws` subscribers.
     stream_tx: broadcast::Sender<String>,
+    /// Idempotency-Key → committed_version: a retried sync write replays its
+    /// original ack instead of re-running the UPDATE (which would re-bump version).
+    /// In-process + bounded (retries are short-lived). AppState is shared via Arc.
+    idempotency: Mutex<HashMap<String, i64>>,
 }
+
+/// Coarse bound on the in-process idempotency cache (cleared wholesale past this).
+const IDEMPOTENCY_CACHE_CAP: usize = 10_000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -88,11 +103,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "http://localhost:8095".into()),
         pool,
         stream_tx,
+        idempotency: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/assets/htmx.min.js", get(htmx_js))
+        .route("/assets/fiducia-sync.js", get(sync_js))
         .route("/login", get(login).post(login_submit))
         .route("/", get(dashboard))
         .route("/account", get(account))
@@ -103,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Local-first sync write path (mirrors the customer plane): the sync
         // client POSTs a queued optimistic write; we persist via SQLx and return
         // the committed row version, then broadcast the change to WS subscribers.
-        .route("/api/admin/sync/infra_operations", post(sync_write_infra_operations))
+        .route("/api/admin/sync/:table", post(sync_write))
         .route("/admin/ws", get(admin_ws))
         .with_state(state)
         // Hardening stack (outermost last): catch handler panics → 500, bound
@@ -151,6 +168,14 @@ async fn htmx_js() -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
         HTMX_JS,
+    )
+}
+
+/// Serve the vendored, self-contained @fiducia/sync admin bundle (same-origin).
+async fn sync_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        SYNC_JS,
     )
 }
 
@@ -396,87 +421,119 @@ struct SyncWriteRequest {
     base_version: Option<i64>,
 }
 
-/// Persist a queued infra_operations write and return the committed row version
-/// so the client can adopt it and clear its `dirty` flag; broadcast the change so
-/// every WS subscriber reconciles too. The BEFORE UPDATE trigger bumps `version`.
-async fn sync_write_infra_operations(
+/// The @fiducia/sync write path, generic in `{table}` (only `infra_operations` is
+/// DB-wired today). Persists the queued optimistic write, returns the committed row
+/// version (a shared `WriteAck`) so the client adopts it and clears `dirty`, and
+/// broadcasts the change. Honors the client's Idempotency-Key so a retry replays
+/// the original ack instead of re-running the UPDATE (which re-bumps version).
+async fn sync_write(
     State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<SyncWriteRequest>,
 ) -> Response {
-    let op = req.op.as_deref().unwrap_or("upsert");
-
-    if let Some(pool) = &st.pool {
-        if let Ok(id) = Uuid::parse_str(&req.id) {
-            let committed = if op == "delete" {
-                // A control-plane op is an audit record, not a droppable row: a
-                // "delete" marks it failed. Version still bumps via the trigger.
-                sqlx::query_as::<_, InfraOperationsRow>(
-                    "update infra_operations set status = 'failed' where id = $1 returning *",
-                )
-                .bind(id)
-                .fetch_optional(pool)
-                .await
-            } else {
-                let payload = req.payload.clone().unwrap_or_else(|| json!({}));
-                let status = payload.get("status").and_then(Value::as_str);
-                let target_nodes = payload
-                    .get("target_nodes")
-                    .and_then(Value::as_i64)
-                    .map(|v| v as i32);
-                let error = payload.get("error").and_then(Value::as_str);
-                // COALESCE keeps existing values for any field the client omitted.
-                sqlx::query_as::<_, InfraOperationsRow>(
-                    "update infra_operations set \
-                        status = coalesce($2, status), \
-                        target_nodes = coalesce($3, target_nodes), \
-                        error = coalesce($4, error) \
-                     where id = $1 returning *",
-                )
-                .bind(id)
-                .bind(status)
-                .bind(target_nodes)
-                .bind(error)
-                .fetch_optional(pool)
-                .await
-            };
-
-            match committed {
-                Ok(Some(row)) => {
-                    broadcast_infra_change(&st, &row);
-                    return Json(json!({
-                        "id": row.id.to_string(),
-                        "committed_version": row.version,
-                    }))
-                    .into_response();
-                }
-                Ok(None) => {}
-                Err(err) => tracing::error!("infra_operations sync write failed: {err}"),
-            }
+    let idem_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    if let Some(key) = &idem_key {
+        if let Some(v) = st.idempotency.lock().unwrap().get(key).copied() {
+            return ack(&req.id, v);
         }
     }
 
-    // Fallback ack (no pool, unparseable id, or no matching row): a monotonic
-    // version so the client's queue drains cleanly instead of retrying.
-    Json(json!({
-        "id": req.id,
-        "committed_version": req.base_version.unwrap_or(0) + 1,
-    }))
+    let committed = match table.as_str() {
+        "infra_operations" => sync_write_infra_operations_row(&st, &req).await,
+        // No DB-wired handler for this table yet — fall through to the fallback ack.
+        _ => None,
+    };
+    let version = committed.unwrap_or_else(|| req.base_version.unwrap_or(0) + 1);
+
+    if let Some(key) = idem_key {
+        let mut cache = st.idempotency.lock().unwrap();
+        if cache.len() >= IDEMPOTENCY_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, version);
+    }
+    ack(&req.id, version)
+}
+
+/// Build the shared write-ack the @fiducia/sync client reconciles against.
+fn ack(id: &str, committed_version: i64) -> Response {
+    Json(WriteAck {
+        id: id.to_string(),
+        committed_version,
+    })
     .into_response()
 }
 
-/// Broadcast a single infra_operations upsert as a `fiducia:sync` frame.
+/// Persist one queued optimistic write to `infra_operations`, broadcasting the
+/// committed change. Returns the committed row version, or `None` when there was
+/// no pool / no matching row / a bad id. The BEFORE UPDATE trigger bumps `version`.
+async fn sync_write_infra_operations_row(st: &AppState, req: &SyncWriteRequest) -> Option<i64> {
+    let pool = st.pool.as_ref()?;
+    let id = Uuid::parse_str(&req.id).ok()?;
+    let op = req.op.as_deref().unwrap_or("upsert");
+
+    let committed = if op == "delete" {
+        // A control-plane op is an audit record, not a droppable row: a "delete"
+        // marks it failed. Version still bumps via the trigger.
+        sqlx::query_as::<_, InfraOperationsRow>(
+            "update infra_operations set status = 'failed' where id = $1 returning *",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    } else {
+        let payload = req.payload.clone().unwrap_or_else(|| json!({}));
+        let status = payload.get("status").and_then(Value::as_str);
+        let target_nodes = payload
+            .get("target_nodes")
+            .and_then(Value::as_i64)
+            .map(|v| v as i32);
+        let error = payload.get("error").and_then(Value::as_str);
+        // COALESCE keeps existing values for any field the client omitted.
+        sqlx::query_as::<_, InfraOperationsRow>(
+            "update infra_operations set \
+                status = coalesce($2, status), \
+                target_nodes = coalesce($3, target_nodes), \
+                error = coalesce($4, error) \
+             where id = $1 returning *",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(target_nodes)
+        .bind(error)
+        .fetch_optional(pool)
+        .await
+    };
+
+    match committed {
+        Ok(Some(row)) => {
+            broadcast_infra_change(st, &row);
+            Some(row.version)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::error!("infra_operations sync write failed: {err}");
+            None
+        }
+    }
+}
+
+/// Broadcast a single infra_operations upsert as a `fiducia:sync` frame, built from
+/// the shared fiducia-sync-core ChangeEvent so server and client agree on one shape.
 fn broadcast_infra_change(st: &AppState, row: &InfraOperationsRow) {
-    let frame = json!({
-        "event": "fiducia:sync",
-        "changes": [{
-            "table": "infra_operations",
-            "op": "upsert",
-            "id": row.id.to_string(),
-            "version": row.version,
-            "row": serde_json::to_value(row).unwrap_or_default(),
-            "at_ms": unix_epoch_ms(),
-        }],
-    });
+    let change = ChangeEvent {
+        table: "infra_operations".to_string(),
+        op: ChangeOp::Upsert,
+        id: row.id.to_string(),
+        version: row.version,
+        row: serde_json::to_value(row).unwrap_or_default(),
+        at_ms: unix_epoch_ms() as i64,
+    };
+    let frame = json!({ "event": "fiducia:sync", "changes": [change] });
     let _ = st.stream_tx.send(frame.to_string());
 }
 
@@ -516,6 +573,76 @@ async fn admin_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<Stri
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            auth_url: "http://localhost:8097".into(),
+            brain_url: "http://localhost:8095".into(),
+            pool: None, // no DB -> fallback monotonic ack path
+            stream_tx: broadcast::channel(16).0,
+            idempotency: Mutex::new(HashMap::new()),
+        })
+    }
+
+    async fn post_sync(state: Arc<AppState>, table: &str, key: Option<&str>, base: i64) -> Value {
+        let app = Router::new()
+            .route("/api/admin/sync/:table", post(sync_write))
+            .with_state(state);
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/api/admin/sync/{table}"))
+            .header(CONTENT_TYPE, "application/json");
+        if let Some(k) = key {
+            builder = builder.header("idempotency-key", k);
+        }
+        let body = json!({ "id": "op1", "op": "upsert", "base_version": base }).to_string();
+        let resp = app.oneshot(builder.body(Body::from(body)).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sync_write_is_generic_and_acks_a_monotonic_version() {
+        let acked = post_sync(test_state(), "infra_operations", None, 4).await;
+        assert_eq!(acked["id"], "op1");
+        assert_eq!(acked["committed_version"], 5);
+        // A table with no DB-wired handler still returns a valid ack (generic route).
+        let other = post_sync(test_state(), "operators", None, 0).await;
+        assert_eq!(other["committed_version"], 1);
+    }
+
+    #[tokio::test]
+    async fn serves_the_vendored_sync_bundle() {
+        let app = Router::new().route("/assets/fiducia-sync.js", get(sync_js));
+        let resp = app
+            .oneshot(Request::builder().uri("/assets/fiducia-sync.js").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert!(ct.contains("javascript"), "ct={ct}");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("FiduciaSyncAdmin"));
+    }
+
+    #[tokio::test]
+    async fn sync_write_idempotency_key_replays_the_same_ack() {
+        let state = test_state();
+        let first = post_sync(state.clone(), "infra_operations", Some("infra_operations:op1:upsert:7"), 7).await;
+        assert_eq!(first["committed_version"], 8);
+        // Same key, different base -> the ORIGINAL ack is replayed, not 1000.
+        let retry = post_sync(state.clone(), "infra_operations", Some("infra_operations:op1:upsert:7"), 999).await;
+        assert_eq!(retry["committed_version"], 8);
     }
 }
 

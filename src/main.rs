@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Form, Path, State,
+        Form, Path, Query, State,
     },
     http::{
         header::{CONTENT_TYPE, LOCATION, SET_COOKIE},

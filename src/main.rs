@@ -437,8 +437,11 @@ async fn sync_write(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     if let Some(key) = &idem_key {
-        if let Some(v) = st.idempotency.lock().unwrap().get(key).copied() {
-            return ack(&req.id, v);
+        match idempotency_begin(&st, key).await {
+            Idem::Replay(v) => return ack(&req.id, v),
+            // A concurrent identical request holds the claim; don't re-run.
+            Idem::InFlight => return ack(&req.id, req.base_version.unwrap_or(0) + 1),
+            Idem::Proceed => {}
         }
     }
 
@@ -449,14 +452,110 @@ async fn sync_write(
     };
     let version = committed.unwrap_or_else(|| req.base_version.unwrap_or(0) + 1);
 
-    if let Some(key) = idem_key {
+    if let Some(key) = &idem_key {
+        idempotency_commit(&st, key, version).await;
+    }
+    ack(&req.id, version)
+}
+
+/// Idempotency decision for a claimed/seen key.
+enum Idem {
+    Replay(i64),
+    InFlight,
+    Proceed,
+}
+
+/// Begin idempotent handling of `key`. Durable (survives restarts) when a pool is
+/// present — claim-first so only the first request runs the mutation; otherwise an
+/// in-process cache (the mock/no-DB path used in tests).
+async fn idempotency_begin(st: &AppState, key: &str) -> Idem {
+    if let Some(pool) = &st.pool {
+        // Claim: insert returns a row only if we won it.
+        let claimed = sqlx::query_scalar::<_, i32>(
+            "insert into sync_idempotency_keys (key) values ($1) \
+             on conflict (key) do nothing returning 1",
+        )
+        .bind(key)
+        .fetch_optional(pool)
+        .await;
+        match claimed {
+            Ok(Some(_)) => Idem::Proceed,
+            Ok(None) => {
+                // Existed already — replay the committed version (null => in-flight).
+                match sqlx::query_scalar::<_, Option<i64>>(
+                    "select committed_version from sync_idempotency_keys where key = $1",
+                )
+                .bind(key)
+                .fetch_optional(pool)
+                .await
+                {
+                    Ok(Some(Some(v))) => Idem::Replay(v),
+                    Ok(Some(None)) => Idem::InFlight,
+                    _ => Idem::Proceed,
+                }
+            }
+            Err(_) => Idem::Proceed, // ledger error must not block the write
+        }
+    } else if let Some(v) = st.idempotency.lock().unwrap().get(key).copied() {
+        Idem::Replay(v)
+    } else {
+        Idem::Proceed
+    }
+}
+
+/// Record the committed version for `key` (durable when pooled, else in-process).
+async fn idempotency_commit(st: &AppState, key: &str, version: i64) {
+    if let Some(pool) = &st.pool {
+        let _ = sqlx::query("update sync_idempotency_keys set committed_version = $2 where key = $1")
+            .bind(key)
+            .bind(version)
+            .execute(pool)
+            .await;
+    } else {
         let mut cache = st.idempotency.lock().unwrap();
         if cache.len() >= IDEMPOTENCY_CACHE_CAP {
             cache.clear();
         }
-        cache.insert(key, version);
+        cache.insert(key.to_owned(), version);
     }
-    ack(&req.id, version)
+}
+
+#[derive(Debug, Deserialize)]
+struct CatchupParams {
+    #[serde(default)]
+    since: i64,
+}
+
+/// Catch-up hydration: `GET /api/admin/sync/{table}?since=<version>` returns the
+/// control-plane rows newer than the client's cursor, ordered by version
+/// (index-backed by `infra_operations_version_idx`). Feeds the SDK's `hydrate()`.
+async fn sync_catchup(
+    State(st): State<Arc<AppState>>,
+    Path(table): Path<String>,
+    Query(params): Query<CatchupParams>,
+) -> Response {
+    let rows: Vec<serde_json::Value> = match (table.as_str(), &st.pool) {
+        ("infra_operations", Some(pool)) => {
+            match sqlx::query_as::<_, InfraOperationsRow>(
+                "select * from infra_operations where version > $1 order by version asc limit 500",
+            )
+            .bind(params.since)
+            .fetch_all(pool)
+            .await
+            {
+                Ok(rows) => rows
+                    .iter()
+                    .map(|r| serde_json::to_value(r).unwrap_or_default())
+                    .collect(),
+                Err(err) => {
+                    tracing::error!("infra_operations catch-up failed: {err}");
+                    vec![]
+                }
+            }
+        }
+        _ => vec![],
+    };
+    Json(json!({ "table": table, "since": params.since, "rows": rows })).into_response()
 }
 
 /// Build the shared write-ack the @fiducia/sync client reconciles against.

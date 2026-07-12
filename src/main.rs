@@ -776,25 +776,6 @@ mod db_tests {
 
     const SCHEMA: &str = include_str!("../../fiducia-interfaces/sql/admin.sql");
 
-    // One shared pool + one schema apply for the module (see the customer plane's
-    // store tests: per-test `create or replace function` races two sessions).
-    static POOL: tokio::sync::OnceCell<Option<PgPool>> = tokio::sync::OnceCell::const_new();
-
-    async fn pool_or_skip() -> Option<PgPool> {
-        POOL.get_or_init(|| async {
-            let url = std::env::var("TEST_DATABASE_URL").ok().filter(|v| !v.is_empty())?;
-            let pool = PgPoolOptions::new()
-                .max_connections(8)
-                .connect(&url)
-                .await
-                .expect("connect TEST_DATABASE_URL");
-            sqlx::raw_sql(SCHEMA).execute(&pool).await.expect("apply admin.sql");
-            Some(pool)
-        })
-        .await
-        .clone()
-    }
-
     fn state_with(pool: PgPool) -> AppState {
         AppState {
             auth_url: "x".into(),
@@ -805,58 +786,45 @@ mod db_tests {
         }
     }
 
-    async fn insert_op(pool: &PgPool, action: &str) -> Uuid {
-        sqlx::query_scalar::<_, Uuid>("insert into infra_operations (action) values ($1) returning id")
-            .bind(action)
-            .fetch_one(pool)
-            .await
-            .expect("insert infra_operations")
-    }
-
+    // One test, one pool, one runtime: `#[tokio::test]` gives each test its own
+    // runtime, and an sqlx pool is bound to the runtime that created it — so a
+    // pool shared across tests dies with the first test's runtime. Keeping the
+    // whole sync-durability check in a single test sidesteps that entirely.
     #[tokio::test]
-    async fn durable_idempotency_claims_then_replays() {
-        let Some(pool) = pool_or_skip().await else {
-            eprintln!("skip durable_idempotency_claims_then_replays: TEST_DATABASE_URL unset");
+    async fn sync_durability_against_real_postgres() {
+        let Some(url) = std::env::var("TEST_DATABASE_URL").ok().filter(|v| !v.is_empty()) else {
+            eprintln!("skip sync_durability_against_real_postgres: TEST_DATABASE_URL unset");
             return;
         };
-        let st = state_with(pool);
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+        sqlx::raw_sql(SCHEMA).execute(&pool).await.expect("apply admin.sql");
+        let st = state_with(pool.clone());
+
+        // --- Durable idempotency: claim -> in-flight -> record -> replay ---------
         let key = format!("infra_operations:{}:upsert:7", Uuid::new_v4().simple());
-
-        // First caller owns the claim; a concurrent one sees it in-flight.
-        assert!(matches!(idempotency_begin(&st, &key).await, Idem::Proceed));
-        assert!(matches!(idempotency_begin(&st, &key).await, Idem::InFlight));
-
-        // After recording, every future lookup replays — this is what survives a
-        // process restart (a fresh AppState with a null in-process cache still replays).
+        assert!(matches!(idempotency_begin(&st, &key).await, Idem::Proceed), "first claim owns it");
+        assert!(matches!(idempotency_begin(&st, &key).await, Idem::InFlight), "second sees in-flight");
         idempotency_commit(&st, &key, 8).await;
-        assert!(matches!(idempotency_begin(&st, &key).await, Idem::Replay(8)));
-        let fresh = state_with(st.pool.clone().unwrap());
-        assert!(matches!(idempotency_begin(&fresh, &key).await, Idem::Replay(8)));
-    }
+        assert!(matches!(idempotency_begin(&st, &key).await, Idem::Replay(8)), "replays committed");
+        // Survives a "restart": a fresh AppState (empty in-process cache) still replays.
+        let fresh = state_with(pool.clone());
+        assert!(matches!(idempotency_begin(&fresh, &key).await, Idem::Replay(8)), "durable across restart");
 
-    #[tokio::test]
-    async fn catchup_returns_rows_newer_than_the_cursor_ordered() {
-        let Some(pool) = pool_or_skip().await else {
-            eprintln!("skip catchup_returns_rows_newer_than_the_cursor_ordered: TEST_DATABASE_URL unset");
-            return;
-        };
-        let a = insert_op(&pool, "scale").await;
-        let _b = insert_op(&pool, "drain").await;
-        // Bump `a` to version 2 so a cursor of 1 separates it from the v1 rows.
+        // --- Indexed catch-up: rows newer than the cursor, ordered by version ----
+        let a: Uuid = sqlx::query_scalar("insert into infra_operations (action) values ('scale') returning id")
+            .fetch_one(&pool).await.unwrap();
+        let _b: Uuid = sqlx::query_scalar("insert into infra_operations (action) values ('drain') returning id")
+            .fetch_one(&pool).await.unwrap();
         sqlx::query("update infra_operations set status = 'applied' where id = $1")
-            .bind(a)
-            .execute(&pool)
-            .await
-            .unwrap();
+            .bind(a).execute(&pool).await.unwrap(); // bump `a` to version 2
 
         let newer: Vec<InfraOperationsRow> = sqlx::query_as(
             "select * from infra_operations where version > $1 order by version asc limit 500",
-        )
-        .bind(1_i64)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-
+        ).bind(1_i64).fetch_all(&pool).await.unwrap();
         assert!(newer.iter().any(|r| r.id == a && r.version > 1), "bumped row present");
         assert!(newer.iter().all(|r| r.version > 1), "cursor excludes v1 rows");
         assert!(newer.windows(2).all(|w| w[0].version <= w[1].version), "ordered by version");

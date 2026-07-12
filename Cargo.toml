@@ -32,6 +32,11 @@ fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
 # reads/writes these when DATABASE_URL is set.
 fiducia-interfaces-db = { path = "../fiducia-interfaces/generated/rust-db" }
 
+# The local-first sync protocol core (native build, no wasm). The admin server
+# builds its fiducia:sync change frames and write-acks from THESE types so it and
+# the @fiducia/sync browser client share one protocol definition (same as customer).
+fiducia-sync-core = { path = "../fiducia-sync" }
+
 # SQLx for the DB-backed infra_operations handlers (P2). Runtime-checked queries
 # (query_as, not the compile-time macros) so `cargo build` needs no live DB.
 sqlx = { version = "0.8", features = [
@@ -43,3 +48,7 @@ sqlx = { version = "0.8", features = [
     "macros",
 ] }
 uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+# `ServiceExt::oneshot` drives the router in tests without binding a socket.
+tower = { version = "0.5", features = ["util"] }

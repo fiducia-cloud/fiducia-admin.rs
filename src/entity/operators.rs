@@ -14,6 +14,7 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub version: i64,
+    pub sync_sequence: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

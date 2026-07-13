@@ -22,7 +22,9 @@ enabled, subject-keyed record in the isolated admin database.
   only trusted `admin`/`operator` roles, distinguishes explicit bearer
   credentials from ambient cookies, and provides the debug-build-only local
   auth bypass. The sync write path binds each durable key to the canonical
-  operator/write fingerprint and commits claim + mutation + outcome atomically.
+  operator/write fingerprint, requires an exact base-version CAS, and commits
+  claim + mutation + outcome atomically. Catch-up pages merge current rows with
+  delete tombstones by the global transactional `sync_sequence` cursor.
 - **`upstream.rs`** — the outbound HTTP calls to `fiducia-brain` (nodes /
   placement / scale); failures surface as
   explicit dependency errors instead of fabricated empty results.

@@ -36,7 +36,8 @@ canonical `Host`, and writes reject a supplied non-admin `Origin`.
 | `POST /logout` | clear the admin-only session cookie |
 | `GET /` | operator dashboard |
 | `GET /infra` · `POST /infra/scale` | cluster operations |
-| `GET/POST /api/admin/sync/{table}` | authorized admin-plane sync |
+| `GET /api/admin/sync/{table}?cursor=N&limit=M` | ordered catch-up changes (`changes`, `next_cursor`, `has_more`) |
+| `POST /api/admin/sync/{table}` | version-CAS mutation with mandatory `Idempotency-Key` |
 | `GET /admin/ws` | authorized admin-plane realtime stream |
 | `GET /healthz` | liveness |
 
@@ -63,8 +64,10 @@ FIDUCIA_ADMIN_DEV_SESSION=admin cargo run    # browse http://127.0.0.1:8096
 > compiled out of release binaries entirely. A release binary ignores the
 > variable and logs an error; no other variable can re-enable it.
 
-The service fails startup without its Postgres audit/idempotency ledger, and
-upstream failures return an explicit dependency error rather than empty data.
+The service fails startup when its admin-plane Postgres connection is unavailable.
+The canonical schema must be applied before serving traffic; missing audit, sync,
+or idempotency relations fail closed when their routes use them. Upstream failures
+return an explicit dependency error rather than fabricated empty data.
 Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-telemetry.rs).
 
 ## Configuration (environment)
@@ -108,6 +111,16 @@ The schema is audited by the CLI flag contract step in CI
 (`.github/workflows/ci.yml`). Build the pinned parser once with
 `make -C vendor/flags-2-env all`.
 
+### Reproducible container inputs
+
+The container build fetches `fiducia-interfaces` at
+`bbd8b52ce729ec34b0a9bff4dda6d0a448181797` and `fiducia-sync` at
+`5d3660511b3bfe951d0a66f9d7737497e0d1401f`. Both build arguments must be
+40-character lowercase commit ids; the Dockerfile checks out each commit in
+detached mode and verifies `HEAD` before compiling with `cargo --locked`. CI uses
+the same immutable refs. Update the pins only with the corresponding schema,
+generated browser bundle, and test results in one reviewed change.
+
 ## Security
 
 Hardening in place (verified this audit):
@@ -133,8 +146,12 @@ Hardening in place (verified this audit):
   fingerprint; key claim, row mutation, and committed version are one database
   transaction, and realtime publication occurs only after commit. Historical
   keys without a reconstructable fingerprint fail closed and must be retried
-  with a newly minted key. Raw SQL is limited to applying the canonical schema
-  in the opt-in real-Postgres test.
+  with a newly minted key. Every mutation requires a nonempty durable key and an
+  exact `base_version`; the guarded update returns `409 version_conflict` instead
+  of overwriting a newer row. Catch-up uses a separate transactional
+  `sync_sequence` cursor plus durable delete tombstones—per-row `version` is never
+  used as a table-wide cursor. Raw SQL is limited to the single-snapshot catch-up
+  UNION and applying the canonical schema in the opt-in real-Postgres test.
 - **Request stack.** Body cap (64 KiB), 30 s request timeout, panic catch, CSP
   frame denial, `X-Frame-Options: DENY`, MIME-sniff prevention, and a no-referrer
   policy apply across the service. Dynamic/login responses are `no-store`; the

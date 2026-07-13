@@ -22,13 +22,16 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: fiducia-cloud/fiducia-interfaces
+          ref: bbd8b52ce729ec34b0a9bff4dda6d0a448181797
           path: fiducia-interfaces
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: fiducia-cloud/fiducia-sync
+          ref: 5d3660511b3bfe951d0a66f9d7737497e0d1401f
           path: fiducia-sync
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
+          toolchain: "1.95.0"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
@@ -47,8 +50,9 @@ jobs:
       - name: test
         working-directory: repo
         run: cargo test --locked --all-targets --all-features
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-audit@0.21.2
       - name: audit
         working-directory: repo
-        run: |
-          cargo install cargo-audit --locked || true
-          cargo audit
+        run: cargo audit

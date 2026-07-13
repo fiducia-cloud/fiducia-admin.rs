@@ -42,11 +42,11 @@ use axum::{
 use fiducia_sync_core::{ChangeEvent, ChangeOp, WriteAck};
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, DatabaseConnection,
-    DatabaseTransaction, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, ConnectionTrait, Database,
+    DatabaseConnection, DatabaseTransaction, DbBackend, DbErr, EntityTrait, FromQueryResult,
+    QueryFilter, QueryOrder, QuerySelect, Statement, TransactionTrait,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
@@ -69,6 +69,8 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 const MAX_BODY_BYTES: usize = 64 * 1024;
 /// Bound attacker-controlled idempotency/echo keys before persisting them.
 const MAX_WRITE_KEY_BYTES: usize = 256;
+const DEFAULT_CATCHUP_PAGE_SIZE: u64 = 100;
+const MAX_CATCHUP_PAGE_SIZE: u64 = 500;
 const CSRF_HEADER: &str = "x-fiducia-csrf";
 
 /// The vendored htmx bundle, compiled into the binary and served same-origin at
@@ -698,7 +700,8 @@ struct SyncWriteRequest {
     #[serde(default)]
     base_version: Option<i64>,
     /// Client-minted durable identity used for both HTTP idempotency and exact
-    /// realtime echo matching. Older clients may omit it.
+    /// realtime echo matching. Mutations require this either here or in the
+    /// Idempotency-Key header; canonical clients send both.
     #[serde(default)]
     key: Option<String>,
 }
@@ -727,9 +730,7 @@ async fn sync_write(
     };
     let fingerprint = sync_write_fingerprint(&session, &table, &req);
     let outcome = match table.as_str() {
-        "infra_operations" => {
-            sync_write_infra_operations(&st, &req, idem_key.as_deref(), &fingerprint).await
-        }
+        "infra_operations" => sync_write_infra_operations(&st, &req, &idem_key, &fingerprint).await,
         _ => {
             return (
                 StatusCode::NOT_FOUND,
@@ -743,7 +744,7 @@ async fn sync_write(
         Ok(SyncWriteOutcome::Committed(row)) => {
             // Publish only after the row update and idempotency outcome commit
             // together. A websocket echo must never expose a rolled-back write.
-            broadcast_infra_change(&st, &row, idem_key.as_deref());
+            broadcast_infra_change(&st, &row, Some(&idem_key));
             ack(&req.id, row.version)
         }
         Err(SyncWriteError::InvalidId) => (
@@ -754,6 +755,30 @@ async fn sync_write(
         Err(SyncWriteError::InvalidOperation) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid_sync_operation" })),
+        )
+            .into_response(),
+        Err(SyncWriteError::InvalidPayload) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_sync_payload" })),
+        )
+            .into_response(),
+        Err(SyncWriteError::MissingBaseVersion) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "base_version_required" })),
+        )
+            .into_response(),
+        Err(SyncWriteError::InvalidBaseVersion) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_base_version" })),
+        )
+            .into_response(),
+        Err(SyncWriteError::VersionConflict { expected, actual }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "version_conflict",
+                "expected_version": expected,
+                "actual_version": actual,
+            })),
         )
             .into_response(),
         Err(SyncWriteError::NotFound) => (
@@ -781,6 +806,7 @@ async fn sync_write(
 /// the purported own-echo token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WriteKeyError {
+    Missing,
     Invalid,
     Mismatch,
 }
@@ -788,7 +814,7 @@ enum WriteKeyError {
 fn validated_write_key(
     headers: &HeaderMap,
     request: &SyncWriteRequest,
-) -> Result<Option<String>, WriteKeyError> {
+) -> Result<String, WriteKeyError> {
     let mut header_values = headers.get_all("idempotency-key").iter();
     let header_key = match header_values.next() {
         Some(value) => Some(value.to_str().map_err(|_| WriteKeyError::Invalid)?),
@@ -813,11 +839,15 @@ fn validated_write_key(
         }
     }
 
-    Ok(header_key.or(body_key).map(str::to_owned))
+    header_key
+        .or(body_key)
+        .map(str::to_owned)
+        .ok_or(WriteKeyError::Missing)
 }
 
 fn write_key_error(error: WriteKeyError) -> Response {
     let code = match error {
+        WriteKeyError::Missing => "idempotency_key_required",
         WriteKeyError::Invalid => "invalid_write_key",
         WriteKeyError::Mismatch => "write_key_mismatch",
     };
@@ -984,13 +1014,33 @@ async fn idempotency_complete(
 
 #[derive(Debug, Deserialize)]
 struct CatchupParams {
+    /// `since` remains an accepted alias for clients of the dormant pre-launch
+    /// endpoint, but it now means a global sync sequence, never a row version.
+    #[serde(default, alias = "since")]
+    cursor: i64,
     #[serde(default)]
-    since: i64,
+    limit: Option<u64>,
 }
 
-/// Catch-up hydration: `GET /api/admin/sync/{table}?since=<version>` returns the
-/// control-plane rows newer than the client's cursor, ordered by version
-/// (index-backed by `infra_operations_version_idx`). Feeds the SDK's `hydrate()`.
+#[derive(Debug, Clone, Serialize, FromQueryResult)]
+struct SyncCatchupChange {
+    sequence: i64,
+    #[serde(rename = "table")]
+    table_name: String,
+    op: String,
+    id: String,
+    version: i64,
+    row: Option<Value>,
+}
+
+struct SyncCatchupPage {
+    changes: Vec<SyncCatchupChange>,
+    next_cursor: i64,
+    has_more: bool,
+}
+
+/// Catch-up hydration returns a stable page of live-row upserts and durable
+/// delete tombstones ordered by the plane-wide, commit-visible sync sequence.
 async fn sync_catchup(
     State(st): State<Arc<AppState>>,
     Path(table): Path<String>,
@@ -1000,16 +1050,24 @@ async fn sync_catchup(
     if let Err(response) = require_admin_api(&headers, &st).await {
         return response;
     }
-    let rows: Vec<serde_json::Value> = match table.as_str() {
+    let page_size = params.limit.unwrap_or(DEFAULT_CATCHUP_PAGE_SIZE);
+    if params.cursor < 0 || page_size == 0 || page_size > MAX_CATCHUP_PAGE_SIZE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_catchup_cursor_or_limit",
+                "max_limit": MAX_CATCHUP_PAGE_SIZE,
+            })),
+        )
+            .into_response();
+    }
+    let page = match table.as_str() {
         "infra_operations" => {
             let Some(db) = &st.db else {
                 return dependency_error("database_unavailable", database_unavailable());
             };
-            match catchup_infra_operations(db, params.since).await {
-                Ok(rows) => rows
-                    .iter()
-                    .map(|r| serde_json::to_value(r).unwrap_or_default())
-                    .collect(),
+            match catchup_infra_operations(db, params.cursor, page_size).await {
+                Ok(page) => page,
                 Err(err) => return dependency_error("sync_catchup_failed", err),
             }
         }
@@ -1021,7 +1079,14 @@ async fn sync_catchup(
                 .into_response()
         }
     };
-    Json(json!({ "table": table, "since": params.since, "rows": rows })).into_response()
+    Json(json!({
+        "table": table,
+        "cursor": params.cursor,
+        "next_cursor": page.next_cursor,
+        "has_more": page.has_more,
+        "changes": page.changes,
+    }))
+    .into_response()
 }
 
 /// Build the shared write-ack the @fiducia/sync client reconciles against.
@@ -1043,6 +1108,10 @@ enum SyncWriteOutcome {
 enum SyncWriteError {
     InvalidId,
     InvalidOperation,
+    InvalidPayload,
+    MissingBaseVersion,
+    InvalidBaseVersion,
+    VersionConflict { expected: i64, actual: i64 },
     NotFound,
     IdempotencyInFlight,
     IdempotencyMismatch,
@@ -1050,23 +1119,27 @@ enum SyncWriteError {
 }
 
 /// Persist one queued optimistic write and its idempotency result atomically.
-/// The BEFORE UPDATE trigger bumps `version`; websocket publication happens in
-/// the caller only after this transaction has committed.
+/// The guarded UPDATE enforces `base_version`, the trigger bumps per-row version
+/// and global sequence, and websocket publication happens only after commit.
 async fn sync_write_infra_operations(
     st: &AppState,
     req: &SyncWriteRequest,
-    write_key: Option<&str>,
+    write_key: &str,
     request_fingerprint: &str,
 ) -> Result<SyncWriteOutcome, SyncWriteError> {
-    let db = st
-        .db
-        .as_ref()
-        .ok_or_else(|| SyncWriteError::Database(database_unavailable()))?;
     let id = Uuid::parse_str(&req.id).map_err(|_| SyncWriteError::InvalidId)?;
     let op = req.op.as_deref().unwrap_or("upsert");
     if !matches!(op, "upsert" | "delete") {
         return Err(SyncWriteError::InvalidOperation);
     }
+    let expected_version = req.base_version.ok_or(SyncWriteError::MissingBaseVersion)?;
+    if expected_version < 0 {
+        return Err(SyncWriteError::InvalidBaseVersion);
+    }
+    let db = st
+        .db
+        .as_ref()
+        .ok_or_else(|| SyncWriteError::Database(database_unavailable()))?;
 
     let transaction = db.begin().await.map_err(SyncWriteError::Database)?;
     let outcome = sync_write_infra_operations_in_transaction(
@@ -1074,6 +1147,7 @@ async fn sync_write_infra_operations(
         req,
         id,
         op,
+        expected_version,
         write_key,
         request_fingerprint,
     )
@@ -1101,15 +1175,14 @@ async fn sync_write_infra_operations_in_transaction(
     req: &SyncWriteRequest,
     id: Uuid,
     op: &str,
-    write_key: Option<&str>,
+    expected_version: i64,
+    write_key: &str,
     request_fingerprint: &str,
 ) -> Result<SyncWriteOutcome, SyncWriteError> {
-    if let Some(key) = write_key {
-        match idempotency_claim(transaction, key, request_fingerprint).await? {
-            Idem::Replay(version) => return Ok(SyncWriteOutcome::Replay(version)),
-            Idem::InFlight => return Err(SyncWriteError::IdempotencyInFlight),
-            Idem::Proceed => {}
-        }
+    match idempotency_claim(transaction, write_key, request_fingerprint).await? {
+        Idem::Replay(version) => return Ok(SyncWriteOutcome::Replay(version)),
+        Idem::InFlight => return Err(SyncWriteError::IdempotencyInFlight),
+        Idem::Proceed => {}
     }
 
     let current = infra_operations::Entity::find_by_id(id)
@@ -1117,13 +1190,26 @@ async fn sync_write_infra_operations_in_transaction(
         .await
         .map_err(SyncWriteError::Database)?
         .ok_or(SyncWriteError::NotFound)?;
-    let unchanged_status = current.status.clone();
-    let mut active: infra_operations::ActiveModel = current.into();
+    if current.version != expected_version {
+        return Err(SyncWriteError::VersionConflict {
+            expected: expected_version,
+            actual: current.version,
+        });
+    }
+
+    // The version predicate belongs to the UPDATE itself, not only to the read
+    // above: two transactions may both observe the same base before either wins.
+    let mut update = infra_operations::Entity::update_many()
+        .filter(infra_operations::Column::Id.eq(id))
+        .filter(infra_operations::Column::Version.eq(expected_version));
 
     if op == "delete" {
         // A control-plane op is an audit record, not a droppable row: a "delete"
         // marks it failed. Version still bumps via the trigger.
-        active.status = Set("failed".to_string());
+        update = update.col_expr(
+            infra_operations::Column::Status,
+            Expr::value("failed".to_string()),
+        );
     } else {
         let payload = req.payload.clone().unwrap_or_else(|| json!({}));
         let status = payload
@@ -1133,52 +1219,134 @@ async fn sync_write_infra_operations_in_transaction(
         let target_nodes = payload
             .get("target_nodes")
             .and_then(Value::as_i64)
-            .map(|v| v as i32);
+            .map(i32::try_from)
+            .transpose()
+            .map_err(|_| SyncWriteError::InvalidPayload)?;
         let error = payload
             .get("error")
             .and_then(Value::as_str)
             .map(str::to_owned);
         let mut changed = false;
         if let Some(status) = status {
-            active.status = Set(status);
+            if !matches!(status.as_str(), "requested" | "applied" | "failed") {
+                return Err(SyncWriteError::InvalidPayload);
+            }
+            update = update.col_expr(infra_operations::Column::Status, Expr::value(status));
             changed = true;
         }
         if let Some(target_nodes) = target_nodes {
-            active.target_nodes = Set(Some(target_nodes));
+            if target_nodes < 3 {
+                return Err(SyncWriteError::InvalidPayload);
+            }
+            update = update.col_expr(
+                infra_operations::Column::TargetNodes,
+                Expr::value(Some(target_nodes)),
+            );
             changed = true;
         }
         if let Some(error) = error {
-            active.error = Set(Some(error));
+            if error.len() > 500 {
+                return Err(SyncWriteError::InvalidPayload);
+            }
+            update = update.col_expr(infra_operations::Column::Error, Expr::value(Some(error)));
             changed = true;
         }
         // Preserve the sync contract: even an empty patch is a committed write
         // whose trigger advances the row version.
         if !changed {
-            active.status = Set(unchanged_status);
+            update = update.col_expr(
+                infra_operations::Column::Status,
+                Expr::value(current.status),
+            );
         }
     }
 
-    let row = active
-        .update(transaction)
+    let result = update
+        .exec(transaction)
         .await
         .map_err(SyncWriteError::Database)?;
-    if let Some(key) = write_key {
-        idempotency_complete(transaction, key, request_fingerprint, row.version).await?;
+    if result.rows_affected != 1 {
+        let actual = infra_operations::Entity::find_by_id(id)
+            .one(transaction)
+            .await
+            .map_err(SyncWriteError::Database)?;
+        return match actual {
+            Some(row) => Err(SyncWriteError::VersionConflict {
+                expected: expected_version,
+                actual: row.version,
+            }),
+            None => Err(SyncWriteError::NotFound),
+        };
     }
+    let row = infra_operations::Entity::find_by_id(id)
+        .one(transaction)
+        .await
+        .map_err(SyncWriteError::Database)?
+        .ok_or(SyncWriteError::NotFound)?;
+    idempotency_complete(transaction, write_key, request_fingerprint, row.version).await?;
     Ok(SyncWriteOutcome::Committed(Box::new(row)))
 }
 
-/// Load one bounded, monotonic catch-up page through the ORM.
+/// Load one bounded catch-up page in a single SQL snapshot. Splitting the live
+/// row and tombstone reads into separate statements would allow a commit between
+/// them to advance the returned cursor past a row the first statement did not see.
 async fn catchup_infra_operations(
     db: &DatabaseConnection,
-    since: i64,
-) -> Result<Vec<InfraOperationsRow>, DbErr> {
-    infra_operations::Entity::find()
-        .filter(infra_operations::Column::Version.gt(since))
-        .order_by_asc(infra_operations::Column::Version)
-        .limit(500)
-        .all(db)
-        .await
+    cursor: i64,
+    page_size: u64,
+) -> Result<SyncCatchupPage, DbErr> {
+    let fetch_limit = i64::try_from(page_size + 1)
+        .map_err(|_| DbErr::Custom("catch-up page size overflow".to_string()))?;
+    let statement = Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"
+select live.sync_sequence as sequence,
+       'infra_operations'::text as table_name,
+       'upsert'::text as op,
+       live.id::text as id,
+       live.version as version,
+       to_jsonb(live) as row
+  from public.infra_operations live
+ where live.sync_sequence > $1
+union all
+select tomb.sequence as sequence,
+       tomb.table_name as table_name,
+       'delete'::text as op,
+       tomb.row_id as id,
+       tomb.row_version as version,
+       null::jsonb as row
+  from public.sync_tombstones tomb
+ where tomb.table_name = 'infra_operations'
+   and tomb.sequence > $1
+order by sequence
+limit $2
+"#,
+        [cursor.into(), fetch_limit.into()],
+    );
+    let query_rows = db.query_all(statement).await?;
+    let changes = query_rows
+        .iter()
+        .map(|row| SyncCatchupChange::from_query_result(row, ""))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(finish_catchup_page(changes, cursor, page_size))
+}
+
+fn finish_catchup_page(
+    mut changes: Vec<SyncCatchupChange>,
+    cursor: i64,
+    page_size: u64,
+) -> SyncCatchupPage {
+    let page_size = page_size as usize;
+    let has_more = changes.len() > page_size;
+    if has_more {
+        changes.truncate(page_size);
+    }
+    let next_cursor = changes.last().map_or(cursor, |change| change.sequence);
+    SyncCatchupPage {
+        changes,
+        next_cursor,
+        has_more,
+    }
 }
 
 fn database_unavailable() -> DbErr {
@@ -1363,8 +1531,8 @@ mod sync_tests {
         let mut headers = HeaderMap::new();
         headers.insert("idempotency-key", HeaderValue::from_static("write-key-1"));
         assert_eq!(
-            validated_write_key(&headers, &request).unwrap().as_deref(),
-            Some("write-key-1")
+            validated_write_key(&headers, &request).unwrap(),
+            "write-key-1"
         );
 
         headers.insert("idempotency-key", HeaderValue::from_static("write-key-2"));
@@ -1387,7 +1555,7 @@ mod sync_tests {
     }
 
     #[test]
-    fn legacy_keyless_and_body_only_keyed_writes_remain_supported() {
+    fn every_mutation_requires_a_nonempty_key_but_body_only_is_accepted() {
         let mut request = SyncWriteRequest {
             id: "op1".into(),
             op: Some("upsert".into()),
@@ -1396,17 +1564,58 @@ mod sync_tests {
             key: None,
         };
         assert_eq!(
-            validated_write_key(&HeaderMap::new(), &request).unwrap(),
-            None
+            validated_write_key(&HeaderMap::new(), &request),
+            Err(WriteKeyError::Missing)
         );
 
         request.key = Some("body-only-key".into());
         assert_eq!(
-            validated_write_key(&HeaderMap::new(), &request)
-                .unwrap()
-                .as_deref(),
-            Some("body-only-key")
+            validated_write_key(&HeaderMap::new(), &request).unwrap(),
+            "body-only-key"
         );
+    }
+
+    #[test]
+    fn catchup_page_advances_only_through_returned_global_sequences() {
+        let change = |sequence| SyncCatchupChange {
+            sequence,
+            table_name: "infra_operations".to_string(),
+            op: "upsert".to_string(),
+            id: format!("op-{sequence}"),
+            version: 1,
+            row: Some(json!({ "id": format!("op-{sequence}") })),
+        };
+        let page = finish_catchup_page(vec![change(10), change(11), change(12)], 9, 2);
+        assert_eq!(page.changes.len(), 2);
+        assert_eq!(page.next_cursor, 11);
+        assert!(page.has_more);
+
+        let empty = finish_catchup_page(Vec::new(), page.next_cursor, 2);
+        assert_eq!(empty.next_cursor, 11);
+        assert!(!empty.has_more);
+    }
+
+    #[tokio::test]
+    async fn sync_mutation_requires_a_nonnegative_base_version_before_database_access() {
+        let mut request = SyncWriteRequest {
+            id: "00000000-0000-0000-0000-000000000001".into(),
+            op: Some("upsert".into()),
+            payload: Some(json!({ "status": "applied" })),
+            base_version: None,
+            key: Some("write-key-1".into()),
+        };
+        assert!(matches!(
+            sync_write_infra_operations(&test_state(), &request, "write-key-1", "fingerprint")
+                .await,
+            Err(SyncWriteError::MissingBaseVersion)
+        ));
+
+        request.base_version = Some(-1);
+        assert!(matches!(
+            sync_write_infra_operations(&test_state(), &request, "write-key-1", "fingerprint")
+                .await,
+            Err(SyncWriteError::InvalidBaseVersion)
+        ));
     }
 
     #[test]
@@ -1778,8 +1987,8 @@ mod interface_contract_tests {
     }
 }
 
-// DB-behavior tests for the sync durability layer (durable idempotency + indexed
-// catch-up), gated on `TEST_DATABASE_URL` — unset → skip, so `cargo test` stays
+// DB-behavior tests for the sync durability layer (durable idempotency + global
+// cursor/tombstones), gated on `TEST_DATABASE_URL` — unset → skip, so `cargo test` stays
 // green with no DB. Run against a real Postgres with admin.sql applied.
 #[cfg(test)]
 mod db_tests {
@@ -1816,8 +2025,9 @@ mod db_tests {
         let db = Database::connect(options)
             .await
             .expect("connect TEST_DATABASE_URL");
-        // Raw SQL is confined to applying the canonical gated-test schema; all
-        // application and behavioral-test CRUD below goes through SeaORM.
+        // Raw SQL here applies the canonical gated-test schema; behavioral CRUD
+        // below uses SeaORM, while production catch-up owns one reviewed UNION so
+        // live rows and tombstones are read in a single database snapshot.
         db.execute_unprepared(SCHEMA)
             .await
             .expect("apply admin.sql");
@@ -1838,7 +2048,7 @@ mod db_tests {
         let fingerprint = sync_write_fingerprint(&operator, "infra_operations", &request);
 
         assert!(matches!(
-            sync_write_infra_operations(&st, &request, Some(&key), &fingerprint).await,
+            sync_write_infra_operations(&st, &request, &key, &fingerprint).await,
             Err(SyncWriteError::NotFound)
         ));
         assert!(
@@ -1858,14 +2068,13 @@ mod db_tests {
         .insert(&db)
         .await
         .unwrap();
-        let committed_version =
-            match sync_write_infra_operations(&st, &request, Some(&key), &fingerprint)
-                .await
-                .unwrap()
-            {
-                SyncWriteOutcome::Committed(row) => row.version,
-                SyncWriteOutcome::Replay(_) => panic!("first successful write must commit"),
-            };
+        let committed_version = match sync_write_infra_operations(&st, &request, &key, &fingerprint)
+            .await
+            .unwrap()
+        {
+            SyncWriteOutcome::Committed(row) => row.version,
+            SyncWriteOutcome::Replay(_) => panic!("first successful write must commit"),
+        };
         let ledger = sync_idempotency_keys::Entity::find_by_id(&key)
             .one(&db)
             .await
@@ -1877,7 +2086,7 @@ mod db_tests {
         // Survives a restart and replays only the exact original request.
         let fresh = state_with(db.clone());
         assert!(matches!(
-            sync_write_infra_operations(&fresh, &request, Some(&key), &fingerprint).await,
+            sync_write_infra_operations(&fresh, &request, &key, &fingerprint).await,
             Ok(SyncWriteOutcome::Replay(version)) if version == committed_version
         ));
         let changed = SyncWriteRequest {
@@ -1889,11 +2098,48 @@ mod db_tests {
         };
         let changed_fingerprint = sync_write_fingerprint(&operator, "infra_operations", &changed);
         assert!(matches!(
-            sync_write_infra_operations(&fresh, &changed, Some(&key), &changed_fingerprint).await,
+            sync_write_infra_operations(&fresh, &changed, &key, &changed_fingerprint).await,
             Err(SyncWriteError::IdempotencyMismatch)
         ));
 
-        // --- Indexed catch-up: rows newer than the cursor, ordered by version ----
+        // A distinct stale write must lose the version CAS and roll its newly
+        // claimed idempotency key back, while the exact old request above replays.
+        let stale_key = format!("admin-sync-stale-{}", Uuid::new_v4().simple());
+        let stale = SyncWriteRequest {
+            key: Some(stale_key.clone()),
+            ..SyncWriteRequest {
+                id: request.id.clone(),
+                op: request.op.clone(),
+                payload: Some(json!({ "status": "failed" })),
+                base_version: Some(1),
+                key: None,
+            }
+        };
+        let stale_fingerprint = sync_write_fingerprint(&operator, "infra_operations", &stale);
+        assert!(matches!(
+            sync_write_infra_operations(&fresh, &stale, &stale_key, &stale_fingerprint).await,
+            Err(SyncWriteError::VersionConflict { expected: 1, actual })
+                if actual == committed_version
+        ));
+        assert!(
+            sync_idempotency_keys::Entity::find_by_id(&stale_key)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "a failed CAS rolls its key claim back"
+        );
+
+        // --- Global cursor: stable pages include v1 inserts and delete tombstones.
+        let clock = db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "select last_sequence from public.sync_clock".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let start_cursor: i64 = clock.try_get("", "last_sequence").unwrap();
         let a = infra_operations::ActiveModel {
             action: Set("scale".to_string()),
             ..Default::default()
@@ -1901,7 +2147,7 @@ mod db_tests {
         .insert(&db)
         .await
         .unwrap();
-        infra_operations::ActiveModel {
+        let b = infra_operations::ActiveModel {
             action: Set("drain".to_string()),
             ..Default::default()
         }
@@ -1909,22 +2155,61 @@ mod db_tests {
         .await
         .unwrap();
         let a_id = a.id;
+        let b_id = b.id;
         let mut active: infra_operations::ActiveModel = a.into();
         active.status = Set("applied".to_string());
         active.update(&db).await.unwrap(); // bump `a` to version 2
+        infra_operations::Entity::delete_by_id(b_id)
+            .exec(&db)
+            .await
+            .unwrap();
+        let c = infra_operations::ActiveModel {
+            action: Set("snapshot".to_string()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
 
-        let newer = catchup_infra_operations(&db, 1).await.unwrap();
+        let mut cursor = start_cursor;
+        let mut changes = Vec::new();
+        loop {
+            let page = catchup_infra_operations(&db, cursor, 1).await.unwrap();
+            assert!(page.changes.iter().all(|change| change.sequence > cursor));
+            changes.extend(page.changes);
+            if !page.has_more {
+                cursor = page.next_cursor;
+                break;
+            }
+            assert!(page.next_cursor > cursor);
+            cursor = page.next_cursor;
+        }
         assert!(
-            newer.iter().any(|r| r.id == a_id && r.version > 1),
-            "bumped row present"
+            changes
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence),
+            "global sequences are unique and strictly ordered"
         );
+        assert!(changes.iter().any(|change| {
+            change.id == a_id.to_string() && change.op == "upsert" && change.version == 2
+        }));
+        assert!(changes.iter().any(|change| {
+            change.id == b_id.to_string()
+                && change.op == "delete"
+                && change.version == 2
+                && change.row.is_none()
+        }));
         assert!(
-            newer.iter().all(|r| r.version > 1),
-            "cursor excludes v1 rows"
+            changes.iter().any(|change| {
+                change.id == c.id.to_string() && change.op == "upsert" && change.version == 1
+            }),
+            "a later v1 insert is visible after higher per-row versions"
         );
-        assert!(
-            newer.windows(2).all(|w| w[0].version <= w[1].version),
-            "ordered by version"
+        assert_eq!(
+            cursor,
+            changes
+                .last()
+                .map_or(start_cursor, |change| change.sequence)
         );
     }
 }

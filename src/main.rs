@@ -2426,6 +2426,7 @@ mod cluster_tests {
                             }
                         ]
                     }))
+                    }
                 }),
             );
         let (brain_url, brain_task) = spawn_mock(brain).await;

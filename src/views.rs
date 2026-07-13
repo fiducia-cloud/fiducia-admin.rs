@@ -862,6 +862,77 @@ mod tests {
     }
 
     #[test]
+    fn cluster_nodes_panel_shows_untrusted_address_as_a_distinct_state() {
+        let nodes = vec![json!({
+            "node_id": "spoofed", "address": "attacker.example.com:8090", "health": "healthy",
+            "last_seen_ms": 1_752_400_000_000i64, "hosted_shards": [], "leading_shards": []
+        })];
+        let observations = vec![NodeObservation {
+            node_id: "spoofed".into(),
+            base_url: "http://attacker.example.com:8090".into(),
+            shards: None,
+            error: Some("untrusted address".into()),
+            untrusted: true,
+        }];
+        let html = cluster_nodes_panel(&nodes, &observations).into_string();
+        assert!(html.contains("untrusted address"), "distinct refused badge");
+        // It must not read as a mere transient reachability failure.
+        assert!(!html.contains(">unreachable<"));
+    }
+
+    #[test]
+    fn cluster_status_panel_flags_dual_leader_unreached_and_truncation() {
+        let status = json!({ "cluster_id": "fiducia-test", "version": "0.1.0" });
+        let leader_view: crate::cluster_insight::ShardView = serde_json::from_value(json!({
+            "shard_id": 0, "role": "leader", "term": 9, "leader_id": "node-b", "has_quorum": true
+        }))
+        .unwrap();
+        let follower_view: crate::cluster_insight::ShardView = serde_json::from_value(json!({
+            "shard_id": 1, "role": "follower", "term": 4, "leader_id": "node-z"
+        }))
+        .unwrap();
+        let shards = vec![
+            MergedShard {
+                shard_id: 0,
+                reported_by: "node-b".into(),
+                leader_view: true,
+                dual_leader: true,
+                view: leader_view,
+            },
+            MergedShard {
+                shard_id: 1,
+                reported_by: "node-a".into(),
+                leader_view: false,
+                dual_leader: false,
+                view: follower_view,
+            },
+        ];
+        let quorum = ClusterQuorum {
+            leaderless: vec![],
+            leader_unreached: vec![1],
+            dual_leader: vec![0],
+            at_risk: vec![],
+            storage_faulted: vec![],
+            unresponsive: vec![],
+            nodes_reporting: 2,
+            nodes_failed: 1,
+            targets_truncated_from: Some(900),
+        };
+        let html =
+            cluster_status_panel(&status, &shards, &quorum, &PromScrape::NotConfigured, None)
+                .into_string();
+        assert!(html.contains("dual-leader"), "split-brain badge + card count");
+        assert!(html.contains("1 leader-unreached"), "M5 bucket in the card");
+        assert!(html.contains("1 dual-leader"), "M4 count in the card");
+        assert!(
+            html.contains("targets truncated (showing 512 of 900)"),
+            "M3 truncation note"
+        );
+        // Shard 1 has a known leader_id, so it reads as "no leader report", not leaderless.
+        assert!(html.contains("no leader report"));
+    }
+
+    #[test]
     fn cluster_events_panel_renders_all_three_states() {
         let unconfigured =
             cluster_events_panel(&EventsPanel::NotConfigured, 30, None).into_string();

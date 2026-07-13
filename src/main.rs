@@ -2225,6 +2225,30 @@ mod auth_flow_tests {
     }
 
     #[test]
+    fn grafana_public_url_validation_rejects_dangerous_schemes() {
+        // Allowed: http(s) URLs and root-relative paths (deep-link prefixes).
+        assert!(grafana_public_url_is_valid("https://grafana.example.com"));
+        assert!(grafana_public_url_is_valid("http://dd-grafana:3000"));
+        assert!(grafana_public_url_is_valid("/telemetry"));
+        // Rejected: anything that could become a dangerous or off-origin href.
+        assert!(!grafana_public_url_is_valid("javascript:alert(1)"));
+        assert!(!grafana_public_url_is_valid("data:text/html,<script>1</script>"));
+        assert!(!grafana_public_url_is_valid("//evil.example.com"));
+        assert!(!grafana_public_url_is_valid("ftp://grafana"));
+        assert!(!grafana_public_url_is_valid("telemetry")); // not root-relative
+        // A set-but-invalid value fails startup closed; unset stays a no-op.
+        std::env::set_var("FIDUCIA_GRAFANA_PUBLIC_URL", "javascript:alert(1)");
+        assert!(validated_grafana_public_url().is_err());
+        std::env::set_var("FIDUCIA_GRAFANA_PUBLIC_URL", "/telemetry");
+        assert_eq!(
+            validated_grafana_public_url().unwrap(),
+            Some("/telemetry".to_string())
+        );
+        std::env::remove_var("FIDUCIA_GRAFANA_PUBLIC_URL");
+        assert_eq!(validated_grafana_public_url().unwrap(), None);
+    }
+
+    #[test]
     fn insecure_cookie_escape_requires_an_explicit_truthy_value() {
         assert!(explicitly_enabled(Some("1")));
         assert!(explicitly_enabled(Some("true")));

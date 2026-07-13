@@ -686,6 +686,267 @@ async fn scale(
     }
 }
 
+// ---- Cluster Insight (read-only observability) --------------------------------
+
+/// Everything one `/cluster` render needs from the brain + the node fan-out.
+/// Brain failures abort the render (the page is meaningless without the
+/// authority view); node fetch failures are carried per-node in `observations`.
+struct ClusterData {
+    status: Value,
+    nodes: Vec<Value>,
+    observations: Vec<cluster_insight::NodeObservation>,
+    merged: Vec<cluster_insight::MergedShard>,
+    quorum: cluster_insight::ClusterQuorum,
+}
+
+async fn cluster_data(st: &AppState) -> Result<ClusterData, Response> {
+    let status = upstream::status(&st.brain_url)
+        .await
+        .map_err(|err| upstream_error("brain_status_failed", "fiducia-brain", err))?;
+    let nodes = upstream::nodes(&st.brain_url)
+        .await
+        .map_err(|err| upstream_error("brain_nodes_failed", "fiducia-brain", err))?;
+    // Explicit FIDUCIA_NODE_URLS wins; otherwise dial the addresses the nodes
+    // heartbeat into the brain.
+    let targets = if st.node_urls.is_empty() {
+        cluster_insight::targets_from_brain_nodes(&nodes)
+    } else {
+        cluster_insight::explicit_node_targets(&st.node_urls)
+    };
+    let observations = cluster_insight::observe_shards_fanout(&targets).await;
+    let merged = cluster_insight::merge_shards(&observations);
+    let quorum = cluster_insight::cluster_quorum(&observations, &merged);
+    Ok(ClusterData {
+        status,
+        nodes,
+        observations,
+        merged,
+        quorum,
+    })
+}
+
+/// The summary card's Prometheus probe (optional plane: unset → NotConfigured).
+async fn prom_scrape(st: &AppState) -> cluster_insight::PromScrape {
+    let Some(url) = &st.prometheus_url else {
+        return cluster_insight::PromScrape::NotConfigured;
+    };
+    match cluster_insight::prom_instant_query(url, cluster_insight::PROM_FIDUCIA_UP_QUERY).await {
+        Ok(series) => cluster_insight::PromScrape::Up {
+            targets: series
+                .iter()
+                .filter(|sample| {
+                    sample
+                        .get("value")
+                        .and_then(|value| value.get(1))
+                        .and_then(Value::as_str)
+                        == Some("1")
+                })
+                .count(),
+        },
+        Err(err) => cluster_insight::PromScrape::Error {
+            error: err.to_string(),
+        },
+    }
+}
+
+/// The events panel state (optional plane: unset → NotConfigured; a Loki error
+/// renders inside the panel so the rest of the page stays useful).
+async fn loki_events(st: &AppState, since_minutes: i64) -> views::EventsPanel {
+    let Some(url) = &st.loki_url else {
+        return views::EventsPanel::NotConfigured;
+    };
+    match cluster_insight::recent_cluster_events(url, since_minutes).await {
+        Ok(events) => views::EventsPanel::Events(events),
+        Err(err) => views::EventsPanel::Error(err.to_string()),
+    }
+}
+
+/// Render the complete `/cluster` page (also served by the fragment routes for
+/// non-htmx requests, mirroring how infra serves both).
+async fn render_cluster_page(st: &AppState, s: &Session) -> Response {
+    let data = match cluster_data(st).await {
+        Ok(data) => data,
+        Err(response) => return response,
+    };
+    let prometheus = prom_scrape(st).await;
+    let events = loki_events(st, cluster_insight::EVENTS_DEFAULT_MINUTES).await;
+    let grafana = st.grafana_public_url.as_deref();
+    let csrf = csrf_token(st, s);
+    views::cluster(
+        s,
+        &csrf,
+        views::cluster_status_panel(&data.status, &data.merged, &data.quorum, &prometheus, grafana),
+        views::cluster_nodes_panel(&data.nodes, &data.observations),
+        views::cluster_events_panel(&events, cluster_insight::EVENTS_DEFAULT_MINUTES, grafana),
+    )
+    .into_response()
+}
+
+async fn cluster_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match require_admin(&headers, &st).await {
+        Ok(s) => render_cluster_page(&st, &s).await,
+        Err(response) => response,
+    }
+}
+
+/// `/cluster/shards` — summary cards + merged shard table (htmx fragment; full
+/// page without the `HX-Request` header).
+async fn cluster_shards_fragment(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let s = match require_admin(&headers, &st).await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+    if !is_htmx(&headers) {
+        return render_cluster_page(&st, &s).await;
+    }
+    let data = match cluster_data(&st).await {
+        Ok(data) => data,
+        Err(response) => return response,
+    };
+    let prometheus = prom_scrape(&st).await;
+    views::cluster_status_panel(
+        &data.status,
+        &data.merged,
+        &data.quorum,
+        &prometheus,
+        st.grafana_public_url.as_deref(),
+    )
+    .into_response()
+}
+
+/// `/cluster/nodes` — node registry table (htmx fragment; full page otherwise).
+async fn cluster_nodes_fragment(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let s = match require_admin(&headers, &st).await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+    if !is_htmx(&headers) {
+        return render_cluster_page(&st, &s).await;
+    }
+    let data = match cluster_data(&st).await {
+        Ok(data) => data,
+        Err(response) => return response,
+    };
+    views::cluster_nodes_panel(&data.nodes, &data.observations).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct EventsParams {
+    #[serde(default)]
+    since_minutes: Option<i64>,
+}
+
+/// `/cluster/events` — recent-events panel (htmx fragment; full page otherwise).
+async fn cluster_events_fragment(
+    State(st): State<Arc<AppState>>,
+    Query(params): Query<EventsParams>,
+    headers: HeaderMap,
+) -> Response {
+    let s = match require_admin(&headers, &st).await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+    if !is_htmx(&headers) {
+        return render_cluster_page(&st, &s).await;
+    }
+    let since_minutes = cluster_insight::clamp_since_minutes(params.since_minutes);
+    let events = loki_events(&st, since_minutes).await;
+    views::cluster_events_panel(&events, since_minutes, st.grafana_public_url.as_deref())
+        .into_response()
+}
+
+/// `GET /api/admin/cluster/overview` — the whole insight snapshot as JSON:
+/// brain status, node registry, per-node observe outcomes (including per-node
+/// errors), merged shards, the quorum rollup, and the Prometheus probe.
+async fn cluster_overview_api(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_admin_api(&headers, &st).await {
+        return response;
+    }
+    let data = match cluster_data(&st).await {
+        Ok(data) => data,
+        Err(response) => return response,
+    };
+    let prometheus = prom_scrape(&st).await;
+    Json(json!({
+        "cluster": data.status,
+        "nodes": data.nodes,
+        "node_observations": data.observations,
+        "shards": data.merged,
+        "quorum": data.quorum,
+        "prometheus": prometheus,
+        "generated_at_ms": cluster_insight::now_ms(),
+    }))
+    .into_response()
+}
+
+/// `GET /api/admin/cluster/shards` — the merged shard map + per-node outcomes.
+async fn cluster_shards_api(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_admin_api(&headers, &st).await {
+        return response;
+    }
+    let data = match cluster_data(&st).await {
+        Ok(data) => data,
+        Err(response) => return response,
+    };
+    Json(json!({
+        "shards": data.merged,
+        "quorum": data.quorum,
+        "node_observations": data.observations,
+        "generated_at_ms": cluster_insight::now_ms(),
+    }))
+    .into_response()
+}
+
+/// `GET /api/admin/cluster/events?since_minutes=` — classified Loki events.
+/// `since_minutes` is clamped (default 30, max 1440). With Loki unconfigured the
+/// response says so instead of erroring.
+async fn cluster_events_api(
+    State(st): State<Arc<AppState>>,
+    Query(params): Query<EventsParams>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_admin_api(&headers, &st).await {
+        return response;
+    }
+    let since_minutes = cluster_insight::clamp_since_minutes(params.since_minutes);
+    let Some(loki_url) = &st.loki_url else {
+        return Json(json!({
+            "configured": false,
+            "since_minutes": since_minutes,
+            "events": [],
+        }))
+        .into_response();
+    };
+    match cluster_insight::recent_cluster_events(loki_url, since_minutes).await {
+        Ok(events) => Json(json!({
+            "configured": true,
+            "since_minutes": since_minutes,
+            "events": events,
+        }))
+        .into_response(),
+        Err(err) => upstream_error("loki_query_failed", "loki", err),
+    }
+}
+
+/// `GET /api/admin/cluster/metrics` — the `/v1/observe/metrics` per-operation
+/// counters fanned out from every node (per-node errors carried in place).
+async fn cluster_metrics_api(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_admin_api(&headers, &st).await {
+        return response;
+    }
+    let targets = if st.node_urls.is_empty() {
+        let nodes = match upstream::nodes(&st.brain_url).await {
+            Ok(nodes) => nodes,
+            Err(err) => return upstream_error("brain_nodes_failed", "fiducia-brain", err),
+        };
+        cluster_insight::targets_from_brain_nodes(&nodes)
+    } else {
+        cluster_insight::explicit_node_targets(&st.node_urls)
+    };
+    let nodes = cluster_insight::observe_metrics_fanout(&targets).await;
+    Json(json!({ "nodes": nodes, "generated_at_ms": cluster_insight::now_ms() })).into_response()
+}
+
 // ---- Admin DB vertical (P2): infra_operations audit + sync broadcast ---------
 
 /// Recent control-plane operations, newest first, as display JSON.

@@ -703,13 +703,9 @@ pub const PROM_FIDUCIA_UP_QUERY: &str = "up{namespace=\"fiducia\"}";
 
 /// Run an instant query and return the `data.result` vector.
 pub async fn prom_instant_query(base_url: &str, query: &str) -> InsightResult<Vec<Value>> {
-    let value: Value = client(OBSERVABILITY_TIMEOUT_SECS)?
-        .get(prom_instant_query_url(base_url, query))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let request = client(OBSERVABILITY_TIMEOUT_SECS)?.get(prom_instant_query_url(base_url, query));
+    let body = upstream::send_capped(request).await?;
+    let value: Value = serde_json::from_slice(&body)?;
     prom_result_vector(&value)
 }
 

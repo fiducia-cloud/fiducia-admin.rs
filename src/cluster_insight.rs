@@ -1243,9 +1243,70 @@ mod tests {
         assert_eq!(quorum.nodes_reporting, 2);
         assert_eq!(quorum.nodes_failed, 1);
         assert_eq!(quorum.leaderless, vec![1], "no node leads shard 1");
+        assert_eq!(quorum.leader_unreached, Vec::<u32>::new());
+        assert_eq!(quorum.dual_leader, Vec::<u32>::new());
         assert_eq!(quorum.at_risk, vec![0]);
         assert_eq!(quorum.storage_faulted, vec![2]);
         assert_eq!(quorum.unresponsive, vec![1]);
+    }
+
+    // ---- M4: split-brain (dual leadership) ----
+
+    #[test]
+    fn merge_flags_dual_leadership_and_adopts_the_higher_term() {
+        let leader_low = observation("node-a", vec![shard_view(0, "leader", 5)]);
+        let leader_high = observation("node-b", vec![shard_view(0, "leader", 8)]);
+
+        // Lower term first, then the higher term: adopt the higher, flag the clash.
+        let merged = merge_shards(&[leader_low.clone(), leader_high.clone()]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].view.term, 8, "higher term adopted");
+        assert_eq!(merged[0].reported_by, "node-b");
+        assert!(merged[0].leader_view);
+        assert!(merged[0].dual_leader, "the second leader is not dropped unseen");
+
+        // Reverse arrival order must reach the same verdict (higher term wins).
+        let merged_rev = merge_shards(&[leader_high.clone(), leader_low.clone()]);
+        assert_eq!(merged_rev[0].view.term, 8);
+        assert_eq!(merged_rev[0].reported_by, "node-b");
+        assert!(merged_rev[0].dual_leader);
+
+        // The quorum rollup surfaces the conflict as a count.
+        let quorum = cluster_quorum(&[leader_low, leader_high], &merged);
+        assert_eq!(quorum.dual_leader, vec![0]);
+        // A dual-leader shard has a reachable leader, so it is neither leaderless
+        // nor leader-unreached.
+        assert!(quorum.leaderless.is_empty() && quorum.leader_unreached.is_empty());
+    }
+
+    // ---- M5: leaderless vs. merely-unreachable leader ----
+
+    #[test]
+    fn quorum_separates_leaderless_from_leader_unreached() {
+        // Shard 0: a follower that still knows its leader — the leader node simply
+        // timed out / its view was never merged. NOT leaderless.
+        let follower_knows_leader = observation(
+            "node-a",
+            vec![serde_json::from_value(
+                json!({ "shard_id": 0, "role": "follower", "term": 4, "leader_id": "node-z" }),
+            )
+            .unwrap()],
+        );
+        // Shard 1: a follower with no leader_id at all — genuinely leaderless.
+        let follower_no_leader = observation("node-b", vec![shard_view(1, "follower", 9)]);
+        let observations = [follower_knows_leader, follower_no_leader];
+        let merged = merge_shards(&observations);
+        let quorum = cluster_quorum(&observations, &merged);
+        assert_eq!(
+            quorum.leaderless,
+            vec![1],
+            "only the shard with no known leader is leaderless"
+        );
+        assert_eq!(
+            quorum.leader_unreached,
+            vec![0],
+            "a known-but-unreachable leader is a separate bucket, not a false alarm"
+        );
     }
 
     // ---- query construction ----

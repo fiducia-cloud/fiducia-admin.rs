@@ -299,6 +299,382 @@ pub fn infra_panel(
     }
 }
 
+// ---- Cluster insight ----------------------------------------------------------
+
+/// The events panel's tri-state: Loki not configured, the query failed, or the
+/// classified events. Unset observability config renders as information, never
+/// as a page error.
+pub enum EventsPanel {
+    NotConfigured,
+    Error(String),
+    Events(Vec<ClusterEvent>),
+}
+
+fn status_str<'a>(status: &'a Value, path: &[&str]) -> &'a str {
+    let mut value = status;
+    for key in path {
+        match value.get(key) {
+            Some(inner) => value = inner,
+            None => return "—",
+        }
+    }
+    value.as_str().unwrap_or("—")
+}
+
+fn status_u64(status: &Value, path: &[&str]) -> u64 {
+    let mut value = status;
+    for key in path {
+        match value.get(key) {
+            Some(inner) => value = inner,
+            None => return 0,
+        }
+    }
+    value.as_u64().unwrap_or(0)
+}
+
+fn health_tag_class(health: &str) -> &'static str {
+    match health {
+        "healthy" => "tag tag--ok",
+        "suspect" | "draining" => "tag tag--warn",
+        "dead" => "tag tag--bad",
+        _ => "tag",
+    }
+}
+
+fn event_tag_class(kind: &str) -> &'static str {
+    match kind {
+        "node_dead" | "check_quorum_step_down" | "step_down" => "tag tag--bad",
+        "election_won" | "node_registered" => "tag tag--ok",
+        _ => "tag tag--warn",
+    }
+}
+
+/// A count that reads green at zero and red above it, linking to the detail
+/// anchor so every number on a summary card goes somewhere.
+fn gap_count(label: &str, count: u64, href: &str) -> Markup {
+    html! {
+        a href=(href) {
+            span class=(if count == 0 { "tag tag--ok" } else { "tag tag--bad" }) {
+                (count) " " (label)
+            }
+        }
+        " "
+    }
+}
+
+/// The full `/cluster` page. The three volatile panels poll their fragment
+/// endpoints via htmx (the same handlers serve this full page to non-htmx
+/// requests, mirroring the infra pattern).
+pub fn cluster(
+    s: &Session,
+    csrf_token: &str,
+    status_panel: Markup,
+    nodes_panel: Markup,
+    events_panel: Markup,
+) -> Markup {
+    page(
+        "Cluster",
+        Some(s),
+        Some(csrf_token),
+        html! {
+            h1 { "Cluster insight" }
+            div id="cluster-status" hx-get="/cluster/shards" hx-trigger="every 5s"
+                hx-swap="innerHTML" { (status_panel) }
+            div id="cluster-nodes" hx-get="/cluster/nodes" hx-trigger="every 5s"
+                hx-swap="innerHTML" { (nodes_panel) }
+            div id="cluster-events" hx-get="/cluster/events" hx-trigger="every 15s"
+                hx-swap="innerHTML" { (events_panel) }
+        },
+    )
+}
+
+/// Summary cards (brain `/v1/status` + the observe fan-out rollup) and the
+/// merged per-shard table. htmx fragment for `/cluster/shards`.
+pub fn cluster_status_panel(
+    status: &Value,
+    shards: &[MergedShard],
+    quorum: &ClusterQuorum,
+    prometheus: &PromScrape,
+    grafana: Option<&str>,
+) -> Markup {
+    let nodes_by_health = status
+        .get("topology")
+        .and_then(|topology| topology.get("nodes_by_health"))
+        .and_then(Value::as_object);
+    html! {
+        div class="grid" {
+            div class="stat" {
+                div class="n" { (status_str(status, &["cluster_id"])) }
+                div class="l" { "cluster · brain v" (status_str(status, &["version"])) }
+            }
+            div class="stat" {
+                div class="n" {
+                    a href="#shard-table" {
+                        (status_u64(status, &["shard_count"]))
+                        " × RF" (status_u64(status, &["replication_factor"]))
+                    }
+                }
+                div class="l" { "shards × replication factor" }
+            }
+            div class="stat" {
+                div class="n" {
+                    a href="/infra" { (status_u64(status, &["brain_cluster", "placement_generation"])) }
+                }
+                div class="l" { "placement generation" }
+            }
+            div class="stat" {
+                div class="n" {
+                    @if status.get("brain_cluster").and_then(|b| b.get("is_leader")).and_then(Value::as_bool) == Some(true) {
+                        "this brain"
+                    } @else {
+                        (status_str(status, &["brain_cluster", "leader"]))
+                    }
+                }
+                div class="l" {
+                    "brain leader · "
+                    @if status.get("brain_cluster").and_then(|b| b.get("ha_configured")).and_then(Value::as_bool) == Some(true) {
+                        span class="tag tag--ok" { "HA" }
+                    } @else {
+                        span class="tag tag--warn" { "no HA" }
+                    }
+                    " "
+                    @if status.get("brain_cluster").and_then(|b| b.get("available")).and_then(Value::as_bool) == Some(true) {
+                        span class="tag tag--ok" { "available" }
+                    } @else {
+                        span class="tag tag--bad" { "unavailable" }
+                    }
+                }
+            }
+            div class="stat" {
+                div class="n" {
+                    @if let Some(by_health) = nodes_by_health {
+                        @for (health, count) in by_health {
+                            a href="#node-table" {
+                                span class=(health_tag_class(health)) {
+                                    (count.as_u64().unwrap_or(0)) " " (health)
+                                }
+                            }
+                            " "
+                        }
+                    } @else {
+                        a href="#node-table" { "0" }
+                    }
+                }
+                div class="l" { "nodes by health (fiducia-brain)" }
+            }
+            div class="stat" {
+                div class="n" {
+                    (gap_count("unplaced", status_u64(status, &["placement", "unplaced_shards"]), "#shard-table"))
+                    (gap_count("under-replicated", status_u64(status, &["placement", "under_replicated_shards"]), "#shard-table"))
+                    (gap_count("leaderless", status_u64(status, &["placement", "leaderless_shards"]), "#shard-table"))
+                    (gap_count("unhealthy-replica", status_u64(status, &["placement", "shards_with_unhealthy_replicas"]), "#shard-table"))
+                }
+                div class="l" { "placement gaps (desired vs observed)" }
+            }
+            div class="stat" {
+                div class="n" {
+                    (gap_count("leaderless", quorum.leaderless.len() as u64, "#shard-table"))
+                    (gap_count("at-risk", quorum.at_risk.len() as u64, "#shard-table"))
+                    (gap_count("storage-faulted", quorum.storage_faulted.len() as u64, "#shard-table"))
+                    (gap_count("unresponsive", quorum.unresponsive.len() as u64, "#shard-table"))
+                }
+                div class="l" {
+                    "raft quorum (observed from "
+                    a href="#node-table" { (quorum.nodes_reporting) " of " (quorum.nodes_reporting + quorum.nodes_failed) " nodes" }
+                    ")"
+                }
+            }
+            div class="stat" {
+                @match prometheus {
+                    PromScrape::NotConfigured => {
+                        div class="n muted" { "—" }
+                        div class="l" { "Prometheus not configured (FIDUCIA_PROMETHEUS_URL)" }
+                    }
+                    PromScrape::Error { error } => {
+                        div class="n" { span class="tag tag--bad" title=(error) { "query failed" } }
+                        div class="l" { "Prometheus " code { (PROM_FIDUCIA_UP_QUERY) } }
+                    }
+                    PromScrape::Up { targets } => {
+                        div class="n" {
+                            @if let Some(grafana) = grafana {
+                                a href=(grafana_explore_prom_url(grafana, PROM_FIDUCIA_UP_QUERY)) { (targets) }
+                            } @else {
+                                (targets)
+                            }
+                        }
+                        div class="l" { "up scrape targets (" code { (PROM_FIDUCIA_UP_QUERY) } ")" }
+                    }
+                }
+            }
+        }
+        div class="card" id="shard-table" {
+            h2 { "Shards" }
+            @if shards.is_empty() {
+                p class="muted" {
+                    "No shard reports."
+                    @if quorum.nodes_failed > 0 {
+                        " (" (quorum.nodes_failed) " node fetches failed — see the node table.)"
+                    }
+                }
+            } @else {
+                table {
+                    tr {
+                        th { "Shard" } th { "Role" } th { "Leader" } th { "Term" }
+                        th { "Commit / applied" } th { "Lag max" } th { "Quorum" }
+                        th { "Storage" } th { "Reported by" }
+                    }
+                    @for shard in shards {
+                        tr {
+                            td { (shard.shard_id) }
+                            td { span class="tag" { (shard.view.role) } }
+                            td { (shard.view.leader_id.as_deref().unwrap_or("—")) }
+                            td class="muted" { (shard.view.term) }
+                            td class="muted" { (shard.view.commit_index) " / " (shard.view.last_applied) }
+                            td class="muted" { (shard.view.metrics.follower_lag_max) }
+                            td {
+                                @if !shard.leader_view {
+                                    @if shard.view.leader_id.is_some() {
+                                        span class="tag tag--warn" { "no leader report" }
+                                    } @else {
+                                        span class="tag tag--bad" { "leaderless" }
+                                    }
+                                } @else if shard.view.has_quorum {
+                                    span class="tag tag--ok" { "quorum (" (shard.view.healthy_replicas) ")" }
+                                } @else {
+                                    span class="tag tag--bad" { "at risk (" (shard.view.healthy_replicas) ")" }
+                                }
+                            }
+                            td {
+                                @if shard.view.storage_healthy {
+                                    span class="tag tag--ok" { "ok" }
+                                } @else {
+                                    span class="tag tag--bad" title=[shard.view.storage_error.as_deref()] { "fault" }
+                                }
+                            }
+                            td class="muted" { (shard.reported_by) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Node registry (brain `/v1/nodes`) merged with each node's observe fetch
+/// outcome. htmx fragment for `/cluster/nodes`.
+pub fn cluster_nodes_panel(nodes: &[Value], observations: &[NodeObservation]) -> Markup {
+    let now = now_ms();
+    html! {
+        div class="card" id="node-table" {
+            h2 { "Nodes" }
+            @if nodes.is_empty() {
+                p class="muted" { "No nodes registered with fiducia-brain." }
+            } @else {
+                table {
+                    tr {
+                        th { "Node" } th { "Health" } th { "Failure domain" } th { "Address" }
+                        th { "Hosted / leading" } th { "Last seen" } th { "Observe" }
+                    }
+                    @for node in nodes {
+                        @let node_id = node.get("node_id").and_then(Value::as_str).unwrap_or("—");
+                        @let last_seen = node.get("last_seen_ms").and_then(Value::as_i64).unwrap_or(0);
+                        tr {
+                            td { (node_id) }
+                            td {
+                                @let health = node.get("health").and_then(Value::as_str).unwrap_or("—");
+                                span class=(health_tag_class(health)) { (health) }
+                            }
+                            td class="muted" { (node.get("failure_domain").and_then(Value::as_str).unwrap_or("—")) }
+                            td class="muted" { (node.get("address").and_then(Value::as_str).unwrap_or("—")) }
+                            td class="muted" {
+                                (node.get("hosted_shards").and_then(Value::as_array).map_or(0, Vec::len))
+                                " / "
+                                (node.get("leading_shards").and_then(Value::as_array).map_or(0, Vec::len))
+                            }
+                            td class="muted" title=(utc_timestamp(last_seen)) { (relative_age(last_seen, now)) }
+                            td {
+                                @match observations.iter().find(|observation| observation.node_id == node_id) {
+                                    Some(observation) => @match (&observation.shards, &observation.error) {
+                                        (Some(shards), _) => {
+                                            span class="tag tag--ok" {
+                                                "ok · leads " (shards.leader_count) " of " (shards.shards.len())
+                                            }
+                                        }
+                                        (None, Some(error)) => span class="tag tag--bad" title=(error) { "unreachable" },
+                                        (None, None) => span class="tag" { "—" },
+                                    },
+                                    None => span class="tag" title="not in the observe target set" { "—" },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Recent cluster events from Loki (leader transfers, elections, step-downs,
+/// membership and placement changes). htmx fragment for `/cluster/events`.
+pub fn cluster_events_panel(
+    events: &EventsPanel,
+    since_minutes: i64,
+    grafana: Option<&str>,
+) -> Markup {
+    let now = now_ms();
+    html! {
+        div class="card" id="event-table" {
+            h2 {
+                "Recent cluster events "
+                span class="tag" { "last " (since_minutes) "m" }
+                @if let Some(grafana) = grafana {
+                    " "
+                    a class="btn btn--ghost"
+                        href=(grafana_explore_loki_url(grafana, &loki_events_logql(), since_minutes)) {
+                        "Open in Grafana"
+                    }
+                }
+            }
+            @match events {
+                EventsPanel::NotConfigured => {
+                    p class="muted" {
+                        "Loki is not configured (" code { "FIDUCIA_LOKI_URL" } " unset) — raft/membership "
+                        "events from the pods' JSON logs appear here once it is."
+                    }
+                }
+                EventsPanel::Error(error) => {
+                    p class="muted" role="alert" { "Loki query failed: " (error) }
+                }
+                EventsPanel::Events(events) => {
+                    @if events.is_empty() {
+                        p class="muted" { "No leadership, membership, or placement events in this window." }
+                    } @else {
+                        table {
+                            tr { th { "When" } th { "Event" } th { "Shard" } th { "Node" } th { "Detail" } }
+                            @for event in events {
+                                tr {
+                                    td class="muted" title=(utc_timestamp(event.at_ms)) { (relative_age(event.at_ms, now)) }
+                                    td { span class=(event_tag_class(event.kind)) { (event.kind) } }
+                                    td class="muted" { (event.shard.map(|shard| shard.to_string()).unwrap_or_else(|| "—".into())) }
+                                    td class="muted" { (event.node.as_deref().unwrap_or("—")) }
+                                    td class="muted" {
+                                        @if let (Some(from), Some(to)) = (&event.from, &event.to) {
+                                            (from) " → " (to)
+                                            @if let Some(reason) = &event.reason { " (" (reason) ")" }
+                                        } @else {
+                                            (event.message)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

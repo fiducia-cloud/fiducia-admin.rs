@@ -72,6 +72,10 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_WRITE_KEY_BYTES: usize = 256;
 const DEFAULT_CATCHUP_PAGE_SIZE: u64 = 100;
 const MAX_CATCHUP_PAGE_SIZE: u64 = 500;
+/// Minimum node count a scale request may target — the multi-cloud replication
+/// baseline. Mirrors the `infra_operations` sync-write guard so both write paths
+/// enforce the same floor.
+const MIN_SCALE_TARGET_NODES: u32 = 3;
 const CSRF_HEADER: &str = "x-fiducia-csrf";
 
 /// The vendored htmx bundle, compiled into the binary and served same-origin at
@@ -651,6 +655,17 @@ async fn scale(
     if let Err(error) = require_form_security(&headers, &st, &s, &form.csrf_token) {
         return request_security_error(error);
     }
+    // Validate the target BEFORE the audit write and the brain side effect. A
+    // `u32` above `i32::MAX` would otherwise wrap negative when persisted into the
+    // audit record's `i32` column, silently corrupting the durable record while
+    // the brain receives the un-wrapped value.
+    if !scale_target_is_valid(form.target_nodes) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_target_nodes", "min": MIN_SCALE_TARGET_NODES })),
+        )
+            .into_response();
+    }
     // Write the audit intent before the external side effect. An operator action
     // is never executed without a durable record.
     if let Err(err) = record_scale(&st, &s, form.target_nodes).await {
@@ -1004,6 +1019,12 @@ async fn recent_ops(st: &AppState) -> Result<Vec<Value>, DbErr> {
         .iter()
         .filter_map(|row| serde_json::to_value(row).ok())
         .collect())
+}
+
+/// A scale target must meet the replication floor and fit the audit record's
+/// `i32` column, so persistence can never silently wrap it.
+fn scale_target_is_valid(target_nodes: u32) -> bool {
+    target_nodes >= MIN_SCALE_TARGET_NODES && i32::try_from(target_nodes).is_ok()
 }
 
 /// Insert a `scale` row into infra_operations (status `requested`, operator
@@ -2145,6 +2166,17 @@ mod auth_flow_tests {
             assert!(cookie.starts_with("__Host-"));
             assert!(cookie.contains("; Secure"));
         }
+    }
+
+    #[test]
+    fn scale_target_rejects_below_floor_and_i32_overflow() {
+        assert!(!scale_target_is_valid(0));
+        assert!(!scale_target_is_valid(MIN_SCALE_TARGET_NODES - 1));
+        assert!(scale_target_is_valid(MIN_SCALE_TARGET_NODES));
+        assert!(scale_target_is_valid(i32::MAX as u32));
+        // Above i32::MAX would wrap negative in the audit record's i32 column.
+        assert!(!scale_target_is_valid(i32::MAX as u32 + 1));
+        assert!(!scale_target_is_valid(u32::MAX));
     }
 
     #[test]

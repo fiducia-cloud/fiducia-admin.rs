@@ -48,9 +48,9 @@ FIDUCIA_ADMIN_DEV_SESSION=admin cargo run    # :8096, click through the UI witho
 ```
 
 > **Security:** `FIDUCIA_ADMIN_DEV_SESSION` is a full auth bypass (any request
-> becomes that user). It is honored **only in debug builds**. A release binary
-> ignores it and logs an error, unless you also set
-> `FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1` — never do that in production.
+> becomes that user). It is honored **only in debug builds** — the code path is
+> compiled out of release binaries entirely. A release binary ignores the
+> variable and logs an error; no other variable can re-enable it.
 
 The service fails startup without its Postgres audit/idempotency ledger, and
 upstream failures return an explicit dependency error rather than empty data.

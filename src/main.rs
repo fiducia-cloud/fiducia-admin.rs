@@ -941,6 +941,8 @@ async fn cluster_events_api(
 
 /// `GET /api/admin/cluster/metrics` — the `/v1/observe/metrics` per-operation
 /// counters fanned out from every node (per-node errors carried in place).
+/// With Prometheus configured, also a 15-minute `up{namespace="fiducia"}`
+/// range so callers see scrape-target stability next to the counters.
 async fn cluster_metrics_api(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(response) = require_admin_api(&headers, &st).await {
         return response;
@@ -955,7 +957,31 @@ async fn cluster_metrics_api(State(st): State<Arc<AppState>>, headers: HeaderMap
         cluster_insight::explicit_node_targets(&st.node_urls)
     };
     let nodes = cluster_insight::observe_metrics_fanout(&targets).await;
-    Json(json!({ "nodes": nodes, "generated_at_ms": cluster_insight::now_ms() })).into_response()
+    let prometheus_up_range = match &st.prometheus_url {
+        None => Value::Null,
+        Some(url) => {
+            let end = cluster_insight::now_ms() / 1000;
+            match cluster_insight::prom_range_query(
+                url,
+                cluster_insight::PROM_FIDUCIA_UP_QUERY,
+                end - 900,
+                end,
+                60,
+            )
+            .await
+            {
+                Ok(series) => json!(series),
+                // The optional plane degrades in place, like the per-node errors.
+                Err(err) => json!({ "error": err.to_string() }),
+            }
+        }
+    };
+    Json(json!({
+        "nodes": nodes,
+        "prometheus_up_range": prometheus_up_range,
+        "generated_at_ms": cluster_insight::now_ms(),
+    }))
+    .into_response()
 }
 
 // ---- Admin DB vertical (P2): infra_operations audit + sync broadcast ---------

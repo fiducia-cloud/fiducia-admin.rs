@@ -972,15 +972,17 @@ async fn cluster_metrics_api(State(st): State<Arc<AppState>>, headers: HeaderMap
     if let Err(response) = require_admin_api(&headers, &st).await {
         return response;
     }
-    let targets = if st.node_urls.is_empty() {
+    let policy = cluster_insight::NodeHostPolicy::from_env();
+    let mut targets = if st.node_urls.is_empty() {
         let nodes = match upstream::nodes(&st.brain_url).await {
             Ok(nodes) => nodes,
             Err(err) => return upstream_error("brain_nodes_failed", "fiducia-brain", err),
         };
-        cluster_insight::targets_from_brain_nodes(&nodes)
+        cluster_insight::targets_from_brain_nodes(&nodes, &policy)
     } else {
-        cluster_insight::explicit_node_targets(&st.node_urls)
+        cluster_insight::explicit_node_targets(&st.node_urls, &policy)
     };
+    let targets_truncated_from = cluster_insight::truncate_targets(&mut targets);
     let nodes = cluster_insight::observe_metrics_fanout(&targets).await;
     let prometheus_up_range = match &st.prometheus_url {
         None => Value::Null,

@@ -775,7 +775,13 @@ async fn render_cluster_page(st: &AppState, s: &Session) -> Response {
     views::cluster(
         s,
         &csrf,
-        views::cluster_status_panel(&data.status, &data.merged, &data.quorum, &prometheus, grafana),
+        views::cluster_status_panel(
+            &data.status,
+            &data.merged,
+            &data.quorum,
+            &prometheus,
+            grafana,
+        ),
         views::cluster_nodes_panel(&data.nodes, &data.observations),
         views::cluster_events_panel(&events, cluster_insight::EVENTS_DEFAULT_MINUTES, grafana),
     )
@@ -2244,11 +2250,20 @@ mod cluster_tests {
     #[tokio::test]
     async fn every_cluster_route_requires_a_session() {
         // Anonymous HTML routes redirect to the login page…
-        for uri in ["/cluster", "/cluster/shards", "/cluster/nodes", "/cluster/events"] {
-            let response = get_with(cluster_router(sync_tests::test_state()), uri, None, false).await;
+        for uri in [
+            "/cluster",
+            "/cluster/shards",
+            "/cluster/nodes",
+            "/cluster/events",
+        ] {
+            let response =
+                get_with(cluster_router(sync_tests::test_state()), uri, None, false).await;
             assert_eq!(response.status(), StatusCode::SEE_OTHER, "uri={uri}");
             assert_eq!(
-                response.headers().get(LOCATION).and_then(|v| v.to_str().ok()),
+                response
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|v| v.to_str().ok()),
                 Some("/login"),
                 "uri={uri}"
             );
@@ -2260,7 +2275,8 @@ mod cluster_tests {
             "/api/admin/cluster/events",
             "/api/admin/cluster/metrics",
         ] {
-            let response = get_with(cluster_router(sync_tests::test_state()), uri, None, false).await;
+            let response =
+                get_with(cluster_router(sync_tests::test_state()), uri, None, false).await;
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "uri={uri}");
         }
     }
@@ -2290,7 +2306,13 @@ mod cluster_tests {
             Vec::new(),
         );
 
-        let page = get_with(cluster_router(state.clone()), "/cluster", Some("verified.jwt"), false).await;
+        let page = get_with(
+            cluster_router(state.clone()),
+            "/cluster",
+            Some("verified.jwt"),
+            false,
+        )
+        .await;
         assert_eq!(page.status(), StatusCode::FORBIDDEN);
 
         let api = get_with(
@@ -2319,7 +2341,10 @@ mod cluster_tests {
 
     async fn healthy_node_shards(headers: HeaderMap) -> Response {
         if !internal_auth_ok(&headers) {
-            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "internal_auth" })))
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "internal_auth" })),
+            )
                 .into_response();
         }
         Json(json!({
@@ -2364,7 +2389,10 @@ mod cluster_tests {
 
     async fn healthy_node_metrics(headers: HeaderMap) -> Response {
         if !internal_auth_ok(&headers) {
-            return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "internal_auth" })))
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "internal_auth" })),
+            )
                 .into_response();
         }
         Json(json!({
@@ -2413,8 +2441,14 @@ mod cluster_tests {
         let (node_ok_url, node_ok_task) = spawn_mock(node_ok).await;
 
         let node_down = Router::new()
-            .route("/v1/observe/shards", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }))
-            .route("/v1/observe/metrics", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
+            .route(
+                "/v1/observe/shards",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/v1/observe/metrics",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            );
         let (node_down_url, node_down_task) = spawn_mock(node_down).await;
 
         // The brain reports both nodes with the mock servers' real addresses, so
@@ -2573,7 +2607,10 @@ mod cluster_tests {
         assert_eq!(overview["quorum"]["nodes_failed"], 1);
         assert_eq!(overview["quorum"]["leaderless"], json!([1]));
         assert_eq!(overview["prometheus"]["state"], "up");
-        assert_eq!(overview["prometheus"]["targets"], 2, "only value==\"1\" counts");
+        assert_eq!(
+            overview["prometheus"]["targets"], 2,
+            "only value==\"1\" counts"
+        );
 
         // -- events API: clamped window + classified Loki lines ---------------
         let events = get_with(
@@ -2610,14 +2647,23 @@ mod cluster_tests {
         );
 
         // -- full HTML page + htmx fragment ------------------------------------
-        let page = get_with(cluster_router(state.clone()), "/cluster", Some("verified.jwt"), false).await;
+        let page = get_with(
+            cluster_router(state.clone()),
+            "/cluster",
+            Some("verified.jwt"),
+            false,
+        )
+        .await;
         assert_eq!(page.status(), StatusCode::OK);
         let html = body_text(page).await;
         assert!(html.contains("Cluster insight"));
         assert!(html.contains("node-ok"));
         assert!(html.contains("unreachable"), "down node badge renders");
         assert!(html.contains("leader_transfer"), "Loki event renders");
-        assert!(html.contains("/telemetry/explore?left="), "Grafana deep link");
+        assert!(
+            html.contains("/telemetry/explore?left="),
+            "Grafana deep link"
+        );
 
         let fragment = get_with(
             cluster_router(state),

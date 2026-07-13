@@ -802,7 +802,10 @@ mod tests {
         assert!(html.contains(r#"id="shard-table""#));
         assert!(html.contains("quorum (3)"));
         assert!(html.contains("disk full"), "storage fault tooltip");
-        assert!(html.contains("/telemetry/explore?left="), "Grafana prom link");
+        assert!(
+            html.contains("/telemetry/explore?left="),
+            "Grafana prom link"
+        );
     }
 
     #[test]
@@ -822,7 +825,10 @@ mod tests {
         assert!(html.contains(r#"id="node-table""#));
         assert!(html.contains("node-a"));
         assert!(html.contains("unreachable"));
-        assert!(html.contains("connect timeout"), "error carried in the tooltip");
+        assert!(
+            html.contains("connect timeout"),
+            "error carried in the tooltip"
+        );
         assert!(html.contains("2 / 1"), "hosted / leading counts");
     }
 
@@ -846,9 +852,8 @@ mod tests {
             reason: Some("became_leader".into()),
             message: "observed raft leadership transition".into(),
         }];
-        let rendered =
-            cluster_events_panel(&EventsPanel::Events(events), 30, Some("/telemetry"))
-                .into_string();
+        let rendered = cluster_events_panel(&EventsPanel::Events(events), 30, Some("/telemetry"))
+            .into_string();
         assert!(rendered.contains("leader_transfer"));
         assert!(rendered.contains("Follower"));
         assert!(rendered.contains("became_leader"));

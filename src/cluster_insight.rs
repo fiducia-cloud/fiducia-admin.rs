@@ -464,7 +464,13 @@ pub fn prom_instant_query_url(base_url: &str, query: &str) -> String {
 
 /// Range-query URL: `GET /api/v1/query_range?query=…&start=…&end=…&step=…`.
 /// `start`/`end` are unix seconds, `step` is seconds per point.
-pub fn prom_range_query_url(base_url: &str, query: &str, start: i64, end: i64, step: u32) -> String {
+pub fn prom_range_query_url(
+    base_url: &str,
+    query: &str,
+    start: i64,
+    end: i64,
+    step: u32,
+) -> String {
     format!(
         "{}/api/v1/query_range?query={}&start={start}&end={end}&step={step}",
         base_url.trim_end_matches('/'),
@@ -829,8 +835,7 @@ mod tests {
     // ---- merge ----
 
     fn shard_view(shard_id: u32, role: &str, term: u64) -> ShardView {
-        serde_json::from_value(json!({ "shard_id": shard_id, "role": role, "term": term }))
-            .unwrap()
+        serde_json::from_value(json!({ "shard_id": shard_id, "role": role, "term": term })).unwrap()
     }
 
     fn observation(node_id: &str, shards: Vec<ShardView>) -> NodeObservation {
@@ -926,7 +931,9 @@ mod tests {
     #[test]
     fn loki_query_range_url_carries_window_and_escaped_logql() {
         let url = loki_query_range_url("http://loki:3100", &loki_events_logql(), 1, 2, 500);
-        assert!(url.starts_with("http://loki:3100/loki/api/v1/query_range?query=%7Bnamespace%3D%22fiducia%22%7D"));
+        assert!(url.starts_with(
+            "http://loki:3100/loki/api/v1/query_range?query=%7Bnamespace%3D%22fiducia%22%7D"
+        ));
         assert!(url.contains("&start=1&end=2&limit=500"));
         // The selector + line-filter families the classifier depends on.
         let logql = loki_events_logql();

@@ -49,6 +49,7 @@ canonical `Host`, and writes reject a supplied non-admin `Origin`.
 | File | Responsibility |
 |------|----------------|
 | `src/main.rs` | routes + role gating (`require` / `require_admin`) |
+| `src/cluster_insight.rs` | Cluster Insight clients: node observe fan-out, Loki event extraction, Prometheus queries |
 | `src/entity/` | SeaORM models for the isolated admin Postgres schema |
 | `src/views.rs` | server-rendered HTML templates |
 | `src/session.rs` | Supabase session + trusted-role resolution through `fiducia-auth` |

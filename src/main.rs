@@ -2604,6 +2604,10 @@ mod cluster_tests {
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0]["operations"][0]["op"], "kv.put");
         assert!(nodes[1]["error"].as_str().is_some());
+        assert_eq!(
+            metrics["prometheus_up_range"][0]["metric"]["pod"],
+            "fiducia-node-0"
+        );
 
         // -- full HTML page + htmx fragment ------------------------------------
         let page = get_with(cluster_router(state.clone()), "/cluster", Some("verified.jwt"), false).await;

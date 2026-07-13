@@ -856,8 +856,9 @@ async fn cluster_events_fragment(
 }
 
 /// `GET /api/admin/cluster/overview` — the whole insight snapshot as JSON:
-/// brain status, node registry, per-node observe outcomes (including per-node
-/// errors), merged shards, the quorum rollup, and the Prometheus probe.
+/// brain status/config/policies, node registry, per-node observe outcomes
+/// (including per-node errors), merged shards, the quorum rollup, and the
+/// Prometheus probe.
 async fn cluster_overview_api(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(response) = require_admin_api(&headers, &st).await {
         return response;
@@ -866,9 +867,19 @@ async fn cluster_overview_api(State(st): State<Arc<AppState>>, headers: HeaderMa
         Ok(data) => data,
         Err(response) => return response,
     };
+    let config = match upstream::config(&st.brain_url).await {
+        Ok(config) => config,
+        Err(err) => return upstream_error("brain_config_failed", "fiducia-brain", err),
+    };
+    let policies = match upstream::policies(&st.brain_url).await {
+        Ok(policies) => policies.get("policies").cloned().unwrap_or(Value::Null),
+        Err(err) => return upstream_error("brain_policies_failed", "fiducia-brain", err),
+    };
     let prometheus = prom_scrape(&st).await;
     Json(json!({
         "cluster": data.status,
+        "config": config,
+        "policies": policies,
         "nodes": data.nodes,
         "node_observations": data.observations,
         "shards": data.merged,

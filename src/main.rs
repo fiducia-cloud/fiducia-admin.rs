@@ -2130,6 +2130,119 @@ mod auth_flow_tests {
 }
 
 #[cfg(test)]
+mod cluster_tests {
+    use super::auth_flow_tests::spawn_mock;
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn cluster_router(state: Arc<AppState>) -> Router {
+        Router::new()
+            .route("/cluster", get(cluster_page))
+            .route("/cluster/shards", get(cluster_shards_fragment))
+            .route("/cluster/nodes", get(cluster_nodes_fragment))
+            .route("/cluster/events", get(cluster_events_fragment))
+            .route("/api/admin/cluster/overview", get(cluster_overview_api))
+            .route("/api/admin/cluster/shards", get(cluster_shards_api))
+            .route("/api/admin/cluster/events", get(cluster_events_api))
+            .route("/api/admin/cluster/metrics", get(cluster_metrics_api))
+            .with_state(state)
+    }
+
+    async fn get_with(router: Router, uri: &str, bearer: Option<&str>, htmx: bool) -> Response {
+        let mut builder = Request::builder()
+            .uri(uri)
+            .header("host", "admin.fiducia.cloud");
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        if htmx {
+            builder = builder.header("hx-request", "true");
+        }
+        router
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn body_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn every_cluster_route_requires_a_session() {
+        // Anonymous HTML routes redirect to the login page…
+        for uri in ["/cluster", "/cluster/shards", "/cluster/nodes", "/cluster/events"] {
+            let response = get_with(cluster_router(sync_tests::test_state()), uri, None, false).await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "uri={uri}");
+            assert_eq!(
+                response.headers().get(LOCATION).and_then(|v| v.to_str().ok()),
+                Some("/login"),
+                "uri={uri}"
+            );
+        }
+        // …and anonymous API routes get a machine-readable 401.
+        for uri in [
+            "/api/admin/cluster/overview",
+            "/api/admin/cluster/shards",
+            "/api/admin/cluster/events",
+            "/api/admin/cluster/metrics",
+        ] {
+            let response = get_with(cluster_router(sync_tests::test_state()), uri, None, false).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "uri={uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_routes_reject_a_verified_non_operator_session() {
+        // fiducia-auth verifies the token but reports no operator role.
+        let auth = Router::new().route(
+            "/v1/me",
+            get(|| async {
+                Json(json!({
+                    "user": {
+                        "user_id": "00000000-0000-0000-0000-000000000002",
+                        "email": "customer@example.com",
+                        "roles": ["customer"]
+                    }
+                }))
+            }),
+        );
+        let (auth_url, auth_task) = spawn_mock(auth).await;
+        let state = Arc::new(AppState {
+            auth_url,
+            ..Arc::try_unwrap(sync_tests::test_state()).unwrap_or_else(|state| (*state).clone_for_test())
+        });
+
+        let page = get_with(cluster_router(state.clone()), "/cluster", Some("verified.jwt"), false).await;
+        assert_eq!(page.status(), StatusCode::FORBIDDEN);
+
+        let api = get_with(
+            cluster_router(state),
+            "/api/admin/cluster/overview",
+            Some("verified.jwt"),
+            false,
+        )
+        .await;
+        assert_eq!(api.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(api).await["error"], "forbidden");
+
+        auth_task.abort();
+    }
+}
+
+#[cfg(test)]
 mod csrf_tests {
     use super::*;
     use axum::body::Body;

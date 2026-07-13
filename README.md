@@ -70,8 +70,8 @@ like the infra pattern). The same data is served as JSON under
   shard count × RF, placement generation, brain leader/HA/availability, node
   counts by health, placement gaps); `GET /v1/nodes` feeds the node registry
   table and, by default, node discovery. The overview API additionally returns
-  `/v1/config` and `/v1/policies`. All brain calls present the
-  `x-fiducia-internal-secret` trusted-hop header (`x-fiducia-internal-auth`).
+  `/v1/config` and `/v1/policies`. All brain calls present
+  `FIDUCIA_INTERNAL_SECRET` in the `x-fiducia-internal-auth` trusted-hop header.
 - **fiducia-node** — `GET /v1/observe/shards` and `GET /v1/observe/metrics`,
   fanned out **concurrently to every node** with a 3 s per-node timeout. These
   two paths are exempt from the node's org-scope middleware (they are node

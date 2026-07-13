@@ -397,7 +397,61 @@ pub fn merge_shards(observations: &[NodeObservation]) -> Vec<MergedShard> {
     merged.into_values().collect()
 }
 
+/// Cluster-wide quorum rollup, folded from every node's own rollup plus the
+/// merged shard rows. Feeds the summary cards and the overview API.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ClusterQuorum {
+    /// Shards for which no reporting node claims leadership.
+    pub leaderless: Vec<u32>,
+    /// Union of every leader's `at_risk_led_shards` (led, but a majority is not
+    /// caught up — one more failure stalls the shard).
+    pub at_risk: Vec<u32>,
+    /// Union of every node's `storage_faulted_shards`.
+    pub storage_faulted: Vec<u32>,
+    /// Union of every node's `unresponsive_shards` (wedged local actors).
+    pub unresponsive: Vec<u32>,
+    pub nodes_reporting: usize,
+    pub nodes_failed: usize,
+}
+
+pub fn cluster_quorum(observations: &[NodeObservation], merged: &[MergedShard]) -> ClusterQuorum {
+    let mut rollup = ClusterQuorum::default();
+    let mut at_risk = std::collections::BTreeSet::new();
+    let mut storage_faulted = std::collections::BTreeSet::new();
+    let mut unresponsive = std::collections::BTreeSet::new();
+    for observation in observations {
+        match &observation.shards {
+            Some(shards) => {
+                rollup.nodes_reporting += 1;
+                at_risk.extend(shards.quorum.at_risk_led_shards.iter().copied());
+                storage_faulted.extend(shards.quorum.storage_faulted_shards.iter().copied());
+                unresponsive.extend(shards.quorum.unresponsive_shards.iter().copied());
+            }
+            None => rollup.nodes_failed += 1,
+        }
+    }
+    rollup.leaderless = merged
+        .iter()
+        .filter(|shard| !shard.leader_view)
+        .map(|shard| shard.shard_id)
+        .collect();
+    rollup.at_risk = at_risk.into_iter().collect();
+    rollup.storage_faulted = storage_faulted.into_iter().collect();
+    rollup.unresponsive = unresponsive.into_iter().collect();
+    rollup
+}
+
 // ---- Prometheus -------------------------------------------------------------------
+
+/// The summary card's Prometheus state: unset URL, query failure, or the number
+/// of up scrape targets in the `fiducia` namespace ([`PROM_FIDUCIA_UP_QUERY`]).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PromScrape {
+    NotConfigured,
+    Error { error: String },
+    Up { targets: usize },
+}
 
 /// Instant-query URL: `GET /api/v1/query?query=…`.
 pub fn prom_instant_query_url(base_url: &str, query: &str) -> String {

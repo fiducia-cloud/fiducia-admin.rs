@@ -16,6 +16,11 @@
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde_json::Value;
 
+use crate::cluster_insight::{
+    grafana_explore_loki_url, grafana_explore_prom_url, loki_events_logql, now_ms, relative_age,
+    utc_timestamp, ClusterEvent, ClusterQuorum, MergedShard, NodeObservation, PromScrape,
+    PROM_FIDUCIA_UP_QUERY,
+};
 use crate::session::Session;
 
 const CSS: &str = r#"

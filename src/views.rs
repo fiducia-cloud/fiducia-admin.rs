@@ -474,6 +474,8 @@ pub fn cluster_status_panel(
             div class="stat" {
                 div class="n" {
                     (gap_count("leaderless", quorum.leaderless.len() as u64, "#shard-table"))
+                    (gap_count("leader-unreached", quorum.leader_unreached.len() as u64, "#shard-table"))
+                    (gap_count("dual-leader", quorum.dual_leader.len() as u64, "#shard-table"))
                     (gap_count("at-risk", quorum.at_risk.len() as u64, "#shard-table"))
                     (gap_count("storage-faulted", quorum.storage_faulted.len() as u64, "#shard-table"))
                     (gap_count("unresponsive", quorum.unresponsive.len() as u64, "#shard-table"))
@@ -482,6 +484,12 @@ pub fn cluster_status_panel(
                     "raft quorum (observed from "
                     a href="#node-table" { (quorum.nodes_reporting) " of " (quorum.nodes_reporting + quorum.nodes_failed) " nodes" }
                     ")"
+                    @if let Some(total) = quorum.targets_truncated_from {
+                        " · "
+                        span class="tag tag--warn" {
+                            "targets truncated (showing " (crate::cluster_insight::MAX_NODES) " of " (total) ")"
+                        }
+                    }
                 }
             }
             div class="stat" {

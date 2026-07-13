@@ -1136,13 +1136,10 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_address_class_matches_the_upstream_sentinel() {
-        // The string the fan-out stamps on a refused target must equal the shared
-        // upstream sentinel so JSON and tooltips agree (L7 / H1).
-        assert_eq!(
-            UNTRUSTED_ADDRESS,
-            crate::upstream::UpstreamError::UntrustedAddress.to_string()
-        );
+    fn untrusted_address_class_is_the_documented_l7_string() {
+        // The string the fan-out stamps on a refused target is the shared L7
+        // class, so JSON (`node_observations[].error`) and tooltips agree (H1).
+        assert_eq!(untrusted_address_class(), "untrusted address");
     }
 
     // ---- M3: fan-out target cap ----

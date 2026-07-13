@@ -2499,22 +2499,38 @@ mod cluster_tests {
         );
         let (loki_url, loki_task) = spawn_mock(loki).await;
 
-        let prometheus = Router::new().route(
-            "/api/v1/query",
-            get(|| async {
-                Json(json!({
-                    "status": "success",
-                    "data": {
-                        "resultType": "vector",
-                        "result": [
-                            { "metric": { "pod": "fiducia-node-0" }, "value": [1752400681.0, "1"] },
-                            { "metric": { "pod": "fiducia-node-1" }, "value": [1752400681.0, "1"] },
-                            { "metric": { "pod": "fiducia-brain-0" }, "value": [1752400681.0, "0"] }
-                        ]
-                    }
-                }))
-            }),
-        );
+        let prometheus = Router::new()
+            .route(
+                "/api/v1/query",
+                get(|| async {
+                    Json(json!({
+                        "status": "success",
+                        "data": {
+                            "resultType": "vector",
+                            "result": [
+                                { "metric": { "pod": "fiducia-node-0" }, "value": [1752400681.0, "1"] },
+                                { "metric": { "pod": "fiducia-node-1" }, "value": [1752400681.0, "1"] },
+                                { "metric": { "pod": "fiducia-brain-0" }, "value": [1752400681.0, "0"] }
+                            ]
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/query_range",
+                get(|| async {
+                    Json(json!({
+                        "status": "success",
+                        "data": {
+                            "resultType": "matrix",
+                            "result": [{
+                                "metric": { "pod": "fiducia-node-0" },
+                                "values": [[1752400621.0, "1"], [1752400681.0, "1"]]
+                            }]
+                        }
+                    }))
+                }),
+            );
         let (prometheus_url, prometheus_task) = spawn_mock(prometheus).await;
 
         let state = insight_state(

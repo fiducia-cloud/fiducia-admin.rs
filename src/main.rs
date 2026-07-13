@@ -2244,10 +2244,14 @@ mod cluster_tests {
             }),
         );
         let (auth_url, auth_task) = spawn_mock(auth).await;
-        let state = Arc::new(AppState {
+        let state = insight_state(
             auth_url,
-            ..Arc::try_unwrap(sync_tests::test_state()).unwrap_or_else(|state| (*state).clone_for_test())
-        });
+            "http://localhost:8095".into(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
 
         let page = get_with(cluster_router(state.clone()), "/cluster", Some("verified.jwt"), false).await;
         assert_eq!(page.status(), StatusCode::FORBIDDEN);

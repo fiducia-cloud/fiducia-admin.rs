@@ -386,7 +386,10 @@ pub struct NodeMetrics {
 async fn observe_get(base_url: &str, path: &str) -> InsightResult<Value> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
     let request = upstream::attach_internal(client(NODE_OBSERVE_TIMEOUT_SECS)?.get(url))?;
-    Ok(request.send().await?.error_for_status()?.json().await?)
+    // Status/redirect check + 16 MiB body cap (H1 + M2); parse from the bounded
+    // buffer.
+    let body = upstream::send_capped(request).await?;
+    Ok(serde_json::from_slice(&body)?)
 }
 
 /// Fetch `/v1/observe/shards` from every target concurrently. Partial failure is

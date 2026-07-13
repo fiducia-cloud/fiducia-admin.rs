@@ -56,7 +56,7 @@ canonical `Host`, and writes reject a supplied non-admin `Origin`.
 After supplying the required service and database configuration below:
 
 ```bash
-FIDUCIA_ADMIN_DEV_SESSION=admin cargo run    # browse http://127.0.0.1:8096
+FIDUCIA_ADMIN_DEV_SESSION=admin cargo run --locked    # browse http://127.0.0.1:8096
 ```
 
 > **Security:** `FIDUCIA_ADMIN_DEV_SESSION` is a full auth bypass (any request
@@ -104,7 +104,7 @@ pinned [`flags-2-env`](https://github.com/ORESoftware/flags-2-env) submodule
 (`vendor/flags-2-env`) and the `.cli-flags.toml` schema, then execs the command:
 
 ```bash
-scripts/with-flags2env.sh --port 8096 -- cargo run
+scripts/with-flags2env.sh --port 8096 -- cargo run --locked
 ```
 
 The schema is audited by the CLI flag contract step in CI
@@ -117,7 +117,8 @@ The container build fetches `fiducia-interfaces` at
 `bbd8b52ce729ec34b0a9bff4dda6d0a448181797` and `fiducia-sync` at
 `5d3660511b3bfe951d0a66f9d7737497e0d1401f`. Both build arguments must be
 40-character lowercase commit ids; the Dockerfile checks out each commit in
-detached mode and verifies `HEAD` before compiling with `cargo --locked`. CI uses
+detached mode and verifies `HEAD` before compiling with
+`cargo build --release --locked`. CI uses
 the same immutable refs. Update the pins only with the corresponding schema,
 generated browser bundle, and test results in one reviewed change.
 

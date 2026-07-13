@@ -11,6 +11,7 @@ roll the test environment.
   `ghcr.io/fiducia-cloud/fiducia-admin` tagged `latest` and the commit SHA. The
   same immutable sibling commits are passed as explicit Docker build arguments.
 - **`deploy-test.yml`** — on `main`, rolls the `fiducia-test` Kubernetes
-  namespace to the SHA-tagged image. Secret-gated on `KUBE_CONFIG_TEST`; a no-op
-  (validation-only) when the secret is absent. App repos deploy to TEST from
-  their own CI; PROD deploys only from the monorepo.
+  namespace to the SHA-tagged image. `KUBE_CONFIG_TEST` is mandatory: missing,
+  invalid, or empty credentials fail the job, as do a missing target and an
+  incomplete rollout. App repos deploy to TEST from their own CI; PROD deploys
+  only from the monorepo.

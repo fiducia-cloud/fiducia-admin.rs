@@ -2,10 +2,10 @@
 //!
 //! The admin app is a thin web tier: it renders HTML but the data and actions
 //! live elsewhere — **accounts/API keys** in `fiducia-auth`, **infra** in
-//! `fiducia-brain`. Each call here is a small HTTP round-trip; failures degrade
-//! gracefully (empty list / `false`) so a transient upstream blip renders an
-//! empty page rather than a 500.
+//! `fiducia-brain`. Each call returns a typed success or an error to the handler;
+//! dependency failures are never presented as empty, successful data.
 
+use std::io;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -14,17 +14,18 @@ use crate::session::Session;
 
 /// Shared HTTP client (connection pooling + a sane timeout) so a slow upstream
 /// can't hang a dashboard request.
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+type UpstreamResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn client() -> UpstreamResult<reqwest::Client> {
+    Ok(reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .build()?)
 }
 
 /// The cluster trusted-hop secret, read once. The brain's `/v1` enforces it when
 /// configured, so admin's brain calls (membership / placement / scale) must
 /// present it. (Auth calls use the caller's bearer token instead.)
-fn internal_secret() -> Option<&'static str> {
+fn internal_secret() -> UpstreamResult<&'static str> {
     static SECRET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     SECRET
         .get_or_init(|| {
@@ -34,34 +35,30 @@ fn internal_secret() -> Option<&'static str> {
                 .filter(|s| !s.is_empty())
         })
         .as_deref()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FIDUCIA_INTERNAL_SECRET must be set",
+            )
+            .into()
+        })
 }
 
-/// Attach the trusted-hop header to an outbound brain request when configured.
-fn attach_internal(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    match internal_secret() {
-        Some(secret) => builder.header("x-fiducia-internal-auth", secret),
-        None => builder,
-    }
+/// Attach the required trusted-hop header to an outbound brain request.
+fn attach_internal(builder: reqwest::RequestBuilder) -> UpstreamResult<reqwest::RequestBuilder> {
+    Ok(builder.header("x-fiducia-internal-auth", internal_secret()?))
 }
 
 /// `fiducia-auth`: list the caller's org API keys (masked). Forwards the caller's
 /// session bearer so auth resolves the same identity the dashboard authenticated.
-pub async fn list_keys(auth_url: &str, session: &Session) -> Vec<Value> {
-    let Some(token) = session.bearer_token.as_deref() else {
-        return vec![];
-    };
+pub async fn list_keys(auth_url: &str, session: &Session) -> UpstreamResult<Vec<Value>> {
+    let token = session
+        .bearer_token
+        .as_deref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "missing bearer session"))?;
     let url = format!("{}/v1/keys", auth_url.trim_end_matches('/'));
-    match get_json(client().get(url).bearer_auth(token)).await {
-        Ok(value) => value
-            .get("keys")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to list API keys via fiducia-auth");
-            vec![]
-        }
-    }
+    let value = get_json(client()?.get(url).bearer_auth(token)).await?;
+    json_array(&value, "keys")
 }
 
 /// `fiducia-auth`: create a scoped key. Returns the raw key (shown once) + meta.
@@ -71,10 +68,11 @@ pub async fn create_key_with_scopes(
     name: &str,
     scopes: &[String],
     env: &str,
-) -> Value {
-    let Some(token) = session.bearer_token.as_deref() else {
-        return json!({ "error": "missing_bearer_session" });
-    };
+) -> UpstreamResult<Value> {
+    let token = session
+        .bearer_token
+        .as_deref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "missing bearer session"))?;
     let scopes = normalized_scopes(scopes);
     let env = match env.trim() {
         "" => "live",
@@ -87,7 +85,6 @@ pub async fn create_key_with_scopes(
         json!({ "name": name, "org_id": session.orgs.first(), "scopes": scopes, "env": env }),
     )
     .await
-    .unwrap_or_else(|err| json!({ "error": "upstream_failed", "detail": err.to_string() }))
 }
 
 fn normalized_scopes(scopes: &[String]) -> Vec<String> {
@@ -106,65 +103,70 @@ fn normalized_scopes(scopes: &[String]) -> Vec<String> {
 }
 
 /// `fiducia-auth`: revoke a key. Returns whether auth reported it revoked.
-pub async fn revoke_key(auth_url: &str, session: &Session, key_id: &str) -> bool {
-    let Some(token) = session.bearer_token.as_deref() else {
-        return false;
-    };
+pub async fn revoke_key(auth_url: &str, session: &Session, key_id: &str) -> UpstreamResult<bool> {
+    let token = session
+        .bearer_token
+        .as_deref()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "missing bearer session"))?;
     let url = format!(
         "{}/v1/keys/{}",
         auth_url.trim_end_matches('/'),
         urlencode(key_id)
     );
-    match get_json(client().delete(url).bearer_auth(token)).await {
-        Ok(value) => value
-            .get("revoked")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        Err(err) => {
-            tracing::warn!(error = %err, key_id, "failed to revoke API key via fiducia-auth");
-            false
-        }
-    }
+    let value = get_json(client()?.delete(url).bearer_auth(token)).await?;
+    value
+        .get("revoked")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "auth response omitted revoked").into()
+        })
 }
 
 /// `fiducia-brain`: cluster membership.
-pub async fn nodes(brain_url: &str) -> Vec<Value> {
+pub async fn nodes(brain_url: &str) -> UpstreamResult<Vec<Value>> {
     get_array(brain_url, "/v1/nodes", "nodes").await
 }
 
 /// `fiducia-brain`: shard placement map.
-pub async fn placement(brain_url: &str) -> Vec<Value> {
+pub async fn placement(brain_url: &str) -> UpstreamResult<Vec<Value>> {
     get_array(brain_url, "/v1/placement", "shards").await
 }
 
 /// `fiducia-brain`: set the desired scale plan. The replication factor is fixed
 /// at the multi-cloud baseline (the brain clamps it server-side anyway), so the
 /// admin form only changes the node count.
-pub async fn set_scale(brain_url: &str, target_nodes: u32) -> bool {
+pub async fn set_scale(brain_url: &str, target_nodes: u32) -> UpstreamResult<bool> {
     let url = format!("{}/v1/scale", brain_url.trim_end_matches('/'));
-    get_json(attach_internal(client().post(url).json(
-        &json!({ "target_nodes": target_nodes, "replication_factor": 3 }),
-    )))
-    .await
-    .map(|value| value.get("ok").and_then(Value::as_bool).unwrap_or(false))
-    .unwrap_or(false)
+    let value =
+        get_json(attach_internal(client()?.post(url).json(
+            &json!({ "target_nodes": target_nodes, "replication_factor": 3 }),
+        ))?)
+        .await?;
+    value.get("ok").and_then(Value::as_bool).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "brain response omitted ok").into()
+    })
 }
 
-async fn get_array(base_url: &str, path: &str, field: &str) -> Vec<Value> {
+async fn get_array(base_url: &str, path: &str, field: &str) -> UpstreamResult<Vec<Value>> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
     // get_array only fetches from the brain (nodes / placement), so always present
     // the trusted-hop secret.
-    match get_json(attach_internal(client().get(url))).await {
-        Ok(value) => value
-            .get(field)
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
-        Err(err) => {
-            tracing::warn!(error = %err, path, "failed to fetch admin upstream data");
-            vec![]
-        }
-    }
+    let value = get_json(attach_internal(client()?.get(url))?).await?;
+    json_array(&value, field)
+}
+
+fn json_array(value: &Value, field: &str) -> UpstreamResult<Vec<Value>> {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("upstream response omitted {field} array"),
+            )
+            .into()
+        })
 }
 
 /// Percent-encode a single path segment (key ids are opaque but kept URL-safe).
@@ -192,7 +194,7 @@ async fn post_json(
     bearer: Option<&str>,
     body: Value,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    let mut request = client().post(url).json(&body);
+    let mut request = client()?.post(url).json(&body);
     if let Some(token) = bearer {
         request = request.bearer_auth(token);
     }

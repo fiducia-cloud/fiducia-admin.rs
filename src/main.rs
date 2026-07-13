@@ -24,6 +24,7 @@ mod views;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{io, result};
 
 use axum::{
     extract::{
@@ -44,8 +45,6 @@ use maud::Markup;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
-use std::collections::HashMap;
-use std::sync::Mutex;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
 use tower_http::{
@@ -76,34 +75,25 @@ const SYNC_JS: &str = include_str!("../assets/fiducia-sync.js");
 struct AppState {
     auth_url: String,
     brain_url: String,
-    /// Admin Postgres pool. `None` keeps the no-DB behavior (infra audit empty).
+    /// Admin Postgres pool. `None` is only used by isolated failure-path tests.
     pool: Option<PgPool>,
     /// Fans `fiducia:sync` frames out to `/admin/ws` subscribers.
     stream_tx: broadcast::Sender<String>,
-    /// Idempotency-Key → committed_version: a retried sync write replays its
-    /// original ack instead of re-running the UPDATE (which would re-bump version).
-    /// In-process + bounded (retries are short-lived). AppState is shared via Arc.
-    idempotency: Mutex<HashMap<String, i64>>,
 }
-
-/// Coarse bound on the in-process idempotency cache (cleared wholesale past this).
-const IDEMPOTENCY_CACHE_CAP: usize = 10_000;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
-    let pool = connect_admin_db().await;
+    let pool = connect_admin_db().await?;
+    required_env("FIDUCIA_INTERNAL_SECRET")?;
     let (stream_tx, _) = broadcast::channel::<String>(256);
 
     let state = Arc::new(AppState {
-        auth_url: std::env::var("FIDUCIA_AUTH_URL")
-            .unwrap_or_else(|_| "http://localhost:8097".into()),
-        brain_url: std::env::var("FIDUCIA_BRAIN_URL")
-            .unwrap_or_else(|_| "http://localhost:8095".into()),
-        pool,
+        auth_url: required_env("FIDUCIA_AUTH_URL")?,
+        brain_url: required_env("FIDUCIA_BRAIN_URL")?,
+        pool: Some(pool),
         stream_tx,
-        idempotency: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -141,22 +131,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Open a pool to the ADMIN Postgres plane when `DATABASE_URL` is set. Returns
-/// `None` (no-DB path) if the var is unset/empty, or if the connection fails —
-/// the dashboard must boot without a DB, so a bad/missing DB is degraded, never
-/// fatal. This is the admin DB only; never the customer database.
-async fn connect_admin_db() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok().filter(|v| !v.is_empty())?;
-    match PgPoolOptions::new().max_connections(5).connect(&url).await {
-        Ok(pool) => {
-            tracing::info!("admin DB connected — infra_operations audit is live");
-            Some(pool)
-        }
-        Err(err) => {
-            tracing::error!("admin DB connect failed ({err}); running without the audit trail");
-            None
-        }
-    }
+/// Connect to the isolated admin Postgres plane; missing/unreachable storage is
+/// fatal because an operator action without its audit trail is not acceptable.
+async fn connect_admin_db() -> Result<PgPool, Box<dyn std::error::Error>> {
+    let url = required_env("DATABASE_URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await?;
+    pool.acquire().await?;
+    tracing::info!("admin DB connected — infra_operations audit is live");
+    Ok(pool)
+}
+
+fn required_env(name: &str) -> result::Result<String, io::Error> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{name} must be set")))
 }
 
 async fn health() -> Json<Value> {
@@ -257,7 +249,10 @@ async fn keys_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respo
         Ok(s) => s,
         Err(r) => return r,
     };
-    let keys = upstream::list_keys(&st.auth_url, &s).await;
+    let keys = match upstream::list_keys(&st.auth_url, &s).await {
+        Ok(keys) => keys,
+        Err(err) => return upstream_error("auth_key_list_failed", "fiducia-auth", err),
+    };
     views::keys(&s, &keys).into_response()
 }
 
@@ -281,9 +276,16 @@ async fn create_key(
     };
     let scopes = vec![form.scope.unwrap_or_else(|| "requests:write".to_string())];
     let env = form.env.as_deref().unwrap_or("live");
-    let created = upstream::create_key_with_scopes(&st.auth_url, &s, &form.name, &scopes, env).await;
+    let created =
+        match upstream::create_key_with_scopes(&st.auth_url, &s, &form.name, &scopes, env).await {
+            Ok(created) => created,
+            Err(err) => return upstream_error("auth_key_create_failed", "fiducia-auth", err),
+        };
     if is_htmx(&headers) {
-        let keys = upstream::list_keys(&st.auth_url, &s).await;
+        let keys = match upstream::list_keys(&st.auth_url, &s).await {
+            Ok(keys) => keys,
+            Err(err) => return upstream_error("auth_key_list_failed", "fiducia-auth", err),
+        };
         views::keys_after_create(&form.name, &created, &keys).into_response()
     } else {
         redirect("/keys")
@@ -299,9 +301,15 @@ async fn revoke_key(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let revoked = upstream::revoke_key(&st.auth_url, &s, &key_id).await;
+    let revoked = match upstream::revoke_key(&st.auth_url, &s, &key_id).await {
+        Ok(revoked) => revoked,
+        Err(err) => return upstream_error("auth_key_revoke_failed", "fiducia-auth", err),
+    };
     if is_htmx(&headers) {
-        let keys = upstream::list_keys(&st.auth_url, &s).await;
+        let keys = match upstream::list_keys(&st.auth_url, &s).await {
+            Ok(keys) => keys,
+            Err(err) => return upstream_error("auth_key_list_failed", "fiducia-auth", err),
+        };
         views::keys_after_revoke(revoked, &keys).into_response()
     } else {
         redirect("/keys")
@@ -313,9 +321,18 @@ async fn infra_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         Ok(s) => s,
         Err(r) => return r,
     };
-    let nodes = upstream::nodes(&st.brain_url).await;
-    let placement = upstream::placement(&st.brain_url).await;
-    let recent = recent_ops(&st).await;
+    let nodes = match upstream::nodes(&st.brain_url).await {
+        Ok(nodes) => nodes,
+        Err(err) => return upstream_error("brain_nodes_failed", "fiducia-brain", err),
+    };
+    let placement = match upstream::placement(&st.brain_url).await {
+        Ok(placement) => placement,
+        Err(err) => return upstream_error("brain_placement_failed", "fiducia-brain", err),
+    };
+    let recent = match recent_ops(&st).await {
+        Ok(rows) => rows,
+        Err(err) => return dependency_error("infra_audit_read_failed", err),
+    };
     views::infra(&s, &nodes, &placement, &recent).into_response()
 }
 
@@ -333,14 +350,35 @@ async fn scale(
         Ok(s) => s,
         Err(r) => return r,
     };
-    // Drive the real brain (best-effort), and — when the admin DB is wired —
-    // record the control-plane action in the infra_operations audit trail.
-    let _ = upstream::set_scale(&st.brain_url, form.target_nodes).await;
-    let _ = record_scale(&st, &s, form.target_nodes).await;
+    // Write the audit intent before the external side effect. An operator action
+    // is never executed without a durable record.
+    if let Err(err) = record_scale(&st, &s, form.target_nodes).await {
+        return dependency_error("infra_audit_write_failed", err);
+    }
+    let scaled = match upstream::set_scale(&st.brain_url, form.target_nodes).await {
+        Ok(scaled) => scaled,
+        Err(err) => return upstream_error("brain_scale_failed", "fiducia-brain", err),
+    };
+    if !scaled {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "brain_scale_failed", "dependency": "fiducia-brain" })),
+        )
+            .into_response();
+    }
     if is_htmx(&headers) {
-        let nodes = upstream::nodes(&st.brain_url).await;
-        let placement = upstream::placement(&st.brain_url).await;
-        let recent = recent_ops(&st).await;
+        let nodes = match upstream::nodes(&st.brain_url).await {
+            Ok(nodes) => nodes,
+            Err(err) => return upstream_error("brain_nodes_failed", "fiducia-brain", err),
+        };
+        let placement = match upstream::placement(&st.brain_url).await {
+            Ok(placement) => placement,
+            Err(err) => return upstream_error("brain_placement_failed", "fiducia-brain", err),
+        };
+        let recent = match recent_ops(&st).await {
+            Ok(rows) => rows,
+            Err(err) => return dependency_error("infra_audit_read_failed", err),
+        };
         views::infra_panel(&nodes, &placement, &recent, Some(form.target_nodes)).into_response()
     } else {
         redirect("/infra")
@@ -349,46 +387,39 @@ async fn scale(
 
 // ---- Admin DB vertical (P2): infra_operations audit + sync broadcast ---------
 
-/// Recent control-plane operations, newest first, as display JSON. Empty when no
-/// admin DB is configured (or the query fails) so the page always renders.
-async fn recent_ops(st: &AppState) -> Vec<Value> {
-    let Some(pool) = &st.pool else {
-        return vec![];
-    };
-    match sqlx::query_as::<_, InfraOperationsRow>(
+/// Recent control-plane operations, newest first, as display JSON.
+async fn recent_ops(st: &AppState) -> Result<Vec<Value>, sqlx::Error> {
+    let pool = st.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
+    let rows = sqlx::query_as::<_, InfraOperationsRow>(
         "select * from infra_operations order by created_at desc limit 10",
     )
     .fetch_all(pool)
-    .await
-    {
-        Ok(rows) => rows
-            .iter()
-            .filter_map(|row| serde_json::to_value(row).ok())
-            .collect(),
-        Err(err) => {
-            tracing::error!("recent infra_operations query failed: {err}");
-            vec![]
-        }
-    }
+    .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| serde_json::to_value(row).ok())
+        .collect())
 }
 
 /// Insert a `scale` row into infra_operations (status `requested`, operator
 /// resolved from the session email if a matching operator exists) and broadcast
-/// it as a `fiducia:sync` change. No-op without an admin DB.
-async fn record_scale(st: &AppState, s: &Session, target_nodes: u32) -> Option<InfraOperationsRow> {
-    let pool = st.pool.as_ref()?;
+/// it as a `fiducia:sync` change.
+async fn record_scale(
+    st: &AppState,
+    s: &Session,
+    target_nodes: u32,
+) -> Result<InfraOperationsRow, sqlx::Error> {
+    let pool = st.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
     let operator_id: Option<Uuid> = match &s.email {
-        Some(email) => sqlx::query_scalar::<_, Uuid>(
-            "select id from operators where lower(email) = lower($1)",
-        )
-        .bind(email)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten(),
+        Some(email) => {
+            sqlx::query_scalar::<_, Uuid>("select id from operators where lower(email) = lower($1)")
+                .bind(email)
+                .fetch_optional(pool)
+                .await?
+        }
         None => None,
     };
-    match sqlx::query_as::<_, InfraOperationsRow>(
+    let row = sqlx::query_as::<_, InfraOperationsRow>(
         "insert into infra_operations (operator_id, action, target_nodes, status, params) \
          values ($1, 'scale', $2, 'requested', $3) returning *",
     )
@@ -396,17 +427,9 @@ async fn record_scale(st: &AppState, s: &Session, target_nodes: u32) -> Option<I
     .bind(target_nodes as i32)
     .bind(json!({ "target_nodes": target_nodes, "replication_factor": 3 }))
     .fetch_one(pool)
-    .await
-    {
-        Ok(row) => {
-            broadcast_infra_change(st, &row);
-            Some(row)
-        }
-        Err(err) => {
-            tracing::error!("infra_operations insert failed: {err}");
-            None
-        }
-    }
+    .await?;
+    broadcast_infra_change(st, &row);
+    Ok(row)
 }
 
 /// One queued optimistic write from the sync client (mirrors the customer plane).
@@ -417,8 +440,6 @@ struct SyncWriteRequest {
     op: Option<String>,
     #[serde(default)]
     payload: Option<Value>,
-    #[serde(default)]
-    base_version: Option<i64>,
 }
 
 /// The @fiducia/sync write path, generic in `{table}` (only `infra_operations` is
@@ -438,22 +459,52 @@ async fn sync_write(
         .map(str::to_owned);
     if let Some(key) = &idem_key {
         match idempotency_begin(&st, key).await {
-            Idem::Replay(v) => return ack(&req.id, v),
-            // A concurrent identical request holds the claim; don't re-run.
-            Idem::InFlight => return ack(&req.id, req.base_version.unwrap_or(0) + 1),
-            Idem::Proceed => {}
+            Ok(Idem::Replay(v)) => return ack(&req.id, v),
+            Ok(Idem::InFlight) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": "idempotency_in_flight" })),
+                )
+                    .into_response()
+            }
+            Ok(Idem::Proceed) => {}
+            Err(err) => return dependency_error("idempotency_claim_failed", err),
         }
     }
 
     let committed = match table.as_str() {
         "infra_operations" => sync_write_infra_operations_row(&st, &req).await,
-        // No DB-wired handler for this table yet — fall through to the fallback ack.
-        _ => None,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "unsupported_sync_table", "table": table })),
+            )
+                .into_response()
+        }
     };
-    let version = committed.unwrap_or_else(|| req.base_version.unwrap_or(0) + 1);
+    let version = match committed {
+        Ok(version) => version,
+        Err(SyncWriteError::InvalidId) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_row_id" })),
+            )
+                .into_response()
+        }
+        Err(SyncWriteError::NotFound) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "row_not_found" })),
+            )
+                .into_response()
+        }
+        Err(SyncWriteError::Database(err)) => return dependency_error("sync_write_failed", err),
+    };
 
     if let Some(key) = &idem_key {
-        idempotency_commit(&st, key, version).await;
+        if let Err(err) = idempotency_commit(&st, key, version).await {
+            return dependency_error("idempotency_commit_failed", err);
+        }
     }
     ack(&req.id, version)
 }
@@ -465,59 +516,42 @@ enum Idem {
     Proceed,
 }
 
-/// Begin idempotent handling of `key`. Durable (survives restarts) when a pool is
-/// present — claim-first so only the first request runs the mutation; otherwise an
-/// in-process cache (the mock/no-DB path used in tests).
-async fn idempotency_begin(st: &AppState, key: &str) -> Idem {
-    if let Some(pool) = &st.pool {
-        // Claim: insert returns a row only if we won it.
-        let claimed = sqlx::query_scalar::<_, i32>(
-            "insert into sync_idempotency_keys (key) values ($1) \
-             on conflict (key) do nothing returning 1",
+/// Begin idempotent handling in the durable admin ledger.
+async fn idempotency_begin(st: &AppState, key: &str) -> Result<Idem, sqlx::Error> {
+    let pool = st.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
+    let claimed = sqlx::query_scalar::<_, i32>(
+        "insert into sync_idempotency_keys (key) values ($1) \
+         on conflict (key) do nothing returning 1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+    if claimed.is_some() {
+        return Ok(Idem::Proceed);
+    }
+    Ok(
+        match sqlx::query_scalar::<_, Option<i64>>(
+            "select committed_version from sync_idempotency_keys where key = $1",
         )
         .bind(key)
         .fetch_optional(pool)
-        .await;
-        match claimed {
-            Ok(Some(_)) => Idem::Proceed,
-            Ok(None) => {
-                // Existed already — replay the committed version (null => in-flight).
-                match sqlx::query_scalar::<_, Option<i64>>(
-                    "select committed_version from sync_idempotency_keys where key = $1",
-                )
-                .bind(key)
-                .fetch_optional(pool)
-                .await
-                {
-                    Ok(Some(Some(v))) => Idem::Replay(v),
-                    Ok(Some(None)) => Idem::InFlight,
-                    _ => Idem::Proceed,
-                }
-            }
-            Err(_) => Idem::Proceed, // ledger error must not block the write
-        }
-    } else if let Some(v) = st.idempotency.lock().unwrap().get(key).copied() {
-        Idem::Replay(v)
-    } else {
-        Idem::Proceed
-    }
+        .await?
+        {
+            Some(Some(version)) => Idem::Replay(version),
+            _ => Idem::InFlight,
+        },
+    )
 }
 
-/// Record the committed version for `key` (durable when pooled, else in-process).
-async fn idempotency_commit(st: &AppState, key: &str, version: i64) {
-    if let Some(pool) = &st.pool {
-        let _ = sqlx::query("update sync_idempotency_keys set committed_version = $2 where key = $1")
-            .bind(key)
-            .bind(version)
-            .execute(pool)
-            .await;
-    } else {
-        let mut cache = st.idempotency.lock().unwrap();
-        if cache.len() >= IDEMPOTENCY_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(key.to_owned(), version);
-    }
+/// Record the committed version for `key` in the durable admin ledger.
+async fn idempotency_commit(st: &AppState, key: &str, version: i64) -> Result<(), sqlx::Error> {
+    let pool = st.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
+    sqlx::query("update sync_idempotency_keys set committed_version = $2 where key = $1")
+        .bind(key)
+        .bind(version)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -534,8 +568,11 @@ async fn sync_catchup(
     Path(table): Path<String>,
     Query(params): Query<CatchupParams>,
 ) -> Response {
-    let rows: Vec<serde_json::Value> = match (table.as_str(), &st.pool) {
-        ("infra_operations", Some(pool)) => {
+    let rows: Vec<serde_json::Value> = match table.as_str() {
+        "infra_operations" => {
+            let Some(pool) = &st.pool else {
+                return dependency_error("database_unavailable", sqlx::Error::PoolClosed);
+            };
             match sqlx::query_as::<_, InfraOperationsRow>(
                 "select * from infra_operations where version > $1 order by version asc limit 500",
             )
@@ -547,13 +584,16 @@ async fn sync_catchup(
                     .iter()
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
                     .collect(),
-                Err(err) => {
-                    tracing::error!("infra_operations catch-up failed: {err}");
-                    vec![]
-                }
+                Err(err) => return dependency_error("sync_catchup_failed", err),
             }
         }
-        _ => vec![],
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "unsupported_sync_table", "table": table })),
+            )
+                .into_response()
+        }
     };
     Json(json!({ "table": table, "since": params.since, "rows": rows })).into_response()
 }
@@ -567,12 +607,23 @@ fn ack(id: &str, committed_version: i64) -> Response {
     .into_response()
 }
 
+enum SyncWriteError {
+    InvalidId,
+    NotFound,
+    Database(sqlx::Error),
+}
+
 /// Persist one queued optimistic write to `infra_operations`, broadcasting the
-/// committed change. Returns the committed row version, or `None` when there was
-/// no pool / no matching row / a bad id. The BEFORE UPDATE trigger bumps `version`.
-async fn sync_write_infra_operations_row(st: &AppState, req: &SyncWriteRequest) -> Option<i64> {
-    let pool = st.pool.as_ref()?;
-    let id = Uuid::parse_str(&req.id).ok()?;
+/// committed change. The BEFORE UPDATE trigger bumps `version`.
+async fn sync_write_infra_operations_row(
+    st: &AppState,
+    req: &SyncWriteRequest,
+) -> Result<i64, SyncWriteError> {
+    let pool = st
+        .pool
+        .as_ref()
+        .ok_or(SyncWriteError::Database(sqlx::Error::PoolClosed))?;
+    let id = Uuid::parse_str(&req.id).map_err(|_| SyncWriteError::InvalidId)?;
     let op = req.op.as_deref().unwrap_or("upsert");
 
     let committed = if op == "delete" {
@@ -611,14 +662,29 @@ async fn sync_write_infra_operations_row(st: &AppState, req: &SyncWriteRequest) 
     match committed {
         Ok(Some(row)) => {
             broadcast_infra_change(st, &row);
-            Some(row.version)
+            Ok(row.version)
         }
-        Ok(None) => None,
-        Err(err) => {
-            tracing::error!("infra_operations sync write failed: {err}");
-            None
-        }
+        Ok(None) => Err(SyncWriteError::NotFound),
+        Err(err) => Err(SyncWriteError::Database(err)),
     }
+}
+
+fn dependency_error(code: &str, error: impl std::fmt::Display) -> Response {
+    tracing::error!(code, error = %error, "required admin dependency failed");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": code, "dependency": "postgres" })),
+    )
+        .into_response()
+}
+
+fn upstream_error(code: &str, dependency: &str, error: impl std::fmt::Display) -> Response {
+    tracing::error!(code, dependency, error = %error, "required admin upstream failed");
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({ "error": code, "dependency": dependency })),
+    )
+        .into_response()
 }
 
 /// Broadcast a single infra_operations upsert as a `fiducia:sync` frame, built from
@@ -686,13 +752,16 @@ mod sync_tests {
         Arc::new(AppState {
             auth_url: "http://localhost:8097".into(),
             brain_url: "http://localhost:8095".into(),
-            pool: None, // no DB -> fallback monotonic ack path
+            pool: None,
             stream_tx: broadcast::channel(16).0,
-            idempotency: Mutex::new(HashMap::new()),
         })
     }
 
-    async fn post_sync(state: Arc<AppState>, table: &str, key: Option<&str>, base: i64) -> Value {
+    async fn post_sync(
+        state: Arc<AppState>,
+        table: &str,
+        key: Option<&str>,
+    ) -> axum::response::Response {
         let app = Router::new()
             .route("/api/admin/sync/:table", post(sync_write))
             .with_state(state);
@@ -703,45 +772,55 @@ mod sync_tests {
         if let Some(k) = key {
             builder = builder.header("idempotency-key", k);
         }
-        let body = json!({ "id": "op1", "op": "upsert", "base_version": base }).to_string();
-        let resp = app.oneshot(builder.body(Body::from(body)).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        serde_json::from_slice(&bytes).unwrap()
+        let body = json!({ "id": "op1", "op": "upsert" }).to_string();
+        app.oneshot(builder.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn sync_write_is_generic_and_acks_a_monotonic_version() {
-        let acked = post_sync(test_state(), "infra_operations", None, 4).await;
-        assert_eq!(acked["id"], "op1");
-        assert_eq!(acked["committed_version"], 5);
-        // A table with no DB-wired handler still returns a valid ack (generic route).
-        let other = post_sync(test_state(), "operators", None, 0).await;
-        assert_eq!(other["committed_version"], 1);
+    async fn sync_write_fails_closed_without_postgres() {
+        let response = post_sync(test_state(), "infra_operations", None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let unsupported = post_sync(test_state(), "operators", None).await;
+        assert_eq!(unsupported.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn serves_the_vendored_sync_bundle() {
         let app = Router::new().route("/assets/fiducia-sync.js", get(sync_js));
         let resp = app
-            .oneshot(Request::builder().uri("/assets/fiducia-sync.js").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/fiducia-sync.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+        let ct = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
         assert!(ct.contains("javascript"), "ct={ct}");
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("FiduciaSyncAdmin"));
     }
 
     #[tokio::test]
-    async fn sync_write_idempotency_key_replays_the_same_ack() {
-        let state = test_state();
-        let first = post_sync(state.clone(), "infra_operations", Some("infra_operations:op1:upsert:7"), 7).await;
-        assert_eq!(first["committed_version"], 8);
-        // Same key, different base -> the ORIGINAL ack is replayed, not 1000.
-        let retry = post_sync(state.clone(), "infra_operations", Some("infra_operations:op1:upsert:7"), 999).await;
-        assert_eq!(retry["committed_version"], 8);
+    async fn idempotency_requires_the_durable_ledger() {
+        let response = post_sync(
+            test_state(),
+            "infra_operations",
+            Some("infra_operations:op1:upsert:7"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
 
@@ -782,7 +861,6 @@ mod db_tests {
             brain_url: "x".into(),
             pool: Some(pool),
             stream_tx: broadcast::channel(4).0,
-            idempotency: Mutex::new(HashMap::new()),
         }
     }
 
@@ -792,7 +870,10 @@ mod db_tests {
     // whole sync-durability check in a single test sidesteps that entirely.
     #[tokio::test]
     async fn sync_durability_against_real_postgres() {
-        let Some(url) = std::env::var("TEST_DATABASE_URL").ok().filter(|v| !v.is_empty()) else {
+        let Some(url) = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+        else {
             eprintln!("skip sync_durability_against_real_postgres: TEST_DATABASE_URL unset");
             return;
         };
@@ -801,32 +882,71 @@ mod db_tests {
             .connect(&url)
             .await
             .expect("connect TEST_DATABASE_URL");
-        sqlx::raw_sql(SCHEMA).execute(&pool).await.expect("apply admin.sql");
+        sqlx::raw_sql(SCHEMA)
+            .execute(&pool)
+            .await
+            .expect("apply admin.sql");
         let st = state_with(pool.clone());
 
         // --- Durable idempotency: claim -> in-flight -> record -> replay ---------
         let key = format!("infra_operations:{}:upsert:7", Uuid::new_v4().simple());
-        assert!(matches!(idempotency_begin(&st, &key).await, Idem::Proceed), "first claim owns it");
-        assert!(matches!(idempotency_begin(&st, &key).await, Idem::InFlight), "second sees in-flight");
-        idempotency_commit(&st, &key, 8).await;
-        assert!(matches!(idempotency_begin(&st, &key).await, Idem::Replay(8)), "replays committed");
+        assert!(
+            matches!(idempotency_begin(&st, &key).await, Ok(Idem::Proceed)),
+            "first claim owns it"
+        );
+        assert!(
+            matches!(idempotency_begin(&st, &key).await, Ok(Idem::InFlight)),
+            "second sees in-flight"
+        );
+        idempotency_commit(&st, &key, 8).await.unwrap();
+        assert!(
+            matches!(idempotency_begin(&st, &key).await, Ok(Idem::Replay(8))),
+            "replays committed"
+        );
         // Survives a "restart": a fresh AppState (empty in-process cache) still replays.
         let fresh = state_with(pool.clone());
-        assert!(matches!(idempotency_begin(&fresh, &key).await, Idem::Replay(8)), "durable across restart");
+        assert!(
+            matches!(idempotency_begin(&fresh, &key).await, Ok(Idem::Replay(8))),
+            "durable across restart"
+        );
 
         // --- Indexed catch-up: rows newer than the cursor, ordered by version ----
-        let a: Uuid = sqlx::query_scalar("insert into infra_operations (action) values ('scale') returning id")
-            .fetch_one(&pool).await.unwrap();
-        let _b: Uuid = sqlx::query_scalar("insert into infra_operations (action) values ('drain') returning id")
-            .fetch_one(&pool).await.unwrap();
+        let a: Uuid = sqlx::query_scalar(
+            "insert into infra_operations (action) values ('scale') returning id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let _b: Uuid = sqlx::query_scalar(
+            "insert into infra_operations (action) values ('drain') returning id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         sqlx::query("update infra_operations set status = 'applied' where id = $1")
-            .bind(a).execute(&pool).await.unwrap(); // bump `a` to version 2
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap(); // bump `a` to version 2
 
         let newer: Vec<InfraOperationsRow> = sqlx::query_as(
             "select * from infra_operations where version > $1 order by version asc limit 500",
-        ).bind(1_i64).fetch_all(&pool).await.unwrap();
-        assert!(newer.iter().any(|r| r.id == a && r.version > 1), "bumped row present");
-        assert!(newer.iter().all(|r| r.version > 1), "cursor excludes v1 rows");
-        assert!(newer.windows(2).all(|w| w[0].version <= w[1].version), "ordered by version");
+        )
+        .bind(1_i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            newer.iter().any(|r| r.id == a && r.version > 1),
+            "bumped row present"
+        );
+        assert!(
+            newer.iter().all(|r| r.version > 1),
+            "cursor excludes v1 rows"
+        );
+        assert!(
+            newer.windows(2).all(|w| w[0].version <= w[1].version),
+            "ordered by version"
+        );
     }
 }

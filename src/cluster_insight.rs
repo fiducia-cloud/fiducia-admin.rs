@@ -1092,6 +1092,7 @@ mod tests {
             base_url: "http://node-c:8090".into(),
             shards: None,
             error: Some("connection refused".into()),
+            untrusted: false,
         };
 
         let merged = merge_shards(&[follower_first, leader_second, down]);

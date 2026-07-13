@@ -560,6 +560,27 @@ pub fn cluster_status_panel(
     }
 }
 
+/// One node's observe-fetch outcome badge for the registry table: reachable
+/// (with its leadership share), unreachable (error in the tooltip), or not in
+/// the fan-out target set at all.
+fn observe_cell(observation: Option<&NodeObservation>) -> Markup {
+    match observation {
+        Some(NodeObservation {
+            shards: Some(shards),
+            ..
+        }) => html! {
+            span class="tag tag--ok" {
+                "ok · leads " (shards.leader_count) " of " (shards.shards.len())
+            }
+        },
+        Some(NodeObservation {
+            error: Some(error), ..
+        }) => html! { span class="tag tag--bad" title=(error) { "unreachable" } },
+        Some(_) => html! { span class="tag" { "—" } },
+        None => html! { span class="tag" title="not in the observe target set" { "—" } },
+    }
+}
+
 /// Node registry (brain `/v1/nodes`) merged with each node's observe fetch
 /// outcome. htmx fragment for `/cluster/nodes`.
 pub fn cluster_nodes_panel(nodes: &[Value], observations: &[NodeObservation]) -> Markup {

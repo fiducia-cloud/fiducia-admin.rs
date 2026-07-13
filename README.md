@@ -48,7 +48,10 @@ FIDUCIA_ADMIN_DEV_SESSION=admin cargo run    # :8096, click through the UI witho
 > ignores it and logs an error, unless you also set
 > `FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1` — never do that in production.
 
-Env: `PORT`, `FIDUCIA_AUTH_URL`, `FIDUCIA_BRAIN_URL`, `OTEL_EXPORTER_OTLP_ENDPOINT`.
+Required env: `DATABASE_URL`, `FIDUCIA_AUTH_URL`, `FIDUCIA_BRAIN_URL`, and
+`FIDUCIA_INTERNAL_SECRET`. `PORT` and `OTEL_EXPORTER_OTLP_ENDPOINT` are optional.
+The service fails startup without its Postgres audit/idempotency ledger, and
+upstream failures return an explicit dependency error rather than empty data.
 Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-telemetry.rs).
 
 ## Related

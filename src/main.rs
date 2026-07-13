@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         request_security,
         prometheus_url: optional_env("FIDUCIA_PROMETHEUS_URL"),
         loki_url: optional_env("FIDUCIA_LOKI_URL"),
-        grafana_public_url: optional_env("FIDUCIA_GRAFANA_PUBLIC_URL"),
+        grafana_public_url: validated_grafana_public_url()?,
         node_urls: csv_env("FIDUCIA_NODE_URLS"),
     });
 

@@ -18,6 +18,8 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub version: i64,
+    /// Plane-wide, commit-ordered cursor used only for catch-up pagination.
+    pub sync_sequence: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

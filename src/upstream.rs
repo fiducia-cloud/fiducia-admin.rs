@@ -43,14 +43,35 @@ fn internal_secret() -> UpstreamResult<&'static str> {
         })
 }
 
-/// Attach the required trusted-hop header to an outbound brain request.
-fn attach_internal(builder: reqwest::RequestBuilder) -> UpstreamResult<reqwest::RequestBuilder> {
+/// Attach the required trusted-hop header to an outbound brain request. Also
+/// used by `cluster_insight` for the node observe fan-out — the node's `/v1`
+/// enforces the same `x-fiducia-internal-auth` trusted-hop secret.
+pub(crate) fn attach_internal(
+    builder: reqwest::RequestBuilder,
+) -> UpstreamResult<reqwest::RequestBuilder> {
     Ok(builder.header("x-fiducia-internal-auth", internal_secret()?))
 }
 
 /// `fiducia-brain`: cluster membership.
 pub async fn nodes(brain_url: &str) -> UpstreamResult<Vec<Value>> {
     get_array(brain_url, "/v1/nodes", "nodes").await
+}
+
+/// `fiducia-brain`: control-plane rollup (node health counts, placement gaps,
+/// brain HA/leader state). One call feeds the Cluster Insight summary cards.
+pub async fn status(brain_url: &str) -> UpstreamResult<Value> {
+    get_object(brain_url, "/v1/status").await
+}
+
+/// `fiducia-brain`: authoritative cluster configuration (`shard_count`,
+/// `replication_factor`, `cluster_id`).
+pub async fn config(brain_url: &str) -> UpstreamResult<Value> {
+    get_object(brain_url, "/v1/config").await
+}
+
+/// `fiducia-brain`: namespace placement policies.
+pub async fn policies(brain_url: &str) -> UpstreamResult<Value> {
+    get_object(brain_url, "/v1/policies").await
 }
 
 /// `fiducia-brain`: shard placement map.

@@ -1,11 +1,20 @@
-// Playwright browser E2E: boots the real axum admin server (dev session, no DB)
+// Playwright browser E2E: boots or reuses a fully configured axum admin server
 // and drives the isolated operator account and infra-scale HTMX flows.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright";
-import { chromeExecutablePath, startAdmin } from "./admin-browser-harness.mjs";
+import {
+  chromeExecutablePath,
+  startAdmin,
+  unavailableReason,
+} from "./admin-browser-harness.mjs";
 
 test("playwright drives the isolated admin dashboard and infra scale flow", async (t) => {
+  const unavailable = unavailableReason();
+  if (unavailable) {
+    t.skip(unavailable);
+    return;
+  }
   const server = await startAdmin();
   t.after(() => server.stop());
 
@@ -19,7 +28,7 @@ test("playwright drives the isolated admin dashboard and infra scale flow", asyn
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
 
-  // Dashboard renders under the dev-admin session (no DB required).
+  // Dashboard renders under the debug-only dev-admin session.
   await page.goto(`${server.url}/`, { waitUntil: "networkidle" });
   await assertVisibleText(page, "Dashboard");
   await assertVisibleText(page, "Welcome");

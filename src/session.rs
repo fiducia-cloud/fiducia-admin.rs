@@ -1,8 +1,9 @@
 //! Dashboard session handling.
 //!
 //! Operators log in through Supabase Auth; the Supabase access token rides in a
-//! host-only admin cookie (`fiducia_admin_session`) or an `Authorization: Bearer`
-//! header. On each request we verify it via `fiducia-auth`'s `GET /v1/me` (which
+//! host-only admin cookie (`__Host-fiducia_admin_session` in release builds) or
+//! an `Authorization: Bearer` header. On each request we verify it via
+//! `fiducia-auth`'s `GET /v1/me` (which
 //! already does offline Supabase JWT verification) and require an `admin` or
 //! `operator` role copied from trusted Supabase `app_metadata`.
 
@@ -11,6 +12,28 @@ use std::fmt;
 use std::time::Duration;
 
 use serde::Deserialize;
+
+const fn admin_session_cookie_name(release_hardened: bool) -> &'static str {
+    if release_hardened {
+        "__Host-fiducia_admin_session"
+    } else {
+        "fiducia_admin_session"
+    }
+}
+
+const fn login_csrf_cookie_name(release_hardened: bool) -> &'static str {
+    if release_hardened {
+        "__Host-fiducia_admin_login_csrf"
+    } else {
+        "fiducia_admin_login_csrf"
+    }
+}
+
+/// Release cookies use the browser-enforced `__Host-` prefix, which forbids a
+/// sibling subdomain from planting a colliding Domain cookie. Debug builds keep
+/// unprefixed names so the explicit plain-HTTP development mode remains usable.
+pub(crate) const ADMIN_SESSION_COOKIE: &str = admin_session_cookie_name(!cfg!(debug_assertions));
+pub(crate) const LOGIN_CSRF_COOKIE: &str = login_csrf_cookie_name(!cfg!(debug_assertions));
 
 #[derive(Clone)]
 pub struct Session {
@@ -27,10 +50,6 @@ impl Session {
         &self.credential_binding
     }
 
-    pub fn is_cookie_authenticated(&self) -> bool {
-        self.cookie_authenticated
-    }
-
     pub fn is_browser_session(&self) -> bool {
         self.cookie_authenticated || self.credential_binding.starts_with("development\0")
     }
@@ -42,6 +61,28 @@ impl Session {
             email: Some(format!("{user_id}@example.com")),
             is_admin: true,
             credential_binding: format!("development\0{user_id}"),
+            cookie_authenticated: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_admin_cookie(user_id: &str, token: &str) -> Self {
+        Self {
+            user_id: user_id.to_string(),
+            email: Some(format!("{user_id}@example.com")),
+            is_admin: true,
+            credential_binding: format!("cookie\0{token}"),
+            cookie_authenticated: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_admin_bearer(user_id: &str, token: &str) -> Self {
+        Self {
+            user_id: user_id.to_string(),
+            email: Some(format!("{user_id}@example.com")),
+            is_admin: true,
+            credential_binding: format!("authorization\0{token}"),
             cookie_authenticated: false,
         }
     }
@@ -62,18 +103,24 @@ impl fmt::Debug for Session {
 /// Resolve the session for a request, or `None` if not signed in.
 ///
 /// Tries real auth first — the bearer from the `Authorization` header or the
-/// `fiducia_admin_session` cookie, verified with `fiducia-auth` `GET /v1/me` — and only
+/// canonical admin session cookie, verified with `fiducia-auth` `GET /v1/me` — and only
 /// then falls back to the debug-build-only dev bypass.
 pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
     if let Some(token) = authorization_token(headers) {
-        if let Some(session) = from_token(auth_url, &token, false).await {
-            return Some(session);
-        }
+        // An explicitly selected bearer credential never silently downgrades to
+        // an ambient cookie when verification fails.
+        return from_token(auth_url, &token, false).await;
+    }
+    if headers.contains_key("authorization") {
+        return None;
     }
     if let Some(token) = session_cookie(headers) {
-        if let Some(session) = from_token(auth_url, &token, true).await {
-            return Some(session);
-        }
+        return from_token(auth_url, &token, true).await;
+    }
+    if cookie_name_present(headers, ADMIN_SESSION_COOKIE) {
+        // A malformed or duplicate admin cookie is an explicit, invalid
+        // credential. Do not turn it into the debug bypass below.
+        return None;
     }
     dev_session()
 }
@@ -192,6 +239,7 @@ fn has_operator_role(roles: &[String]) -> bool {
 }
 
 pub(crate) fn cookie_value(headers: &HeaderMap, expected_name: &str) -> Option<String> {
+    let mut found = None;
     for value in headers.get_all("cookie") {
         let Ok(value) = value.to_str() else {
             continue;
@@ -201,25 +249,45 @@ pub(crate) fn cookie_value(headers: &HeaderMap, expected_name: &str) -> Option<S
                 continue;
             };
             if name == expected_name && !cookie_value.trim().is_empty() {
-                return Some(cookie_value.trim().to_string());
+                if found.is_some() {
+                    // Reject ambiguous cookie tossing (for example, a sibling
+                    // subdomain's Domain cookie colliding with our host-only
+                    // admin cookie) instead of trusting browser ordering.
+                    return None;
+                }
+                found = Some(cookie_value.trim().to_string());
             }
         }
     }
-    None
+    found
+}
+
+fn cookie_name_present(headers: &HeaderMap, expected_name: &str) -> bool {
+    headers.get_all("cookie").iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value.split(';').any(|part| {
+                part.trim()
+                    .split_once('=')
+                    .is_some_and(|(name, _)| name == expected_name)
+            })
+        })
+    })
 }
 
 fn session_cookie(headers: &HeaderMap) -> Option<String> {
-    cookie_value(headers, "fiducia_admin_session")
+    cookie_value(headers, ADMIN_SESSION_COOKIE)
 }
 
-/// Pull the bearer token from the `Authorization` header, else fall back to the
-/// `fiducia_admin_session` cookie — so both browser (cookie) and API (header) callers
-/// work, as the module contract promises.
+/// Pull a bearer token from the `Authorization` header. Cookie extraction stays
+/// separate so the resulting session records which credential class succeeded.
 fn authorization_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
+    let mut values = headers.get_all("authorization").iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value
+        .strip_prefix("Bearer ")
         .filter(|jwt| !jwt.is_empty())
         .map(str::to_string)
 }
@@ -245,8 +313,25 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_authorization_headers_are_rejected_as_ambiguous() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "authorization",
+            HeaderValue::from_static("Bearer first.jwt"),
+        );
+        headers.append(
+            "authorization",
+            HeaderValue::from_static("Bearer second.jwt"),
+        );
+        assert_eq!(authorization_token(&headers), None);
+    }
+
+    #[test]
     fn session_cookie_is_separate_from_authorization_header() {
-        let h = headers_with("cookie", "other=1; fiducia_admin_session=xyz; more=2");
+        let h = headers_with(
+            "cookie",
+            &format!("other=1; {ADMIN_SESSION_COOKIE}=xyz; more=2"),
+        );
         assert_eq!(session_cookie(&h).as_deref(), Some("xyz"));
         assert_eq!(authorization_token(&h), None);
     }
@@ -273,7 +358,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "cookie",
-            HeaderValue::from_static("theme=dark; fiducia_admin_session=jwt.123; other=x"),
+            format!("theme=dark; {ADMIN_SESSION_COOKIE}=jwt.123; other=x")
+                .parse()
+                .unwrap(),
         );
 
         assert_eq!(session_cookie(&headers).as_deref(), Some("jwt.123"));
@@ -284,7 +371,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "cookie",
-            HeaderValue::from_static("fiducia_admin_session= ; theme=dark"),
+            format!("{ADMIN_SESSION_COOKIE}= ; theme=dark")
+                .parse()
+                .unwrap(),
         );
 
         assert_eq!(session_cookie(&headers), None);
@@ -302,9 +391,32 @@ mod tests {
         headers.append("cookie", HeaderValue::from_static("theme=dark"));
         headers.append(
             "cookie",
-            HeaderValue::from_static("fiducia_admin_session=jwt.456"),
+            format!("{ADMIN_SESSION_COOKIE}=jwt.456").parse().unwrap(),
         );
 
         assert_eq!(session_cookie(&headers).as_deref(), Some("jwt.456"));
+    }
+
+    #[test]
+    fn duplicate_admin_cookies_are_rejected_as_ambiguous() {
+        let headers = headers_with(
+            "cookie",
+            &format!("{ADMIN_SESSION_COOKIE}=host.jwt; {ADMIN_SESSION_COOKIE}=domain.jwt"),
+        );
+        assert_eq!(session_cookie(&headers), None);
+    }
+
+    #[test]
+    fn release_cookie_names_are_browser_enforced_host_only() {
+        assert_eq!(
+            admin_session_cookie_name(true),
+            "__Host-fiducia_admin_session"
+        );
+        assert_eq!(
+            login_csrf_cookie_name(true),
+            "__Host-fiducia_admin_login_csrf"
+        );
+        assert!(!admin_session_cookie_name(false).starts_with("__Host-"));
+        assert!(!login_csrf_cookie_name(false).starts_with("__Host-"));
     }
 }

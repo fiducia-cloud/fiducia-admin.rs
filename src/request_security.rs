@@ -26,6 +26,8 @@ pub struct RequestSecurity {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestSecurityError {
+    AmbiguousHost,
+    AmbiguousOrigin,
     InvalidCsrfToken,
     MissingHost,
     MissingOrigin,
@@ -37,6 +39,8 @@ pub enum RequestSecurityError {
 impl RequestSecurityError {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::AmbiguousHost => "ambiguous_host",
+            Self::AmbiguousOrigin => "ambiguous_origin",
             Self::InvalidCsrfToken => "invalid_csrf_token",
             Self::MissingHost => "missing_host",
             Self::MissingOrigin => "missing_origin",
@@ -72,14 +76,18 @@ impl RequestSecurity {
         {
             Some(secret) => secret.into_bytes(),
             None if cfg!(debug_assertions) => {
-                tracing::warn!(
-                    "FIDUCIA_ADMIN_CSRF_SECRET unset; using a debug-only CSRF key"
-                );
+                tracing::warn!("FIDUCIA_ADMIN_CSRF_SECRET unset; using a debug-only CSRF key");
                 b"fiducia-admin-debug-only-csrf-key-never-production".to_vec()
             }
             None => return Err(invalid_input("FIDUCIA_ADMIN_CSRF_SECRET must be set")),
         };
-        Self::new(&origin, csrf_secret)
+        let security = Self::new(&origin, csrf_secret)?;
+        if !cfg!(debug_assertions) && !security.expected_origin.starts_with("https://") {
+            return Err(invalid_input(
+                "FIDUCIA_ADMIN_ORIGIN must use https in release builds",
+            ));
+        }
+        Ok(security)
     }
 
     pub fn new(origin: &str, csrf_secret: Vec<u8>) -> Result<Self, io::Error> {
@@ -120,16 +128,16 @@ impl RequestSecurity {
         })
     }
 
-    pub fn expected_origin(&self) -> &str {
-        &self.expected_origin
-    }
-
     /// Require the exact configured request authority.
     pub fn require_host(&self, headers: &HeaderMap) -> Result<(), RequestSecurityError> {
-        let host = headers
-            .get(HOST)
+        let mut hosts = headers.get_all(HOST).iter();
+        let host = hosts
+            .next()
             .and_then(|value| value.to_str().ok())
             .ok_or(RequestSecurityError::MissingHost)?;
+        if hosts.next().is_some() {
+            return Err(RequestSecurityError::AmbiguousHost);
+        }
         if !host.eq_ignore_ascii_case(&self.expected_host) {
             return Err(RequestSecurityError::MismatchedHost);
         }
@@ -140,10 +148,14 @@ impl RequestSecurity {
     /// `same-site` is intentionally rejected: sibling subdomains are not trusted.
     pub fn require_same_origin(&self, headers: &HeaderMap) -> Result<(), RequestSecurityError> {
         self.require_host(headers)?;
-        let origin = headers
-            .get(ORIGIN)
+        let mut origins = headers.get_all(ORIGIN).iter();
+        let origin = origins
+            .next()
             .and_then(|value| value.to_str().ok())
             .ok_or(RequestSecurityError::MissingOrigin)?;
+        if origins.next().is_some() {
+            return Err(RequestSecurityError::AmbiguousOrigin);
+        }
         if origin != self.expected_origin {
             return Err(RequestSecurityError::MismatchedOrigin);
         }
@@ -164,6 +176,13 @@ impl RequestSecurity {
         self.require_host(headers)?;
         if headers.contains_key(ORIGIN) {
             self.require_same_origin(headers)?;
+        } else if headers
+            .get_all(SEC_FETCH_SITE)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|value| value != "same-origin" && value != "none")
+        {
+            return Err(RequestSecurityError::CrossSiteFetch);
         }
         Ok(())
     }
@@ -276,5 +295,49 @@ mod tests {
         )
         .is_err());
         assert!(RequestSecurity::new("https://admin.fiducia.cloud", b"short".to_vec()).is_err());
+    }
+
+    #[test]
+    fn duplicate_security_authorities_are_rejected() {
+        let mut duplicate_origin = browser_headers("https://admin.fiducia.cloud");
+        duplicate_origin.append(
+            ORIGIN,
+            HeaderValue::from_static("https://admin.fiducia.cloud"),
+        );
+        assert_eq!(
+            security().require_same_origin(&duplicate_origin),
+            Err(RequestSecurityError::AmbiguousOrigin)
+        );
+
+        let mut duplicate_host = browser_headers("https://admin.fiducia.cloud");
+        duplicate_host.append(HOST, HeaderValue::from_static("admin.fiducia.cloud"));
+        assert_eq!(
+            security().require_same_origin(&duplicate_host),
+            Err(RequestSecurityError::AmbiguousHost)
+        );
+    }
+
+    #[test]
+    fn ipv6_origins_preserve_brackets_in_the_expected_host() {
+        let security = RequestSecurity::new(
+            "http://[::1]:8096",
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("[::1]:8096"));
+        headers.insert(ORIGIN, HeaderValue::from_static("http://[::1]:8096"));
+        assert_eq!(security.require_same_origin(&headers), Ok(()));
+    }
+
+    #[test]
+    fn bearer_api_rejects_cross_site_fetch_metadata_without_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("admin.fiducia.cloud"));
+        headers.insert(SEC_FETCH_SITE, HeaderValue::from_static("cross-site"));
+        assert_eq!(
+            security().require_api_host(&headers),
+            Err(RequestSecurityError::CrossSiteFetch)
+        );
     }
 }

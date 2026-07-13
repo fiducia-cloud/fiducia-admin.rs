@@ -464,7 +464,7 @@ fn untrusted_observation(target: NodeTarget) -> NodeObservation {
         node_id: target.node_id,
         base_url: target.base_url,
         shards: None,
-        error: Some(UNTRUSTED_ADDRESS.to_string()),
+        error: Some(untrusted_address_class()),
         untrusted: true,
     }
 }

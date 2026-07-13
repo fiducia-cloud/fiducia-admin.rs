@@ -192,6 +192,28 @@ fn required_env(name: &str) -> result::Result<String, io::Error> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{name} must be set")))
 }
 
+/// Optional configuration: unset or blank means "feature off", not an error.
+fn optional_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Comma-separated optional list (`FIDUCIA_NODE_URLS`); blank entries dropped.
+fn csv_env(name: &str) -> Vec<String> {
+    optional_env(name)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok", "service": SERVICE }))
 }

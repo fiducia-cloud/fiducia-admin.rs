@@ -85,18 +85,54 @@ pub struct NodeTarget {
     /// URL's host so explicit targets still label their table rows.
     pub node_id: String,
     pub base_url: String,
+    /// Whether this address is safe to dial with the cluster secret (H1). An
+    /// explicit operator URL is trusted once it parses as http(s); a
+    /// brain-discovered address must additionally be loopback or carry the
+    /// in-cluster suffix. An untrusted target is never dialed — the fan-out turns
+    /// it into an "untrusted address" observation, kept as data like a down node.
+    pub trusted: bool,
+}
+
+/// Trust policy for node targets (H1). Explicit operator URLs are trusted as-is;
+/// brain-discovered addresses must resolve to a loopback host or one ending in
+/// `suffix` before admin attaches the cluster secret and dials them.
+#[derive(Debug, Clone)]
+pub struct NodeHostPolicy {
+    /// In-cluster DNS suffix accepted for brain-discovered hosts.
+    pub suffix: String,
+}
+
+impl NodeHostPolicy {
+    /// Read the policy from `FIDUCIA_NODE_HOST_SUFFIX` (default
+    /// [`DEFAULT_NODE_HOST_SUFFIX`]).
+    pub fn from_env() -> Self {
+        let suffix = std::env::var("FIDUCIA_NODE_HOST_SUFFIX")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_NODE_HOST_SUFFIX.to_string());
+        NodeHostPolicy { suffix }
+    }
+
+    /// Whether a brain-discovered host may be dialed with the cluster secret.
+    fn allows_discovered_host(&self, host: &str) -> bool {
+        host_is_loopback(host) || host_has_suffix(host, &self.suffix)
+    }
 }
 
 /// Targets from the explicit `FIDUCIA_NODE_URLS` override (comma-separated base
 /// URLs). Explicit config wins over brain discovery so an operator can point the
-/// dashboard at nodes the brain has not registered (or a local stack).
-pub fn explicit_node_targets(urls: &[String]) -> Vec<NodeTarget> {
+/// dashboard at nodes the brain has not registered (or a local stack); these are
+/// trusted as-is (H1) once they parse as an http(s) URL with a host.
+pub fn explicit_node_targets(urls: &[String], policy: &NodeHostPolicy) -> Vec<NodeTarget> {
     urls.iter()
         .map(|url| {
             let base_url = normalize_base_url(url);
+            let trusted = base_url_is_trusted(&base_url, true, policy);
             NodeTarget {
                 node_id: host_label(&base_url),
                 base_url,
+                trusted,
             }
         })
         .collect()
@@ -105,8 +141,10 @@ pub fn explicit_node_targets(urls: &[String]) -> Vec<NodeTarget> {
 /// Targets discovered from the brain's `/v1/nodes` membership snapshot: each
 /// `NodeInfo` carries the `address` (`host:port`) the node heartbeats in.
 /// Entries without an address are skipped (a node that never heartbeated an
-/// address has nothing to dial).
-pub fn targets_from_brain_nodes(nodes: &[Value]) -> Vec<NodeTarget> {
+/// address has nothing to dial). Each address is trust-checked against `policy`
+/// (H1): a compromised/spoofed brain cannot make admin ship the cluster secret to
+/// an arbitrary host — an out-of-cluster address becomes an untrusted target.
+pub fn targets_from_brain_nodes(nodes: &[Value], policy: &NodeHostPolicy) -> Vec<NodeTarget> {
     nodes
         .iter()
         .filter_map(|node| {
@@ -119,12 +157,33 @@ pub fn targets_from_brain_nodes(nodes: &[Value]) -> Vec<NodeTarget> {
                 .and_then(Value::as_str)
                 .unwrap_or(address)
                 .to_string();
+            let base_url = normalize_base_url(address);
+            let trusted = base_url_is_trusted(&base_url, false, policy);
             Some(NodeTarget {
                 node_id,
-                base_url: normalize_base_url(address),
+                base_url,
+                trusted,
             })
         })
         .collect()
+}
+
+/// Truncate the fan-out target list to [`MAX_NODES`] (M3) and return the original
+/// count when truncation happened (for the "showing 512 of N" note); `None`
+/// otherwise. Logs a warning so the elision is visible in operations.
+pub fn truncate_targets(targets: &mut Vec<NodeTarget>) -> Option<usize> {
+    let total = targets.len();
+    if total > MAX_NODES {
+        targets.truncate(MAX_NODES);
+        tracing::warn!(
+            total,
+            shown = MAX_NODES,
+            "cluster insight fan-out targets truncated"
+        );
+        Some(total)
+    } else {
+        None
+    }
 }
 
 /// Node addresses arrive as `host:port` from heartbeats or full URLs from env;
@@ -136,6 +195,63 @@ fn normalize_base_url(address: &str) -> String {
     } else {
         format!("http://{address}")
     }
+}
+
+/// Parse a normalized base URL and return its lowercased `(scheme, host)`, or
+/// `None` if it isn't a dialable http(s) URL with a host (H1). Uses reqwest's own
+/// URL parser, so validation sees exactly the host reqwest would dial — no
+/// parser-differential where a `user@host` trick fools the check but not the
+/// client.
+fn scheme_and_host(base_url: &str) -> Option<(String, String)> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let scheme = url.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    // IPv6 literals come back bracketed ("[::1]"); strip for comparison.
+    let host = url
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    Some((scheme, host))
+}
+
+/// Whether `base_url` may be dialed with the cluster secret (H1). Both sources
+/// require an http(s) scheme and a host; brain-discovered addresses additionally
+/// must satisfy the in-cluster host policy.
+fn base_url_is_trusted(base_url: &str, explicit: bool, policy: &NodeHostPolicy) -> bool {
+    let Some((_scheme, host)) = scheme_and_host(base_url) else {
+        return false;
+    };
+    explicit || policy.allows_discovered_host(&host)
+}
+
+/// Case-insensitive, label-boundary suffix match. The leading dot is enforced
+/// even when the configured suffix omits it, so `evilsvc.cluster.local` does not
+/// match a `svc.cluster.local` policy.
+fn host_has_suffix(host: &str, suffix: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let core = suffix
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if core.is_empty() {
+        return false;
+    }
+    host == core || host.ends_with(&format!(".{core}"))
+}
+
+/// Loopback host (the local-stack / in-pod case): `localhost`, or any address in
+/// IPv4 `127.0.0.0/8` or IPv6 `::1`.
+fn host_is_loopback(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|addr| addr.is_loopback())
+        .unwrap_or(false)
 }
 
 /// A short host-derived label for explicitly configured targets

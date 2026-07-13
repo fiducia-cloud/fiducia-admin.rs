@@ -141,6 +141,10 @@ Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-tel
 | `SUPABASE_PUBLISHABLE_KEY` | string | no | Browser-safe Supabase publishable key used by the server-mediated password exchange. | — (required) |
 | `FIDUCIA_ADMIN_ORIGIN` | origin | no | Exact public admin origin used for `Host`/`Origin` enforcement (scheme + authority only); release builds require HTTPS. | debug: `http://127.0.0.1:$PORT`; release: required |
 | `FIDUCIA_ADMIN_CSRF_SECRET` | string | **yes** | HMAC key for credential-bound CSRF tokens; at least 32 bytes. Required in release builds. | debug-only fixed key; release: required |
+| `FIDUCIA_PROMETHEUS_URL` | string | no | Prometheus base URL (e.g. `http://dd-prometheus.observability.svc.cluster.local:9090`) for the Cluster Insight summary probe. Optional. | insight card shows "not configured" |
+| `FIDUCIA_LOKI_URL` | string | no | Loki base URL (e.g. `http://dd-loki.observability.svc.cluster.local:3100`) for the Cluster Insight events panel. Optional. | events panel shows "not configured" |
+| `FIDUCIA_GRAFANA_PUBLIC_URL` | string | no | Public Grafana base URL or path prefix (e.g. `/telemetry`) for Explore deep links. Optional. | no deep-link buttons |
+| `FIDUCIA_NODE_URLS` | string | no | Comma-separated fiducia-node client-plane base URLs; overrides brain `/v1/nodes` discovery for the observe fan-out. Optional. | discover from `fiducia-brain` |
 | `PORT` | integer | no | Listen port. | `8096` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | string | no | OpenTelemetry collector endpoint (optional). | telemetry off |
 | `TEST_DATABASE_URL` | string | **yes** (creds) | Postgres URL for the DB-backed integration test only; unset → that test skips. | — (tests only) |

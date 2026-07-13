@@ -565,6 +565,13 @@ pub fn cluster_status_panel(
 /// the fan-out target set at all.
 fn observe_cell(observation: Option<&NodeObservation>) -> Markup {
     match observation {
+        // Refused before any request: a distinct state from unreachable (H1).
+        Some(observation) if observation.untrusted => html! {
+            span class="tag tag--warn"
+                title="brain-supplied address is not in-cluster; refused (never dialed with the cluster secret)" {
+                "untrusted address"
+            }
+        },
         Some(NodeObservation {
             shards: Some(shards),
             ..

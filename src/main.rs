@@ -1,22 +1,20 @@
-//! fiducia-admin — the server-rendered admin dashboard (MASH: Maud + Axum + SQLx
+//! fiducia-admin — the server-rendered admin dashboard (MASH: Maud + Axum + SeaORM
 //! + HTMX).
 //!
-//! One web app, two role-gated areas:
-//!   * **everyone signed in** — account/org + API keys (data from `fiducia-auth`);
-//!   * **admins** — cluster & infra ops: scale, nodes, shard placement (via
-//!     `fiducia-brain`).
+//! This web app is operator-only: cluster and infrastructure operations live
+//! here, while customer accounts, API keys, preferences, and security sessions
+//! live in the separately deployed customer application.
 //!
 //! Auth is a Supabase session (verified through `fiducia-auth`). This is the
 //! authenticated app — distinct from `fiducia-backend`, which serves the public
 //! marketing site.
 //!
-//! ADMIN plane isolation: when `DATABASE_URL` is set it points at the admin app's
-//! OWN Postgres (operators, infra_operations, admin_audit_log) — a separate
-//! instance from the customer DB. That is a security boundary; this service never
-//! connects to the customer database. With no `DATABASE_URL` the app still renders
-//! fully (the infra audit list is simply empty), so it boots for local dev / E2E
-//! with just the `FIDUCIA_ADMIN_DEV_SESSION` bypass and no DB.
+//! ADMIN plane isolation: `DATABASE_URL` points at the admin app's OWN Postgres
+//! (operators, infra_operations, admin_audit_log) — a separate instance from the
+//! customer DB. That is a security boundary; this service never connects to the
+//! customer database, and startup fails closed when the admin DB is unavailable.
 
+mod entity;
 mod session;
 mod upstream;
 mod views;
@@ -39,13 +37,15 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use fiducia_interfaces_db::admin::InfraOperationsRow;
 use fiducia_sync_core::{ChangeEvent, ChangeOp, WriteAck};
 use maud::Markup;
+use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, DatabaseConnection,
+    DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
 use tokio::sync::broadcast;
 use tower_http::{
     catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
@@ -53,6 +53,8 @@ use tower_http::{
 };
 use uuid::Uuid;
 
+use entity::{infra_operations, operators, sync_idempotency_keys};
+use infra_operations::Model as InfraOperationsRow;
 use session::Session;
 
 const SERVICE: &str = "fiducia-admin";
@@ -75,8 +77,10 @@ const SYNC_JS: &str = include_str!("../assets/fiducia-sync.js");
 struct AppState {
     auth_url: String,
     brain_url: String,
-    /// Admin Postgres pool. `None` is only used by isolated failure-path tests.
-    pool: Option<PgPool>,
+    supabase_url: String,
+    supabase_publishable_key: String,
+    /// Admin-plane SeaORM connection. `None` is only used by failure-path tests.
+    db: Option<DatabaseConnection>,
     /// Fans `fiducia:sync` frames out to `/admin/ws` subscribers.
     stream_tx: broadcast::Sender<String>,
 }
@@ -85,14 +89,16 @@ struct AppState {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
-    let pool = connect_admin_db().await?;
+    let db = connect_admin_db().await?;
     required_env("FIDUCIA_INTERNAL_SECRET")?;
     let (stream_tx, _) = broadcast::channel::<String>(256);
 
     let state = Arc::new(AppState {
         auth_url: required_env("FIDUCIA_AUTH_URL")?,
         brain_url: required_env("FIDUCIA_BRAIN_URL")?,
-        pool: Some(pool),
+        supabase_url: required_env("SUPABASE_URL")?,
+        supabase_publishable_key: required_env("SUPABASE_PUBLISHABLE_KEY")?,
+        db: Some(db),
         stream_tx,
     });
 
@@ -101,14 +107,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/assets/htmx.min.js", get(htmx_js))
         .route("/assets/fiducia-sync.js", get(sync_js))
         .route("/login", get(login).post(login_submit))
+        .route("/logout", post(logout))
         .route("/", get(dashboard))
-        .route("/account", get(account))
-        .route("/keys", get(keys_page).post(create_key))
-        .route("/keys/:key_id/revoke", post(revoke_key))
         .route("/infra", get(infra_page))
         .route("/infra/scale", post(scale))
         // Local-first sync write path (mirrors the customer plane): the sync
-        // client POSTs a queued optimistic write; we persist via SQLx and return
+        // client POSTs a queued optimistic write; we persist via SeaORM and return
         // the committed row version, then broadcast the change to WS subscribers.
         .route("/api/admin/sync/:table", post(sync_write).get(sync_catchup))
         .route("/admin/ws", get(admin_ws))
@@ -133,15 +137,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Connect to the isolated admin Postgres plane; missing/unreachable storage is
 /// fatal because an operator action without its audit trail is not acceptable.
-async fn connect_admin_db() -> Result<PgPool, Box<dyn std::error::Error>> {
+async fn connect_admin_db() -> Result<DatabaseConnection, Box<dyn std::error::Error>> {
     let url = required_env("DATABASE_URL")?;
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&url)
-        .await?;
-    pool.acquire().await?;
+    let mut options = ConnectOptions::new(url);
+    options.max_connections(5);
+    let db = Database::connect(options).await?;
+    db.ping().await?;
     tracing::info!("admin DB connected — infra_operations audit is live");
-    Ok(pool)
+    Ok(db)
 }
 
 fn required_env(name: &str) -> result::Result<String, io::Error> {
@@ -191,10 +194,13 @@ async fn require(headers: &HeaderMap, st: &AppState) -> Result<Session, Response
 /// Require the admin role, else 403.
 async fn require_admin(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {
     let s = require(headers, st).await?;
-    if s.is_admin {
-        Ok(s)
-    } else {
-        Err((StatusCode::FORBIDDEN, views::forbidden(&s)).into_response())
+    if !s.is_admin {
+        return Err((StatusCode::FORBIDDEN, views::forbidden(&s)).into_response());
+    }
+    match operator_is_enabled(st, &s).await {
+        Ok(true) => Ok(s),
+        Ok(false) => Err((StatusCode::FORBIDDEN, views::forbidden(&s)).into_response()),
+        Err(error) => Err(dependency_error("operator_registry_unavailable", error)),
     }
 }
 
@@ -203,77 +209,116 @@ async fn require_admin(headers: &HeaderMap, st: &AppState) -> Result<Session, Re
 /// readable 401/403. Guards the `/api/admin/sync/*` write endpoints.
 async fn require_admin_api(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {
     match require(headers, st).await {
-        Ok(s) if s.is_admin => Ok(s),
+        Ok(s) if s.is_admin => match operator_is_enabled(st, &s).await {
+            Ok(true) => Ok(s),
+            Ok(false) => {
+                Err((StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" }))).into_response())
+            }
+            Err(error) => Err(dependency_error("operator_registry_unavailable", error)),
+        },
         Ok(_) => {
             Err((StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" }))).into_response())
         }
-        Err(_) => Err(
-            (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthenticated" }))).into_response(),
-        ),
+        Err(_) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthenticated" })),
+        )
+            .into_response()),
     }
 }
 
-// Admin API-key management UI. The routes are wired (`/keys`, `/keys/:id/revoke`)
-// and the pieces exist (`upstream::create_key_with_scopes`, `upstream::revoke_key`,
-// `views::create_key_form`), but the operator workflow is still completing these
-// handlers. Until then they FAIL CLOSED behind the admin gate with 501 rather than
-// exposing a half-implemented key-management surface.
-async fn keys_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match require_admin(&headers, &st).await {
-        Ok(_) => {
-            (StatusCode::NOT_IMPLEMENTED, "API-key management is not yet available").into_response()
-        }
-        Err(r) => r,
+async fn enabled_operator(
+    st: &AppState,
+    session: &Session,
+) -> Result<Option<operators::Model>, DbErr> {
+    if cfg!(debug_assertions) && session.user_id == "dev-admin" {
+        return Ok(None);
     }
+    let Ok(subject) = Uuid::parse_str(&session.user_id) else {
+        return Ok(None);
+    };
+    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
+    let operator = operators::Entity::find()
+        .filter(operators::Column::SupabaseUserId.eq(subject))
+        .filter(operators::Column::Disabled.eq(false))
+        .one(db)
+        .await?;
+    Ok(
+        operator
+            .filter(|operator| matches!(operator.role.as_str(), "owner" | "admin" | "operator")),
+    )
 }
 
-async fn create_key(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match require_admin(&headers, &st).await {
-        Ok(_) => {
-            (StatusCode::NOT_IMPLEMENTED, "API-key creation is not yet available").into_response()
-        }
-        Err(r) => r,
+async fn operator_is_enabled(st: &AppState, session: &Session) -> Result<bool, DbErr> {
+    if cfg!(debug_assertions) && session.user_id == "dev-admin" {
+        return Ok(true);
     }
-}
-
-async fn revoke_key(
-    State(st): State<Arc<AppState>>,
-    Path(_key_id): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    match require_admin(&headers, &st).await {
-        Ok(_) => {
-            (StatusCode::NOT_IMPLEMENTED, "API-key revocation is not yet available").into_response()
-        }
-        Err(r) => r,
-    }
+    Ok(enabled_operator(st, session).await?.is_some())
 }
 
 async fn login() -> Markup {
-    views::login()
+    views::login(None)
 }
 
 #[derive(Debug, Deserialize)]
 struct LoginForm {
-    token: String,
+    email: String,
+    password: String,
 }
 
-async fn login_submit(Form(form): Form<LoginForm>) -> Response {
-    let token = form.token.trim();
-    if token.is_empty() {
-        return redirect("/login");
+#[derive(Debug, Deserialize)]
+struct SupabasePasswordSession {
+    access_token: String,
+}
+
+async fn login_submit(State(st): State<Arc<AppState>>, Form(form): Form<LoginForm>) -> Response {
+    let email = form.email.trim();
+    if email.is_empty() || form.password.is_empty() {
+        return views::login(Some("Email and password are required.")).into_response();
     }
-    // Security: the session cookie is HttpOnly + SameSite=Strict + Secure. `Secure`
-    // means the cookie is only sent over HTTPS; gate it off with
-    // FIDUCIA_INSECURE_COOKIES=1 for a plain-http local escape hatch. (Local dev
-    // click-through uses the FIDUCIA_ADMIN_DEV_SESSION env bypass, not this cookie,
-    // so the default-Secure cookie doesn't hinder local use.)
-    let secure = if std::env::var("FIDUCIA_INSECURE_COOKIES").as_deref() == Ok("1") {
-        ""
-    } else {
-        "; Secure"
+
+    let token_url = format!(
+        "{}/auth/v1/token?grant_type=password",
+        st.supabase_url.trim_end_matches('/')
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return upstream_error("supabase_login_failed", "supabase", error),
     };
-    let cookie = format!("fiducia_session={token}; Path=/; HttpOnly; SameSite=Strict{secure}");
+    let response = match client
+        .post(token_url)
+        .header("apikey", &st.supabase_publishable_key)
+        .json(&json!({ "email": email, "password": form.password }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return upstream_error("supabase_login_failed", "supabase", error),
+    };
+    if !response.status().is_success() {
+        return views::login(Some("Supabase rejected those credentials.")).into_response();
+    }
+    let password_session = match response.json::<SupabasePasswordSession>().await {
+        Ok(session) => session,
+        Err(error) => return upstream_error("supabase_login_failed", "supabase", error),
+    };
+    let Some(session) = session::from_bearer(&st.auth_url, &password_session.access_token).await
+    else {
+        return views::login(Some("The identity could not be verified.")).into_response();
+    };
+    if !session.is_admin {
+        return (StatusCode::FORBIDDEN, views::forbidden(&session)).into_response();
+    }
+    match operator_is_enabled(&st, &session).await {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::FORBIDDEN, views::forbidden(&session)).into_response(),
+        Err(error) => return dependency_error("operator_registry_unavailable", error),
+    }
+
+    let cookie = make_session_cookie(&password_session.access_token);
     (
         StatusCode::SEE_OTHER,
         [(LOCATION, "/".to_string()), (SET_COOKIE, cookie)],
@@ -281,16 +326,33 @@ async fn login_submit(Form(form): Form<LoginForm>) -> Response {
         .into_response()
 }
 
-async fn dashboard(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match require(&headers, &st).await {
-        Ok(s) => views::dashboard(&s).into_response(),
-        Err(r) => r,
-    }
+fn make_session_cookie(token: &str) -> String {
+    let secure = if std::env::var("FIDUCIA_INSECURE_COOKIES").as_deref() == Ok("1") {
+        ""
+    } else {
+        "; Secure"
+    };
+    format!("fiducia_admin_session={token}; Path=/; HttpOnly; SameSite=Strict{secure}")
 }
 
-async fn account(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match require(&headers, &st).await {
-        Ok(s) => views::account(&s).into_response(),
+async fn logout() -> Response {
+    let secure = if std::env::var("FIDUCIA_INSECURE_COOKIES").as_deref() == Ok("1") {
+        ""
+    } else {
+        "; Secure"
+    };
+    let cookie =
+        format!("fiducia_admin_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}");
+    (
+        StatusCode::SEE_OTHER,
+        [(LOCATION, "/login".to_string()), (SET_COOKIE, cookie)],
+    )
+        .into_response()
+}
+
+async fn dashboard(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match require_admin(&headers, &st).await {
+        Ok(s) => views::dashboard(&s).into_response(),
         Err(r) => r,
     }
 }
@@ -367,13 +429,13 @@ async fn scale(
 // ---- Admin DB vertical (P2): infra_operations audit + sync broadcast ---------
 
 /// Recent control-plane operations, newest first, as display JSON.
-async fn recent_ops(st: &AppState) -> Result<Vec<Value>, sqlx::Error> {
-    let pool = st.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
-    let rows = sqlx::query_as::<_, InfraOperationsRow>(
-        "select * from infra_operations order by created_at desc limit 10",
-    )
-    .fetch_all(pool)
-    .await?;
+async fn recent_ops(st: &AppState) -> Result<Vec<Value>, DbErr> {
+    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
+    let rows = infra_operations::Entity::find()
+        .order_by_desc(infra_operations::Column::CreatedAt)
+        .limit(10)
+        .all(db)
+        .await?;
     Ok(rows
         .iter()
         .filter_map(|row| serde_json::to_value(row).ok())
@@ -381,31 +443,24 @@ async fn recent_ops(st: &AppState) -> Result<Vec<Value>, sqlx::Error> {
 }
 
 /// Insert a `scale` row into infra_operations (status `requested`, operator
-/// resolved from the session email if a matching operator exists) and broadcast
+/// resolved from the verified Supabase subject) and broadcast
 /// it as a `fiducia:sync` change.
 async fn record_scale(
     st: &AppState,
     s: &Session,
     target_nodes: u32,
-) -> Result<InfraOperationsRow, sqlx::Error> {
-    let pool = st.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
-    let operator_id: Option<Uuid> = match &s.email {
-        Some(email) => {
-            sqlx::query_scalar::<_, Uuid>("select id from operators where lower(email) = lower($1)")
-                .bind(email)
-                .fetch_optional(pool)
-                .await?
-        }
-        None => None,
-    };
-    let row = sqlx::query_as::<_, InfraOperationsRow>(
-        "insert into infra_operations (operator_id, action, target_nodes, status, params) \
-         values ($1, 'scale', $2, 'requested', $3) returning *",
-    )
-    .bind(operator_id)
-    .bind(target_nodes as i32)
-    .bind(json!({ "target_nodes": target_nodes, "replication_factor": 3 }))
-    .fetch_one(pool)
+) -> Result<InfraOperationsRow, DbErr> {
+    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
+    let operator_id = enabled_operator(st, s).await?.map(|operator| operator.id);
+    let row = infra_operations::ActiveModel {
+        operator_id: Set(operator_id),
+        action: Set("scale".to_string()),
+        target_nodes: Set(Some(target_nodes as i32)),
+        status: Set("requested".to_string()),
+        params: Set(json!({ "target_nodes": target_nodes, "replication_factor": 3 })),
+        ..Default::default()
+    }
+    .insert(db)
     .await?;
     broadcast_infra_change(st, &row);
     Ok(row)
@@ -499,39 +554,44 @@ enum Idem {
 }
 
 /// Begin idempotent handling in the durable admin ledger.
-async fn idempotency_begin(st: &AppState, key: &str) -> Result<Idem, sqlx::Error> {
-    let pool = st.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
-    let claimed = sqlx::query_scalar::<_, i32>(
-        "insert into sync_idempotency_keys (key) values ($1) \
-         on conflict (key) do nothing returning 1",
+async fn idempotency_begin(st: &AppState, key: &str) -> Result<Idem, DbErr> {
+    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
+    let claimed = sync_idempotency_keys::Entity::insert(sync_idempotency_keys::ActiveModel {
+        key: Set(key.to_string()),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::column(sync_idempotency_keys::Column::Key)
+            .do_nothing()
+            .to_owned(),
     )
-    .bind(key)
-    .fetch_optional(pool)
+    .exec_without_returning(db)
     .await?;
-    if claimed.is_some() {
+    if claimed > 0 {
         return Ok(Idem::Proceed);
     }
     Ok(
-        match sqlx::query_scalar::<_, Option<i64>>(
-            "select committed_version from sync_idempotency_keys where key = $1",
-        )
-        .bind(key)
-        .fetch_optional(pool)
-        .await?
+        match sync_idempotency_keys::Entity::find_by_id(key)
+            .one(db)
+            .await?
+            .and_then(|record| record.committed_version)
         {
-            Some(Some(version)) => Idem::Replay(version),
-            _ => Idem::InFlight,
+            Some(version) => Idem::Replay(version),
+            None => Idem::InFlight,
         },
     )
 }
 
 /// Record the committed version for `key` in the durable admin ledger.
-async fn idempotency_commit(st: &AppState, key: &str, version: i64) -> Result<(), sqlx::Error> {
-    let pool = st.pool.as_ref().ok_or(sqlx::Error::PoolClosed)?;
-    sqlx::query("update sync_idempotency_keys set committed_version = $2 where key = $1")
-        .bind(key)
-        .bind(version)
-        .execute(pool)
+async fn idempotency_commit(st: &AppState, key: &str, version: i64) -> Result<(), DbErr> {
+    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
+    sync_idempotency_keys::Entity::update_many()
+        .col_expr(
+            sync_idempotency_keys::Column::CommittedVersion,
+            Expr::value(version),
+        )
+        .filter(sync_idempotency_keys::Column::Key.eq(key))
+        .exec(db)
         .await?;
     Ok(())
 }
@@ -556,16 +616,10 @@ async fn sync_catchup(
     }
     let rows: Vec<serde_json::Value> = match table.as_str() {
         "infra_operations" => {
-            let Some(pool) = &st.pool else {
-                return dependency_error("database_unavailable", sqlx::Error::PoolClosed);
+            let Some(db) = &st.db else {
+                return dependency_error("database_unavailable", database_unavailable());
             };
-            match sqlx::query_as::<_, InfraOperationsRow>(
-                "select * from infra_operations where version > $1 order by version asc limit 500",
-            )
-            .bind(params.since)
-            .fetch_all(pool)
-            .await
-            {
+            match catchup_infra_operations(db, params.since).await {
                 Ok(rows) => rows
                     .iter()
                     .map(|r| serde_json::to_value(r).unwrap_or_default())
@@ -596,7 +650,7 @@ fn ack(id: &str, committed_version: i64) -> Response {
 enum SyncWriteError {
     InvalidId,
     NotFound,
-    Database(sqlx::Error),
+    Database(DbErr),
 }
 
 /// Persist one queued optimistic write to `infra_operations`, broadcasting the
@@ -605,54 +659,79 @@ async fn sync_write_infra_operations_row(
     st: &AppState,
     req: &SyncWriteRequest,
 ) -> Result<i64, SyncWriteError> {
-    let pool = st
-        .pool
+    let db = st
+        .db
         .as_ref()
-        .ok_or(SyncWriteError::Database(sqlx::Error::PoolClosed))?;
+        .ok_or_else(|| SyncWriteError::Database(database_unavailable()))?;
     let id = Uuid::parse_str(&req.id).map_err(|_| SyncWriteError::InvalidId)?;
     let op = req.op.as_deref().unwrap_or("upsert");
 
-    let committed = if op == "delete" {
+    let current = infra_operations::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .map_err(SyncWriteError::Database)?
+        .ok_or(SyncWriteError::NotFound)?;
+    let unchanged_status = current.status.clone();
+    let mut active: infra_operations::ActiveModel = current.into();
+
+    if op == "delete" {
         // A control-plane op is an audit record, not a droppable row: a "delete"
         // marks it failed. Version still bumps via the trigger.
-        sqlx::query_as::<_, InfraOperationsRow>(
-            "update infra_operations set status = 'failed' where id = $1 returning *",
-        )
-        .bind(id)
-        .fetch_optional(pool)
-        .await
+        active.status = Set("failed".to_string());
     } else {
         let payload = req.payload.clone().unwrap_or_else(|| json!({}));
-        let status = payload.get("status").and_then(Value::as_str);
+        let status = payload
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let target_nodes = payload
             .get("target_nodes")
             .and_then(Value::as_i64)
             .map(|v| v as i32);
-        let error = payload.get("error").and_then(Value::as_str);
-        // COALESCE keeps existing values for any field the client omitted.
-        sqlx::query_as::<_, InfraOperationsRow>(
-            "update infra_operations set \
-                status = coalesce($2, status), \
-                target_nodes = coalesce($3, target_nodes), \
-                error = coalesce($4, error) \
-             where id = $1 returning *",
-        )
-        .bind(id)
-        .bind(status)
-        .bind(target_nodes)
-        .bind(error)
-        .fetch_optional(pool)
-        .await
-    };
-
-    match committed {
-        Ok(Some(row)) => {
-            broadcast_infra_change(st, &row);
-            Ok(row.version)
+        let error = payload
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut changed = false;
+        if let Some(status) = status {
+            active.status = Set(status);
+            changed = true;
         }
-        Ok(None) => Err(SyncWriteError::NotFound),
-        Err(err) => Err(SyncWriteError::Database(err)),
+        if let Some(target_nodes) = target_nodes {
+            active.target_nodes = Set(Some(target_nodes));
+            changed = true;
+        }
+        if let Some(error) = error {
+            active.error = Set(Some(error));
+            changed = true;
+        }
+        // Preserve the sync contract: even an empty patch is a committed write
+        // whose trigger advances the row version.
+        if !changed {
+            active.status = Set(unchanged_status);
+        }
     }
+
+    let row = active.update(db).await.map_err(SyncWriteError::Database)?;
+    broadcast_infra_change(st, &row);
+    Ok(row.version)
+}
+
+/// Load one bounded, monotonic catch-up page through the ORM.
+async fn catchup_infra_operations(
+    db: &DatabaseConnection,
+    since: i64,
+) -> Result<Vec<InfraOperationsRow>, DbErr> {
+    infra_operations::Entity::find()
+        .filter(infra_operations::Column::Version.gt(since))
+        .order_by_asc(infra_operations::Column::Version)
+        .limit(500)
+        .all(db)
+        .await
+}
+
+fn database_unavailable() -> DbErr {
+    DbErr::Custom("admin database connection unavailable".to_string())
 }
 
 fn dependency_error(code: &str, error: impl std::fmt::Display) -> Response {
@@ -747,7 +826,7 @@ mod sync_tests {
             brain_url: "http://localhost:8095".into(),
             supabase_url: "https://example.supabase.co".into(),
             supabase_publishable_key: "test-publishable-key".into(),
-            pool: None,
+            db: None,
             stream_tx: broadcast::channel(16).0,
         })
     }
@@ -818,6 +897,92 @@ mod sync_tests {
 }
 
 #[cfg(test)]
+mod auth_flow_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn spawn_mock(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn login_requires_the_operator_registry_after_trusted_auth() {
+        let supabase = Router::new().route(
+            "/auth/v1/token",
+            post(|| async { Json(json!({ "access_token": "verified.jwt" })) }),
+        );
+        let auth = Router::new().route(
+            "/v1/me",
+            get(|| async {
+                Json(json!({
+                    "user": {
+                        "user_id": "00000000-0000-0000-0000-000000000001",
+                        "email": "operator@example.com",
+                        "orgs": ["org_admin"],
+                        "roles": ["operator"]
+                    }
+                }))
+            }),
+        );
+        let (supabase_url, supabase_task) = spawn_mock(supabase).await;
+        let (auth_url, auth_task) = spawn_mock(auth).await;
+
+        let state = Arc::new(AppState {
+            auth_url,
+            brain_url: "http://localhost:8095".into(),
+            supabase_url,
+            supabase_publishable_key: "public-publishable-key".into(),
+            db: None,
+            stream_tx: broadcast::channel(4).0,
+        });
+        let app = Router::new()
+            .route("/login", post(login_submit))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "email=operator%40example.com&password=correct-horse",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        supabase_task.abort();
+        auth_task.abort();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn logout_expires_only_the_admin_cookie() {
+        let response = logout().await;
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(cookie.starts_with("fiducia_admin_session="));
+        assert!(cookie.contains("Max-Age=0"));
+        assert!(!cookie.contains("fiducia_session="));
+    }
+}
+
+#[cfg(test)]
 mod interface_contract_tests {
     use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
 
@@ -844,25 +1009,23 @@ mod interface_contract_tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use sqlx::postgres::PgPoolOptions;
+    use sea_orm::ConnectionTrait;
 
     const SCHEMA: &str = include_str!("../../fiducia-interfaces/sql/admin.sql");
 
-    fn state_with(pool: PgPool) -> AppState {
+    fn state_with(db: DatabaseConnection) -> AppState {
         AppState {
             auth_url: "x".into(),
             brain_url: "x".into(),
             supabase_url: "https://example.supabase.co".into(),
             supabase_publishable_key: "test-publishable-key".into(),
-            pool: Some(pool),
+            db: Some(db),
             stream_tx: broadcast::channel(4).0,
         }
     }
 
-    // One test, one pool, one runtime: `#[tokio::test]` gives each test its own
-    // runtime, and an sqlx pool is bound to the runtime that created it — so a
-    // pool shared across tests dies with the first test's runtime. Keeping the
-    // whole sync-durability check in a single test sidesteps that entirely.
+    // One test, one connection, one runtime: SeaORM's async connection pool is
+    // runtime-bound, so the whole durability check deliberately shares one test.
     #[tokio::test]
     async fn sync_durability_against_real_postgres() {
         let Some(url) = std::env::var("TEST_DATABASE_URL")
@@ -872,16 +1035,17 @@ mod db_tests {
             eprintln!("skip sync_durability_against_real_postgres: TEST_DATABASE_URL unset");
             return;
         };
-        let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .connect(&url)
+        let mut options = ConnectOptions::new(url);
+        options.max_connections(4);
+        let db = Database::connect(options)
             .await
             .expect("connect TEST_DATABASE_URL");
-        sqlx::raw_sql(SCHEMA)
-            .execute(&pool)
+        // Raw SQL is confined to applying the canonical gated-test schema; all
+        // application and behavioral-test CRUD below goes through SeaORM.
+        db.execute_unprepared(SCHEMA)
             .await
             .expect("apply admin.sql");
-        let st = state_with(pool.clone());
+        let st = state_with(db.clone());
 
         // --- Durable idempotency: claim -> in-flight -> record -> replay ---------
         let key = format!("infra_operations:{}:upsert:7", Uuid::new_v4().simple());
@@ -899,40 +1063,35 @@ mod db_tests {
             "replays committed"
         );
         // Survives a "restart": a fresh AppState (empty in-process cache) still replays.
-        let fresh = state_with(pool.clone());
+        let fresh = state_with(db.clone());
         assert!(
             matches!(idempotency_begin(&fresh, &key).await, Ok(Idem::Replay(8))),
             "durable across restart"
         );
 
         // --- Indexed catch-up: rows newer than the cursor, ordered by version ----
-        let a: Uuid = sqlx::query_scalar(
-            "insert into infra_operations (action) values ('scale') returning id",
-        )
-        .fetch_one(&pool)
+        let a = infra_operations::ActiveModel {
+            action: Set("scale".to_string()),
+            ..Default::default()
+        }
+        .insert(&db)
         .await
         .unwrap();
-        let _b: Uuid = sqlx::query_scalar(
-            "insert into infra_operations (action) values ('drain') returning id",
-        )
-        .fetch_one(&pool)
+        infra_operations::ActiveModel {
+            action: Set("drain".to_string()),
+            ..Default::default()
+        }
+        .insert(&db)
         .await
         .unwrap();
-        sqlx::query("update infra_operations set status = 'applied' where id = $1")
-            .bind(a)
-            .execute(&pool)
-            .await
-            .unwrap(); // bump `a` to version 2
+        let a_id = a.id;
+        let mut active: infra_operations::ActiveModel = a.into();
+        active.status = Set("applied".to_string());
+        active.update(&db).await.unwrap(); // bump `a` to version 2
 
-        let newer: Vec<InfraOperationsRow> = sqlx::query_as(
-            "select * from infra_operations where version > $1 order by version asc limit 500",
-        )
-        .bind(1_i64)
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let newer = catchup_infra_operations(&db, 1).await.unwrap();
         assert!(
-            newer.iter().any(|r| r.id == a && r.version > 1),
+            newer.iter().any(|r| r.id == a_id && r.version > 1),
             "bumped row present"
         );
         assert!(

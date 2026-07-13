@@ -22,31 +22,24 @@ pub struct Session {
 ///
 /// Tries real auth first — the bearer from the `Authorization` header or the
 /// `fiducia_admin_session` cookie, verified with `fiducia-auth` `GET /v1/me` — and only
-/// then falls back to the dev bypass.
-///
-/// A dev bypass (`FIDUCIA_ADMIN_DEV_SESSION=user|admin`) lets you click through
-/// the UI before auth is wired. It is a **full authentication bypass** — anyone
-/// reaching the service becomes that user — so it is honored **only** in debug
-/// builds, or when explicitly forced with `FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1`.
-/// Release builds otherwise refuse it and log loudly, so a stray env var in
-/// production can't silently hand out admin.
+/// then falls back to the debug-build-only dev bypass.
 pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
     if let Some(token) = bearer_token(headers) {
         if let Some(session) = from_bearer(auth_url, &token).await {
             return Some(session);
         }
     }
+    dev_session()
+}
+
+/// Debug builds only: `FIDUCIA_ADMIN_DEV_SESSION=user|admin` fabricates a session
+/// so the UI can be clicked through before auth is wired. It is a **full
+/// authentication bypass** — anyone reaching the service becomes that user — so
+/// the entire code path is compiled out of release binaries; no environment
+/// variable can resurrect it in production.
+#[cfg(debug_assertions)]
+fn dev_session() -> Option<Session> {
     let role = std::env::var("FIDUCIA_ADMIN_DEV_SESSION").ok()?;
-
-    if !dev_session_allowed() {
-        tracing::error!(
-            "FIDUCIA_ADMIN_DEV_SESSION is set but IGNORED: the dev auth bypass is \
-             disabled in release builds. Set FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1 \
-             to force it (NEVER in production)."
-        );
-        return None;
-    }
-
     tracing::warn!(
         role = %role,
         "INSECURE: serving a fabricated dev session (auth bypass) — for local dev only"
@@ -64,6 +57,19 @@ pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
         }),
         _ => None,
     }
+}
+
+/// Release builds: the dev bypass does not exist. A stray env var is reported
+/// loudly and ignored — it can never mint a session.
+#[cfg(not(debug_assertions))]
+fn dev_session() -> Option<Session> {
+    if std::env::var_os("FIDUCIA_ADMIN_DEV_SESSION").is_some() {
+        tracing::error!(
+            "FIDUCIA_ADMIN_DEV_SESSION is set but IGNORED: the dev auth bypass is \
+             compiled out of release builds and cannot be enabled in production."
+        );
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +108,9 @@ async fn current_from_auth(auth_url: &str, token: &str) -> Result<Session, reqwe
         .json::<MeResponse>()
         .await?
         .user;
+    // fiducia-auth derives these roles exclusively from trusted Supabase
+    // app_metadata. Neither email addresses nor caller-editable metadata are an
+    // authorization source for the operator plane.
     let is_admin = has_operator_role(&user.roles);
 
     Ok(Session {
@@ -135,7 +144,7 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Pull the bearer token from the `Authorization` header, else fall back to the
-/// `fiducia_session` cookie — so both browser (cookie) and API (header) callers
+/// `fiducia_admin_session` cookie — so both browser (cookie) and API (header) callers
 /// work, as the module contract promises.
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     if let Some(jwt) = headers
@@ -218,6 +227,12 @@ mod tests {
             HeaderValue::from_static("fiducia_admin_session= ; theme=dark"),
         );
 
+        assert_eq!(session_cookie(&headers), None);
+    }
+
+    #[test]
+    fn session_cookie_ignores_customer_session_cookie() {
+        let headers = headers_with("cookie", "fiducia_session=customer.jwt");
         assert_eq!(session_cookie(&headers), None);
     }
 

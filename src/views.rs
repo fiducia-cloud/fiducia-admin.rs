@@ -61,7 +61,7 @@ pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
             body {
                 nav class="nav" {
                     span class="brand" { "Fiducia" b { ".admin" } }
-                    @if let Some(s) = session {
+                    @if session.is_some() {
                         a href="/" { "Dashboard" }
                         a href="/infra" { "Infra" }
                     } @else {
@@ -274,6 +274,16 @@ mod tests {
         assert!(html.contains("Dashboard"));
         assert!(html.contains("Welcome"));
         assert!(html.contains(r#"href="/infra""#));
+    }
+
+    #[test]
+    fn login_collects_credentials_without_exposing_token_paste() {
+        let html = login(Some("Invalid email or password.")).into_string();
+        assert!(html.contains(r#"name="email""#));
+        assert!(html.contains(r#"name="password""#));
+        assert!(html.contains("Invalid email or password."));
+        assert!(!html.contains(r#"name="token""#));
+        assert!(!html.contains("access token"));
     }
 
     #[test]

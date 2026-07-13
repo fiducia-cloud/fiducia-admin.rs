@@ -4,12 +4,14 @@
 # that affects this service). Each is documented in the README "Security" section.
 [advisories]
 ignore = [
-    # rsa 0.9.x — Marvin timing side-channel on RSA private-key ops. No fixed
-    # upgrade is published upstream. Pulled in only via a feature-gated transitive
-    # of sqlx (this service uses Postgres, which does not perform RSA key ops on
-    # the hot path). Re-evaluate when a patched rsa release lands.
+    # rsa 0.9.x — Marvin timing side-channel on RSA private-key ops. It is
+    # resolved only through the inactive MySQL side of SeaORM's transitive SQLx
+    # dependency graph; this service enables PostgreSQL only, so it is not built.
     "RUSTSEC-2023-0071",
     # proc-macro-error 1.0.4 — unmaintained. Build-time only (via maud_macros),
     # never linked into the running binary. No runtime exposure.
     "RUSTSEC-2024-0370",
+    # proc-macro-error2 2.0.1 — unmaintained. Build-time only (via SeaORM's
+    # derive-macro stack), never linked into the running binary.
+    "RUSTSEC-2026-0173",
 ]

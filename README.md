@@ -1,15 +1,18 @@
 # fiducia-admin
 
 The server-rendered, operator-only **admin dashboard** for
-[fiducia.cloud](https://fiducia.cloud). It is a separate Rust + Axum deployment
-with its own host-only session cookie, admin routes, database, realtime channel,
-and browser storage. Customer account and API-key workflows live exclusively in
-`fiducia-customer-ui.web` plus the customer BFF.
+[fiducia.cloud](https://fiducia.cloud). It is a separate Rust deployment built
+with Maud, Axum, SeaORM, and HTMX. It has its own host-only session cookie,
+admin routes, database, realtime channel, and browser storage. Customer account
+and API-key workflows live exclusively in `fiducia-customer-ui.web` plus the
+customer BFF.
 
 ## Operator boundary
 
-Every non-public route requires a verified `admin` or `operator` role from
-Supabase `app_metadata`, returned by `fiducia-auth /v1/me`. Email addresses and
+Every non-public route requires both a verified `admin` or `operator` role from
+Supabase `app_metadata` (returned by `fiducia-auth /v1/me`) and a matching,
+enabled operator record in the isolated admin database. The registry lookup uses
+the immutable Supabase user id, never an email allowlist. Email addresses and
 ordinary Supabase `authenticated` membership never grant admin access.
 
 The sign-in form exchanges operator credentials directly with Supabase Auth,
@@ -20,7 +23,7 @@ before issuing `fiducia_admin_session` as `HttpOnly; SameSite=Strict; Secure`.
 
 | Route | Purpose |
 |-------|---------|
-| `GET /login` | sign-in page (Supabase) |
+| `GET/POST /login` | server-mediated Supabase sign-in |
 | `POST /logout` | clear the admin-only session cookie |
 | `GET /` | operator dashboard |
 | `GET /infra` · `POST /infra/scale` | cluster operations |
@@ -33,6 +36,7 @@ before issuing `fiducia_admin_session` as `HttpOnly; SameSite=Strict; Secure`.
 | File | Responsibility |
 |------|----------------|
 | `src/main.rs` | routes + role gating (`require` / `require_admin`) |
+| `src/entity/` | SeaORM models for the isolated admin Postgres schema |
 | `src/views.rs` | server-rendered HTML templates |
 | `src/session.rs` | Supabase session + trusted-role resolution through `fiducia-auth` |
 | `src/upstream.rs` | operator-only HTTP calls to `fiducia-brain` |
@@ -57,7 +61,7 @@ Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-tel
 | Var | Type | Secret? | Meaning | Secure default (unset) |
 |-----|------|---------|---------|------------------------|
 | `DATABASE_URL` | string | **yes** (creds) | Admin-plane Postgres (its OWN DB — a security boundary, never the customer DB). Required at startup. | — (required) |
-| `FIDUCIA_AUTH_URL` | string | no | Base URL of `fiducia-auth` (session verification, keys). Required. | — (required) |
+| `FIDUCIA_AUTH_URL` | string | no | Base URL of `fiducia-auth` for session verification. Required. | — (required) |
 | `FIDUCIA_BRAIN_URL` | string | no | Base URL of `fiducia-brain` (infra ops). Required. | — (required) |
 | `FIDUCIA_INTERNAL_SECRET` | string | **yes** (secret) | Cluster trusted-hop secret sent to the brain. Required; never logged. | — (required) |
 | `SUPABASE_URL` | string | no | Supabase project URL used for operator sign-in. | — (required) |
@@ -87,7 +91,7 @@ pinned [`flags-2-env`](https://github.com/ORESoftware/flags-2-env) submodule
 (`vendor/flags-2-env`) and the `.cli-flags.toml` schema, then execs the command:
 
 ```bash
-scripts/with-flags2env.sh --port 8096 --admin-emails you@acme.com -- cargo run
+scripts/with-flags2env.sh --port 8096 -- cargo run
 ```
 
 The schema is audited in CI (`.github/workflows/cli-flags.yml`). Build the pinned
@@ -97,18 +101,20 @@ parser once with `make -C vendor/flags-2-env all`.
 
 Hardening in place (verified this audit):
 
-- **Secure-by-default flags.** All four insecure-mode toggles above default to
+- **Secure-by-default flags.** All three insecure-mode toggles above default to
   the safe value and cannot silently activate in production (see the callout).
 - **Transport / session.** The host-specific `fiducia_admin_session` cookie is
   `HttpOnly; SameSite=Strict; Secure` by default. Admin authorization comes only
   from the `fiducia-auth`-verified `admin` or `operator` role copied from trusted
-  Supabase `app_metadata`.
+  Supabase `app_metadata`, plus the enabled subject-keyed operator registry.
 - **Complete route gate.** Dashboard, infra, sync catch-up/write, and WebSocket
   handshake paths all enforce the operator role. Customer account/API-key routes
   are not compiled into this service.
 - **Templating.** All HTML is rendered with Maud, which HTML-escapes every
   dynamic interpolation by construction (stored-XSS defense, covered by tests).
-- **SQL.** Every query is parameterized (`$1…`) — no string-built SQL.
+- **Persistence.** SeaORM owns the Postgres connection and all application CRUD
+  through typed admin-plane entities. Raw SQL is limited to applying the
+  canonical schema in the opt-in real-Postgres integration test.
 - **Request stack.** Body cap (64 KiB), 30 s request timeout, and a panic-catch
   layer are applied to every route; the isolated admin Postgres plane is never
   the customer DB.
@@ -116,11 +122,13 @@ Hardening in place (verified this audit):
 Accepted advisories (no clean in-semver fix; recorded in `.cargo/audit.toml`
 with rationale, `cargo audit` runs clean):
 
-- **`rsa` RUSTSEC-2023-0071** (Marvin timing side-channel) — transitive via a
-  feature-gated `sqlx` path; no patched release exists upstream. Re-evaluate
-  when one lands.
+- **`rsa` RUSTSEC-2023-0071** (Marvin timing side-channel) — present only in the
+  inactive MySQL side of SeaORM's transitive SQLx dependency graph; this service
+  enables only PostgreSQL, so the RSA code is not compiled.
 - **`proc-macro-error` RUSTSEC-2024-0370** (unmaintained) — build-time only (via
   `maud_macros`), never linked into the running binary.
+- **`proc-macro-error2` RUSTSEC-2026-0173** (unmaintained) — build-time only (via
+  SeaORM's derive macros), never linked into the running binary.
 
 ## Related
 

@@ -178,6 +178,7 @@ Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-tel
 | `FIDUCIA_LOKI_URL` | string | no | Loki base URL (e.g. `http://dd-loki.observability.svc.cluster.local:3100`) for the Cluster Insight events panel. Optional. | events panel shows "not configured" |
 | `FIDUCIA_GRAFANA_PUBLIC_URL` | string | no | Public Grafana base URL or path prefix (e.g. `/telemetry`) for Explore deep links. Optional. | no deep-link buttons |
 | `FIDUCIA_NODE_URLS` | string | no | Comma-separated fiducia-node client-plane base URLs; overrides brain `/v1/nodes` discovery for the observe fan-out. Optional. | discover from `fiducia-brain` |
+| `FIDUCIA_NODE_HOST_SUFFIX` | string | no | In-cluster DNS suffix a brain-discovered node address must carry (or be loopback) before the fan-out dials it with the cluster secret (SSRF allowlist). Explicit `FIDUCIA_NODE_URLS` bypass it. | `.svc.cluster.local` |
 | `PORT` | integer | no | Listen port. | `8096` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | string | no | OpenTelemetry collector endpoint (optional). | telemetry off |
 | `TEST_DATABASE_URL` | string | **yes** (creds) | Postgres URL for the DB-backed integration test only; unset → that test skips. | — (tests only) |

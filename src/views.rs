@@ -798,15 +798,19 @@ mod tests {
             shard_id: 0,
             reported_by: "node-a".into(),
             leader_view: true,
+            dual_leader: false,
             view,
         }];
         let quorum = ClusterQuorum {
             leaderless: vec![],
+            leader_unreached: vec![],
+            dual_leader: vec![],
             at_risk: vec![0],
             storage_faulted: vec![0],
             unresponsive: vec![],
             nodes_reporting: 2,
             nodes_failed: 1,
+            targets_truncated_from: None,
         };
         let html = cluster_status_panel(
             &status,

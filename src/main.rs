@@ -244,78 +244,6 @@ async fn account(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respons
     }
 }
 
-async fn keys_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let s = match require(&headers, &st).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let keys = match upstream::list_keys(&st.auth_url, &s).await {
-        Ok(keys) => keys,
-        Err(err) => return upstream_error("auth_key_list_failed", "fiducia-auth", err),
-    };
-    views::keys(&s, &keys).into_response()
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateKeyForm {
-    name: String,
-    #[serde(default)]
-    scope: Option<String>,
-    #[serde(default)]
-    env: Option<String>,
-}
-
-async fn create_key(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Form(form): Form<CreateKeyForm>,
-) -> Response {
-    let s = match require(&headers, &st).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let scopes = vec![form.scope.unwrap_or_else(|| "requests:write".to_string())];
-    let env = form.env.as_deref().unwrap_or("live");
-    let created =
-        match upstream::create_key_with_scopes(&st.auth_url, &s, &form.name, &scopes, env).await {
-            Ok(created) => created,
-            Err(err) => return upstream_error("auth_key_create_failed", "fiducia-auth", err),
-        };
-    if is_htmx(&headers) {
-        let keys = match upstream::list_keys(&st.auth_url, &s).await {
-            Ok(keys) => keys,
-            Err(err) => return upstream_error("auth_key_list_failed", "fiducia-auth", err),
-        };
-        views::keys_after_create(&form.name, &created, &keys).into_response()
-    } else {
-        redirect("/keys")
-    }
-}
-
-async fn revoke_key(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(key_id): Path<String>,
-) -> Response {
-    let s = match require(&headers, &st).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let revoked = match upstream::revoke_key(&st.auth_url, &s, &key_id).await {
-        Ok(revoked) => revoked,
-        Err(err) => return upstream_error("auth_key_revoke_failed", "fiducia-auth", err),
-    };
-    if is_htmx(&headers) {
-        let keys = match upstream::list_keys(&st.auth_url, &s).await {
-            Ok(keys) => keys,
-            Err(err) => return upstream_error("auth_key_list_failed", "fiducia-auth", err),
-        };
-        views::keys_after_revoke(revoked, &keys).into_response()
-    } else {
-        redirect("/keys")
-    }
-}
-
 async fn infra_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let s = match require_admin(&headers, &st).await {
         Ok(s) => s,
@@ -453,6 +381,9 @@ async fn sync_write(
     headers: HeaderMap,
     Json(req): Json<SyncWriteRequest>,
 ) -> Response {
+    if let Err(response) = require_admin_api(&headers, &st).await {
+        return response;
+    }
     let idem_key = headers
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
@@ -567,7 +498,11 @@ async fn sync_catchup(
     State(st): State<Arc<AppState>>,
     Path(table): Path<String>,
     Query(params): Query<CatchupParams>,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = require_admin_api(&headers, &st).await {
+        return response;
+    }
     let rows: Vec<serde_json::Value> = match table.as_str() {
         "infra_operations" => {
             let Some(pool) = &st.pool else {
@@ -711,7 +646,14 @@ fn unix_epoch_ms() -> u128 {
 
 /// The admin-plane sync socket: on connect, sends a hello frame, then forwards
 /// every `fiducia:sync` broadcast frame verbatim (mirrors fiducia-backend's WS).
-async fn admin_ws(State(st): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
+async fn admin_ws(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(response) = require_admin_api(&headers, &st).await {
+        return response;
+    }
     let rx = st.stream_tx.subscribe();
     ws.on_upgrade(move |socket| admin_ws_stream(socket, rx))
 }

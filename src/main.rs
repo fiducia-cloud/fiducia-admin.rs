@@ -118,8 +118,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/admin/sync/:table", post(sync_write).get(sync_catchup))
         .route("/admin/ws", get(admin_ws))
         .with_state(state)
-        // Hardening stack (outermost last): catch handler panics → 500, bound
-        // request time, and cap body size.
+        // Hardening stack (outermost last): CSRF origin guard, catch handler
+        // panics → 500, bound request time, and cap body size.
+        .layer(middleware::from_fn(same_origin_guard))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))

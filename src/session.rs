@@ -22,31 +22,24 @@ pub struct Session {
 ///
 /// Tries real auth first — the bearer from the `Authorization` header or the
 /// `fiducia_admin_session` cookie, verified with `fiducia-auth` `GET /v1/me` — and only
-/// then falls back to the dev bypass.
-///
-/// A dev bypass (`FIDUCIA_ADMIN_DEV_SESSION=user|admin`) lets you click through
-/// the UI before auth is wired. It is a **full authentication bypass** — anyone
-/// reaching the service becomes that user — so it is honored **only** in debug
-/// builds, or when explicitly forced with `FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1`.
-/// Release builds otherwise refuse it and log loudly, so a stray env var in
-/// production can't silently hand out admin.
+/// then falls back to the debug-build-only dev bypass.
 pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
     if let Some(token) = bearer_token(headers) {
         if let Some(session) = from_bearer(auth_url, &token).await {
             return Some(session);
         }
     }
+    dev_session()
+}
+
+/// Debug builds only: `FIDUCIA_ADMIN_DEV_SESSION=user|admin` fabricates a session
+/// so the UI can be clicked through before auth is wired. It is a **full
+/// authentication bypass** — anyone reaching the service becomes that user — so
+/// the entire code path is compiled out of release binaries; no environment
+/// variable can resurrect it in production.
+#[cfg(debug_assertions)]
+fn dev_session() -> Option<Session> {
     let role = std::env::var("FIDUCIA_ADMIN_DEV_SESSION").ok()?;
-
-    if !dev_session_allowed() {
-        tracing::error!(
-            "FIDUCIA_ADMIN_DEV_SESSION is set but IGNORED: the dev auth bypass is \
-             disabled in release builds. Set FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1 \
-             to force it (NEVER in production)."
-        );
-        return None;
-    }
-
     tracing::warn!(
         role = %role,
         "INSECURE: serving a fabricated dev session (auth bypass) — for local dev only"
@@ -64,6 +57,19 @@ pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
         }),
         _ => None,
     }
+}
+
+/// Release builds: the dev bypass does not exist. A stray env var is reported
+/// loudly and ignored — it can never mint a session.
+#[cfg(not(debug_assertions))]
+fn dev_session() -> Option<Session> {
+    if std::env::var_os("FIDUCIA_ADMIN_DEV_SESSION").is_some() {
+        tracing::error!(
+            "FIDUCIA_ADMIN_DEV_SESSION is set but IGNORED: the dev auth bypass is \
+             compiled out of release builds and cannot be enabled in production."
+        );
+    }
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,13 +157,6 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         }
     }
     session_cookie(headers)
-}
-
-/// The dev auth bypass is allowed only in debug builds, or when an operator
-/// explicitly opts in via `FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1`.
-fn dev_session_allowed() -> bool {
-    cfg!(debug_assertions)
-        || std::env::var("FIDUCIA_ALLOW_INSECURE_DEV_SESSION").as_deref() == Ok("1")
 }
 
 #[cfg(test)]

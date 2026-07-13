@@ -48,9 +48,9 @@ FIDUCIA_ADMIN_DEV_SESSION=admin cargo run    # :8096, click through the UI witho
 ```
 
 > **Security:** `FIDUCIA_ADMIN_DEV_SESSION` is a full auth bypass (any request
-> becomes that user). It is honored **only in debug builds**. A release binary
-> ignores it and logs an error, unless you also set
-> `FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1` — never do that in production.
+> becomes that user). It is honored **only in debug builds** — the code path is
+> compiled out of release binaries entirely. A release binary ignores the
+> variable and logs an error; no other variable can re-enable it.
 
 The service fails startup without its Postgres audit/idempotency ledger, and
 upstream failures return an explicit dependency error rather than empty data.
@@ -69,20 +69,19 @@ Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-tel
 | `PORT` | integer | no | Listen port. | `8096` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | string | no | OpenTelemetry collector endpoint (optional). | telemetry off |
 | `TEST_DATABASE_URL` | string | **yes** (creds) | Postgres URL for the DB-backed integration test only; unset → that test skips. | — (tests only) |
-| `FIDUCIA_ADMIN_DEV_SESSION` | bool | no | **INSECURE** — full auth bypass (`user`\|`admin` fabricated session). | unset (secure) |
-| `FIDUCIA_ALLOW_INSECURE_DEV_SESSION` | bool | no | **INSECURE** — forces the dev bypass ON in release builds. | off (secure) |
+| `FIDUCIA_ADMIN_DEV_SESSION` | bool | no | **INSECURE** — full auth bypass (`user`\|`admin` fabricated session); debug builds only, compiled out of release. | unset (secure) |
 | `FIDUCIA_INSECURE_COOKIES` | bool | no | **INSECURE** — drops `Secure` from the session cookie (plain-http dev). | off → cookie is `Secure` |
 
 ### ⚠️ Insecure-mode flags — MUST be OFF/unset in production
 
-`FIDUCIA_ADMIN_DEV_SESSION`, `FIDUCIA_ALLOW_INSECURE_DEV_SESSION`, and
-`FIDUCIA_INSECURE_COOKIES` are
-local-development escape hatches. **Every one of them is secure-by-default**:
+`FIDUCIA_ADMIN_DEV_SESSION` and `FIDUCIA_INSECURE_COOKIES` are
+local-development escape hatches. **Both are secure-by-default**:
 each activates only when explicitly set to a truthy value (`1`/`true`), and an
 unset variable always resolves to the safe behavior (no bypass, no all-admins,
-`Secure` cookies). The dev-session bypass is additionally ignored in release
-builds unless `FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1` is set. **Never set any of
-these in production** — they disable authentication or transport protections.
+`Secure` cookies). The dev-session bypass is additionally **compiled out of
+release builds** — a release binary logs an error and ignores it, and there is
+no environment variable that re-enables it. **Never set either of these in
+production** — they disable authentication or transport protections.
 
 ### Bridging CLI flags to env (flags-2-env)
 

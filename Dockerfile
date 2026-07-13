@@ -5,9 +5,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
 ARG INTERFACES_REF=main
+ARG SYNC_REF=main
 RUN git clone --depth 1 --branch "$INTERFACES_REF" \
     https://github.com/fiducia-cloud/fiducia-interfaces.git fiducia-interfaces
-ARG SYNC_REF=main
 RUN git clone --depth 1 --branch "$SYNC_REF" \
     https://github.com/fiducia-cloud/fiducia-sync.git fiducia-sync
 COPY . fiducia-admin.rs

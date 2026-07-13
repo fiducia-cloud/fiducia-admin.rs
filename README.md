@@ -4,8 +4,8 @@ The server-rendered, operator-only **admin dashboard** for
 [fiducia.cloud](https://fiducia.cloud). It is a separate Rust deployment built
 with Maud, Axum, SeaORM, and HTMX. It has its own host-only session cookie,
 admin routes, database, realtime channel, and browser storage. Customer account
-and API-key workflows live exclusively in `fiducia-customer-ui.web` plus the
-customer BFF.
+and API-key workflows live exclusively in the separate Rust MASH customer app,
+`fiducia-backend.rs`. The static `fiducia-ui.web` repository is marketing only.
 
 ## Operator boundary
 

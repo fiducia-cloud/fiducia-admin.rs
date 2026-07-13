@@ -23,6 +23,10 @@ jobs:
         with:
           repository: fiducia-cloud/fiducia-interfaces
           path: fiducia-interfaces
+      - uses: actions/checkout@v7
+        with:
+          repository: fiducia-cloud/fiducia-sync
+          path: fiducia-sync
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

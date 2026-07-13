@@ -2809,6 +2809,169 @@ mod cluster_tests {
 
         auth_task.abort();
     }
+
+    /// H1: the fan-out must (a) refuse a brain-supplied address that is not
+    /// in-cluster — never dialing it with the cluster secret — and (b) never
+    /// follow a redirect, so a trusted node that answers a cross-origin 302 can't
+    /// bounce the secret to an attacker's `Location`.
+    #[tokio::test]
+    async fn node_fanout_refuses_untrusted_addresses_and_never_follows_redirects() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        std::env::set_var("FIDUCIA_INTERNAL_SECRET", TEST_INTERNAL_SECRET);
+        let auth = Router::new().route(
+            "/v1/me",
+            get(|| async {
+                Json(json!({
+                    "user": { "user_id": "dev-admin", "email": "op@example.com", "roles": ["admin"] }
+                }))
+            }),
+        );
+        let (auth_url, auth_task) = spawn_mock(auth).await;
+
+        // A capture server standing in for the attacker's redirect target. It
+        // records any hit and whether the cluster secret rode along.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let leaked = Arc::new(AtomicBool::new(false));
+        let hits_handler = hits.clone();
+        let leaked_handler = leaked.clone();
+        let capture = Router::new().route(
+            "/leak",
+            get(move |headers: HeaderMap| {
+                let hits_handler = hits_handler.clone();
+                let leaked_handler = leaked_handler.clone();
+                async move {
+                    hits_handler.fetch_add(1, Ordering::SeqCst);
+                    if headers
+                        .get("x-fiducia-internal-auth")
+                        .and_then(|value| value.to_str().ok())
+                        == Some(TEST_INTERNAL_SECRET)
+                    {
+                        leaked_handler.store(true, Ordering::SeqCst);
+                    }
+                    StatusCode::OK
+                }
+            }),
+        );
+        let (capture_url, capture_task) = spawn_mock(capture).await;
+
+        // A trusted (loopback) node that answers observe with a cross-origin 302
+        // pointing at the capture server.
+        let leak_location = format!("{capture_url}/leak");
+        let redirect_node = Router::new().route(
+            "/v1/observe/shards",
+            get(move || {
+                let leak_location = leak_location.clone();
+                async move { (StatusCode::FOUND, [(LOCATION, leak_location)]).into_response() }
+            }),
+        );
+        let (redirect_url, redirect_task) = spawn_mock(redirect_node).await;
+        let redirect_address = redirect_url.trim_start_matches("http://").to_string();
+
+        let brain = Router::new()
+            .route(
+                "/v1/status",
+                get(|| async {
+                    Json(json!({
+                        "service": "fiducia-brain", "version": "0.1.0",
+                        "cluster_id": "fiducia-test", "shard_count": 0, "replication_factor": 3
+                    }))
+                }),
+            )
+            .route(
+                "/v1/nodes",
+                get(move || {
+                    let redirect_address = redirect_address.clone();
+                    async move {
+                        Json(json!({
+                            "nodes": [
+                                // Not loopback, not in-cluster: must be refused pre-request.
+                                { "node_id": "evil", "address": "attacker.example.com:8090", "health": "healthy" },
+                                // Loopback (trusted) but answers with a redirect.
+                                { "node_id": "redir", "address": redirect_address, "health": "healthy" }
+                            ]
+                        }))
+                    }
+                }),
+            );
+        let (brain_url, brain_task) = spawn_mock(brain).await;
+
+        let state = insight_state(auth_url, brain_url, None, None, None, Vec::new());
+        let response = get_with(
+            cluster_router(state),
+            "/api/admin/cluster/shards",
+            Some("verified.jwt"),
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "never a page failure");
+        let body = body_json(response).await;
+        let observations = body["node_observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 2);
+
+        let evil = observations
+            .iter()
+            .find(|o| o["node_id"] == "evil")
+            .unwrap();
+        assert_eq!(
+            evil["error"], "untrusted address",
+            "the out-of-cluster address is a distinct refused state"
+        );
+        assert_eq!(evil["untrusted"], true);
+
+        let redir = observations
+            .iter()
+            .find(|o| o["node_id"] == "redir")
+            .unwrap();
+        assert!(
+            redir["error"].as_str().unwrap().contains("302"),
+            "the 302 surfaces as an error, not followed: got {:?}",
+            redir["error"]
+        );
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "the redirect was never followed");
+        assert!(
+            !leaked.load(Ordering::SeqCst),
+            "the cluster secret never reached the redirect target"
+        );
+
+        for task in [auth_task, brain_task, redirect_task, capture_task] {
+            task.abort();
+        }
+    }
+
+    /// M2: an upstream body past the cap is an error observation, not an OOM or a
+    /// panic — the fan-out reads with a running byte counter and aborts.
+    #[tokio::test]
+    async fn oversized_upstream_body_is_an_error_not_an_oom() {
+        std::env::set_var("FIDUCIA_INTERNAL_SECRET", TEST_INTERNAL_SECRET);
+        // Larger than upstream::MAX_UPSTREAM_BODY_BYTES (16 MiB).
+        let oversized = "x".repeat(17 * 1024 * 1024);
+        let node = Router::new().route(
+            "/v1/observe/shards",
+            get(move || {
+                let oversized = oversized.clone();
+                async move { oversized }
+            }),
+        );
+        let (node_url, node_task) = spawn_mock(node).await;
+
+        let targets = vec![cluster_insight::NodeTarget {
+            node_id: "big".into(),
+            base_url: node_url,
+            trusted: true,
+        }];
+        let observations = cluster_insight::observe_shards_fanout(&targets).await;
+        assert_eq!(observations.len(), 1);
+        assert!(observations[0].shards.is_none());
+        assert_eq!(
+            observations[0].error.as_deref(),
+            Some("oversized response"),
+            "the body cap is enforced as bytes arrive"
+        );
+
+        node_task.abort();
+    }
 }
 
 #[cfg(test)]

@@ -397,14 +397,20 @@ async fn observe_get(base_url: &str, path: &str) -> InsightResult<Value> {
 /// — so per-node errors become data, not a page error. Results come back in the
 /// caller's target order.
 pub async fn observe_shards_fanout(targets: &[NodeTarget]) -> Vec<NodeObservation> {
+    let mut observations: Vec<Option<NodeObservation>> = vec![None; targets.len()];
     let mut set = JoinSet::new();
     for (index, target) in targets.iter().cloned().enumerate() {
+        // An untrusted address is never dialed (H1): no request, no secret — it
+        // becomes a per-node "untrusted address" observation, kept as data.
+        if !target.trusted {
+            observations[index] = Some(untrusted_observation(target));
+            continue;
+        }
         set.spawn(async move {
             let outcome = observe_get(&target.base_url, "/v1/observe/shards").await;
             (index, target, outcome)
         });
     }
-    let mut observations: Vec<Option<NodeObservation>> = vec![None; targets.len()];
     while let Some(joined) = set.join_next().await {
         let Ok((index, target, outcome)) = joined else {
             continue; // a panicked fetch task reports as a missing slot below
@@ -416,10 +422,11 @@ pub async fn observe_shards_fanout(targets: &[NodeTarget]) -> Vec<NodeObservatio
                     base_url: target.base_url,
                     shards: Some(shards),
                     error: None,
+                    untrusted: false,
                 },
-                Err(err) => observation_error(target, format!("unexpected payload: {err}")),
+                Err(_) => observation_error(target, "unexpected payload".to_string()),
             },
-            Err(err) => observation_error(target, err.to_string()),
+            Err(err) => observation_error(target, upstream::error_class(&*err)),
         });
     }
     observations
@@ -438,6 +445,19 @@ fn observation_error(target: NodeTarget, error: String) -> NodeObservation {
         base_url: target.base_url,
         shards: None,
         error: Some(error),
+        untrusted: false,
+    }
+}
+
+/// A per-node observation for an address admin refused to dial (H1) — a distinct
+/// reachability state from an unreachable node.
+fn untrusted_observation(target: NodeTarget) -> NodeObservation {
+    NodeObservation {
+        node_id: target.node_id,
+        base_url: target.base_url,
+        shards: None,
+        error: Some(UNTRUSTED_ADDRESS.to_string()),
+        untrusted: true,
     }
 }
 

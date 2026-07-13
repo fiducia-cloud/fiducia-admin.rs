@@ -141,6 +141,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/", get(dashboard))
         .route("/infra", get(infra_page))
         .route("/infra/scale", post(scale))
+        // Cluster Insight (read-only): HTML page + polled htmx fragments behind
+        // the operator gate, and JSON views of the same data for API callers.
+        .route("/cluster", get(cluster_page))
+        .route("/cluster/shards", get(cluster_shards_fragment))
+        .route("/cluster/nodes", get(cluster_nodes_fragment))
+        .route("/cluster/events", get(cluster_events_fragment))
+        .route("/api/admin/cluster/overview", get(cluster_overview_api))
+        .route("/api/admin/cluster/shards", get(cluster_shards_api))
+        .route("/api/admin/cluster/events", get(cluster_events_api))
+        .route("/api/admin/cluster/metrics", get(cluster_metrics_api))
         // Local-first sync write path (mirrors the customer plane): the sync
         // client POSTs a queued optimistic write; we persist via SeaORM and return
         // the committed row version, then broadcast the change to WS subscribers.

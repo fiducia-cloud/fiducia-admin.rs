@@ -200,9 +200,10 @@ Hardening in place (verified this audit):
   writes, and WebSocket handshakes reject sibling origins. Form and sync writes
   additionally require a constant-time-verified HMAC token bound to the exact
   verified credential; canonical-host checks also cover bearer API writes.
-- **Complete route gate.** Dashboard, infra, sync catch-up/write, and WebSocket
-  handshake paths all enforce the operator role. Customer account/API-key routes
-  are not compiled into this service.
+- **Complete route gate.** Dashboard, infra, cluster insight (page, fragments,
+  and JSON), sync catch-up/write, and WebSocket handshake paths all enforce the
+  operator role. Customer account/API-key routes are not compiled into this
+  service.
 - **Templating.** All HTML is rendered with Maud, which HTML-escapes every
   dynamic interpolation by construction (stored-XSS defense, covered by tests).
 - **Persistence.** SeaORM owns the Postgres connection and all application CRUD

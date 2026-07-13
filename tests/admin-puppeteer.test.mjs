@@ -1,11 +1,11 @@
 // Puppeteer browser E2E: boots the real axum admin server (dev session, no DB)
-// and drives the dashboard, API-keys create, and infra-scale HTMX swap flows.
+// and drives the isolated operator account and infra-scale HTMX flows.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import puppeteer from "puppeteer";
 import { chromeExecutablePath, startAdmin } from "./admin-browser-harness.mjs";
 
-test("puppeteer drives the admin dashboard, API keys, and infra scale flows", async (t) => {
+test("puppeteer drives the admin dashboard, account, and infra scale flows", async (t) => {
   const server = await startAdmin();
   t.after(() => server.stop());
 
@@ -25,22 +25,12 @@ test("puppeteer drives the admin dashboard, API keys, and infra scale flows", as
   assert.match(await pageText(page), /Dashboard/);
   assert.match(await pageText(page), /Welcome/);
 
-  // API keys: fill name, pick a scope, Create — htmx swaps the panel (no reload).
+  assert.equal(await page.$$('nav a[href="/keys"]').then((nodes) => nodes.length), 0);
   await Promise.all([
     page.waitForNavigation({ waitUntil: "networkidle0" }),
-    page.click('nav a[href="/keys"]'),
+    page.click('nav a[href="/account"]'),
   ]);
-  await page.type("input[name='name']", "Puppeteer issued admin key");
-  await page.select("select[name='scope']", "locks:write");
-  await Promise.all([
-    page.click("form[action='/keys'] button[type='submit']"),
-    page.waitForFunction(() =>
-      document
-        .querySelector("[data-keys-status]")
-        ?.textContent?.includes("Puppeteer issued admin key"),
-    ),
-  ]);
-  assert.match(await pageText(page), /Puppeteer issued admin key/);
+  assert.match(await pageText(page), /Organization & members/);
 
   // Infra: set target_nodes, Apply — htmx swaps the infra panel (no reload).
   await Promise.all([

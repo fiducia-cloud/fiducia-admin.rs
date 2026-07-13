@@ -1,11 +1,11 @@
 // Playwright browser E2E: boots the real axum admin server (dev session, no DB)
-// and drives the dashboard, API-keys create, and infra-scale HTMX swap flows.
+// and drives the isolated operator account and infra-scale HTMX flows.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright";
 import { chromeExecutablePath, startAdmin } from "./admin-browser-harness.mjs";
 
-test("playwright drives the admin dashboard, API keys, and infra scale flows", async (t) => {
+test("playwright drives the admin dashboard, account, and infra scale flows", async (t) => {
   const server = await startAdmin();
   t.after(() => server.stop());
 
@@ -24,13 +24,9 @@ test("playwright drives the admin dashboard, API keys, and infra scale flows", a
   await assertVisibleText(page, "Dashboard");
   await assertVisibleText(page, "Welcome");
 
-  // API keys: fill name, pick a scope, Create — htmx swaps the panel in place.
-  await page.locator('nav a[href="/keys"]').click();
-  await assertVisibleText(page, "Create a key");
-  await page.fill("input[name='name']", "Playwright issued admin key");
-  await page.selectOption("select[name='scope']", "kv:write");
-  await page.getByRole("button", { name: "Create" }).click();
-  await assertVisibleText(page, "Playwright issued admin key");
+  assert.equal(await page.locator('nav a[href="/keys"]').count(), 0);
+  await page.locator('nav a[href="/account"]').click();
+  await assertVisibleText(page, "Organization & members");
 
   // Infra: set target_nodes, Apply — htmx swaps the infra panel in place.
   await page.locator('nav a[href="/infra"]').click();

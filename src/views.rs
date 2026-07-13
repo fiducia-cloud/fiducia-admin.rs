@@ -63,7 +63,6 @@ pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
                     span class="brand" { "Fiducia" b { ".admin" } }
                     @if let Some(s) = session {
                         a href="/" { "Dashboard" }
-                        a href="/keys" { "API keys" }
                         a href="/account" { "Account" }
                         @if s.is_admin { a href="/infra" { "Infra" } }
                     } @else {
@@ -163,7 +162,6 @@ pub fn dashboard(s: &Session) -> Markup {
                 p class="muted" {
                     "Signed in as " b { (ident(s)) } ". Orgs: " (s.orgs.join(", ")) "."
                 }
-                p { a href="/keys" { "Manage API keys →" } }
                 @if s.is_admin {
                     p { a href="/infra" { "Cluster & infra ops →" } }
                 }
@@ -193,145 +191,6 @@ pub fn account(s: &Session) -> Markup {
             }
         },
     )
-}
-
-// ---- API keys ---------------------------------------------------------------
-
-const SCOPE_OPTIONS: &[&str] = &[
-    "requests:write",
-    "locks:write",
-    "kv:read",
-    "kv:write",
-    "services:read",
-    "services:write",
-    "elections:write",
-    "cron:write",
-    "rate-limit:write",
-];
-
-/// The create-key form. Doubles as a no-JS `POST /keys` and, with htmx, swaps the
-/// refreshed keys panel in place (`#keys-panel`).
-fn create_key_form() -> Markup {
-    html! {
-        form method="post" action="/keys"
-            hx-post="/keys" hx-target="#keys-panel" hx-swap="innerHTML"
-            style="display:flex;gap:.6rem;flex-wrap:wrap" {
-            input name="name" placeholder="key name (e.g. prod-checkout)" required;
-            select name="scope" aria-label="Scope" {
-                @for scope in SCOPE_OPTIONS {
-                    option value=(scope) { (scope) }
-                }
-            }
-            select name="env" aria-label="Environment" {
-                option value="live" { "live" }
-                option value="test" { "test" }
-            }
-            button class="btn" type="submit" { "Create" }
-        }
-    }
-}
-
-pub fn keys(s: &Session, keys: &[Value]) -> Markup {
-    page(
-        "API keys",
-        Some(s),
-        html! {
-            h1 { "API keys" }
-            div class="card" {
-                h2 { "Create a key" }
-                (create_key_form())
-                p class="muted" { "The raw key is shown once on creation. Only its hash is stored." }
-            }
-            // htmx swap target: the create/revoke handlers return `keys_panel`.
-            div id="keys-panel" { (keys_panel(keys, None)) }
-        },
-    )
-}
-
-fn key_scopes(k: &Value) -> String {
-    k.get("scopes")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_else(|| "—".to_string())
-}
-
-fn key_row(k: &Value) -> Markup {
-    let key_id = k.get("key_id").and_then(Value::as_str).unwrap_or("");
-    html! {
-        tr {
-            td { (k.get("name").and_then(Value::as_str).unwrap_or("—")) }
-            td { span class="tag" { (k.get("env").and_then(Value::as_str).unwrap_or("live")) } }
-            td class="muted" { (if key_id.is_empty() { "—" } else { key_id }) }
-            td class="muted" { (key_scopes(k)) }
-            td {
-                form method="post" action=(format!("/keys/{key_id}/revoke"))
-                    hx-post=(format!("/keys/{key_id}/revoke")) hx-target="#keys-panel" hx-swap="innerHTML" {
-                    button class="btn btn--ghost" { "Revoke" }
-                }
-            }
-        }
-    }
-}
-
-/// The "Your keys" panel — an optional status banner (after a create/revoke)
-/// followed by the keys table. This is the htmx fragment the mutating handlers
-/// return, and it is also embedded on the full page.
-pub fn keys_panel(keys: &[Value], status: Option<Markup>) -> Markup {
-    html! {
-        @if let Some(status) = status { (status) }
-        div class="card" {
-            h2 { "Your keys" }
-            table {
-                tr { th { "Name" } th { "Env" } th { "Key ID" } th { "Scopes" } th {} }
-                @if keys.is_empty() {
-                    tr { td colspan="5" class="muted" {
-                        "No keys yet — create one above. (Live data comes from fiducia-auth.)"
-                    } }
-                } @else {
-                    @for k in keys { (key_row(k)) }
-                }
-            }
-        }
-    }
-}
-
-/// Fragment returned after a create. `created` is the upstream `fiducia-auth`
-/// response; when it carries a one-time raw secret we surface it, otherwise we
-/// confirm the submission (the E2E / dev path has no upstream to mint a secret).
-pub fn keys_after_create(name: &str, created: &Value, keys: &[Value]) -> Markup {
-    let secret = ["key", "secret", "raw", "token", "api_key"]
-        .iter()
-        .find_map(|f| created.get(*f).and_then(Value::as_str));
-    let status = html! {
-        div class="card" data-keys-status="" {
-            @match secret {
-                Some(sec) => {
-                    p { "Key " b { (name) } " created. Store this secret now — it is shown once:" }
-                    p { code { (sec) } }
-                }
-                None => {
-                    p { "Key " b { (name) } " submitted." }
-                }
-            }
-        }
-    };
-    keys_panel(keys, Some(status))
-}
-
-/// Fragment returned after a revoke.
-pub fn keys_after_revoke(revoked: bool, keys: &[Value]) -> Markup {
-    let status = html! {
-        div class="card" data-keys-status="" {
-            p { (if revoked { "Key revoked." } else { "Revoke request submitted." }) }
-        }
-    };
-    keys_panel(keys, Some(status))
 }
 
 // ---- Infra ------------------------------------------------------------------
@@ -432,34 +291,7 @@ mod tests {
             email: Some("a@b.c".into()),
             orgs: vec!["org".into()],
             is_admin: false,
-            bearer_token: None,
         }
-    }
-
-    // The MASH "M" auto-escapes every interpolation, so a hostile key name must
-    // render inert (the old esc()-based guarantee, now enforced by Maud).
-    #[test]
-    fn key_names_are_escaped_in_the_table() {
-        let key_list = vec![json!({
-            "name": "<script>alert(1)</script>",
-            "env": "live",
-            "key_id": "abc123",
-        })];
-        let html = keys(&user(), &key_list).into_string();
-        assert!(
-            !html.contains("<script>alert(1)</script>"),
-            "raw payload leaked"
-        );
-        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
-    }
-
-    // A hostile key name routed through the htmx create fragment must also be
-    // escaped — the fragment path skips the full page but not Maud's escaping.
-    #[test]
-    fn create_fragment_escapes_key_name() {
-        let html = keys_after_create("<img src=x onerror=alert(1)>", &json!({}), &[]).into_string();
-        assert!(!html.contains("<img src=x onerror=alert(1)>"));
-        assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
     }
 
     #[test]

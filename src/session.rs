@@ -19,9 +19,6 @@ pub struct Session {
     pub email: Option<String>,
     pub orgs: Vec<String>,
     pub is_admin: bool,
-    /// The caller's bearer token, kept so key actions can be proxied to
-    /// `fiducia-auth` as the same identity. `None` for a dev-bypass session.
-    pub bearer_token: Option<String>,
 }
 
 /// Resolve the session for a request, or `None` if not signed in.
@@ -66,14 +63,12 @@ pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
             email: Some("admin@example.com".into()),
             orgs: vec!["org_dev".into()],
             is_admin: true,
-            bearer_token: None,
         }),
         "user" => Some(Session {
             user_id: "dev-user".into(),
             email: Some("user@example.com".into()),
             orgs: vec!["org_dev".into()],
             is_admin: false,
-            bearer_token: None,
         }),
         _ => None,
     }
@@ -114,7 +109,6 @@ pub async fn verify_token(auth_url: &str, token: &str) -> Result<Session, reqwes
         email: user.email,
         orgs: user.orgs,
         is_admin,
-        bearer_token: Some(token.to_string()),
     })
 }
 

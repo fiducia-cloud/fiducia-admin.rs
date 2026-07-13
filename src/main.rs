@@ -2423,6 +2423,20 @@ mod cluster_tests {
         let down_address = node_down_url.trim_start_matches("http://").to_string();
         let brain = Router::new()
             .route(
+                "/v1/config",
+                get(|| async {
+                    Json(json!({
+                        "cluster_id": "fiducia-test", "shard_count": 2, "replication_factor": 3
+                    }))
+                }),
+            )
+            .route(
+                "/v1/policies",
+                get(|| async {
+                    Json(json!({ "policies": [{ "namespace": "orders", "home_region": "eu" }] }))
+                }),
+            )
+            .route(
                 "/v1/status",
                 get(|| async {
                     Json(json!({

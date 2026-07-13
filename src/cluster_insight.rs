@@ -481,7 +481,7 @@ pub async fn observe_metrics_fanout(targets: &[NodeTarget]) -> Vec<NodeMetrics> 
                 node_id: target.node_id,
                 base_url: target.base_url,
                 operations: None,
-                error: Some(UNTRUSTED_ADDRESS.to_string()),
+                error: Some(untrusted_address_class()),
             });
             continue;
         }

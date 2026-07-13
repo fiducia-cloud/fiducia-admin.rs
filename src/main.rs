@@ -1021,6 +1021,12 @@ async fn recent_ops(st: &AppState) -> Result<Vec<Value>, DbErr> {
         .collect())
 }
 
+/// A scale target must meet the replication floor and fit the audit record's
+/// `i32` column, so persistence can never silently wrap it.
+fn scale_target_is_valid(target_nodes: u32) -> bool {
+    target_nodes >= MIN_SCALE_TARGET_NODES && i32::try_from(target_nodes).is_ok()
+}
+
 /// Insert a `scale` row into infra_operations (status `requested`, operator
 /// resolved from the verified Supabase subject) and broadcast
 /// it as a `fiducia:sync` change.

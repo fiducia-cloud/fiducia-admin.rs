@@ -534,7 +534,16 @@ pub fn cluster_status_panel(
                     @for shard in shards {
                         tr {
                             td { (shard.shard_id) }
-                            td { span class="tag" { (shard.view.role) } }
+                            td {
+                                span class="tag" { (shard.view.role) }
+                                @if shard.dual_leader {
+                                    " "
+                                    span class="tag tag--bad"
+                                        title="two nodes reported leadership for this shard (split-brain); the higher-term view is shown" {
+                                        "dual-leader"
+                                    }
+                                }
+                            }
                             td { (shard.view.leader_id.as_deref().unwrap_or("—")) }
                             td class="muted" { (shard.view.term) }
                             td class="muted" { (shard.view.commit_index) " / " (shard.view.last_applied) }

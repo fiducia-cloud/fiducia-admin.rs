@@ -1085,13 +1085,13 @@ mod tests {
             .iter()
             .map(|target| (target.node_id.as_str(), target.trusted))
             .collect();
-        assert_eq!(trust["loop"], true, "IPv4 loopback is in-cluster");
-        assert_eq!(trust["loop6"], true, "IPv6 loopback is in-cluster");
-        assert_eq!(trust["svc"], true, "in-cluster suffix is trusted");
-        assert_eq!(trust["ext"], false, "public host is refused");
-        assert_eq!(trust["sneaky"], false, "suffix must be on a label boundary");
-        assert_eq!(
-            trust["userinfo"], false,
+        assert!(trust["loop"], "IPv4 loopback is in-cluster");
+        assert!(trust["loop6"], "IPv6 loopback is in-cluster");
+        assert!(trust["svc"], "in-cluster suffix is trusted");
+        assert!(!trust["ext"], "public host is refused");
+        assert!(!trust["sneaky"], "suffix must be on a label boundary");
+        assert!(
+            !trust["userinfo"],
             "the real host (evil.com) is checked, not the userinfo"
         );
     }

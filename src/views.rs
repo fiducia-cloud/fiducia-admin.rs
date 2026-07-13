@@ -921,7 +921,10 @@ mod tests {
         let html =
             cluster_status_panel(&status, &shards, &quorum, &PromScrape::NotConfigured, None)
                 .into_string();
-        assert!(html.contains("dual-leader"), "split-brain badge + card count");
+        assert!(
+            html.contains("dual-leader"),
+            "split-brain badge + card count"
+        );
         assert!(html.contains("1 leader-unreached"), "M5 bucket in the card");
         assert!(html.contains("1 dual-leader"), "M4 count in the card");
         assert!(

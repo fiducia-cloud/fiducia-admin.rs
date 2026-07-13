@@ -2232,11 +2232,13 @@ mod auth_flow_tests {
         assert!(grafana_public_url_is_valid("/telemetry"));
         // Rejected: anything that could become a dangerous or off-origin href.
         assert!(!grafana_public_url_is_valid("javascript:alert(1)"));
-        assert!(!grafana_public_url_is_valid("data:text/html,<script>1</script>"));
+        assert!(!grafana_public_url_is_valid(
+            "data:text/html,<script>1</script>"
+        ));
         assert!(!grafana_public_url_is_valid("//evil.example.com"));
         assert!(!grafana_public_url_is_valid("ftp://grafana"));
         assert!(!grafana_public_url_is_valid("telemetry")); // not root-relative
-        // A set-but-invalid value fails startup closed; unset stays a no-op.
+                                                            // A set-but-invalid value fails startup closed; unset stays a no-op.
         std::env::set_var("FIDUCIA_GRAFANA_PUBLIC_URL", "javascript:alert(1)");
         assert!(validated_grafana_public_url().is_err());
         std::env::set_var("FIDUCIA_GRAFANA_PUBLIC_URL", "/telemetry");
@@ -2953,7 +2955,11 @@ mod cluster_tests {
             redir["error"]
         );
 
-        assert_eq!(hits.load(Ordering::SeqCst), 0, "the redirect was never followed");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the redirect was never followed"
+        );
         assert!(
             !leaked.load(Ordering::SeqCst),
             "the cluster secret never reached the redirect target"

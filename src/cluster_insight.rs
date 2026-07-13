@@ -56,9 +56,12 @@ fn client(timeout_secs: u64) -> InsightResult<reqwest::Client> {
         .build()?)
 }
 
-/// The reachability class for a target admin refused to dial (H1). Kept in step
-/// with [`upstream::UpstreamError::UntrustedAddress`] so JSON and tooltips agree.
-const UNTRUSTED_ADDRESS: &str = "untrusted address";
+/// The reachability class for a target admin refused to dial (H1), sourced from
+/// the shared [`upstream::UpstreamError`] so JSON, tooltips, and the L7 error
+/// classes all agree on one spelling.
+fn untrusted_address_class() -> String {
+    upstream::UpstreamError::UntrustedAddress.to_string()
+}
 
 /// Hard cap on the fan-out target count (M3). A buggy or hostile brain returning
 /// a huge `/v1/nodes` must not make admin spawn unbounded concurrent tasks.
@@ -717,8 +720,8 @@ pub async fn prom_range_query(
     end: i64,
     step: u32,
 ) -> InsightResult<Vec<Value>> {
-    let request =
-        client(OBSERVABILITY_TIMEOUT_SECS)?.get(prom_range_query_url(base_url, query, start, end, step));
+    let request = client(OBSERVABILITY_TIMEOUT_SECS)?
+        .get(prom_range_query_url(base_url, query, start, end, step));
     let body = upstream::send_capped(request).await?;
     let value: Value = serde_json::from_slice(&body)?;
     prom_result_vector(&value)
@@ -1154,7 +1157,11 @@ mod tests {
         assert_eq!(total, MAX_NODES + 40);
         let truncated = truncate_targets(&mut targets);
         assert_eq!(targets.len(), MAX_NODES, "target list is capped");
-        assert_eq!(truncated, Some(total), "original count reported for the note");
+        assert_eq!(
+            truncated,
+            Some(total),
+            "original count reported for the note"
+        );
         // Within the cap, nothing is dropped and no note is raised.
         let mut small = targets_from_brain_nodes(
             &[json!({ "node_id": "n", "address": "127.0.0.1:8090" })],
@@ -1263,7 +1270,10 @@ mod tests {
         assert_eq!(merged[0].view.term, 8, "higher term adopted");
         assert_eq!(merged[0].reported_by, "node-b");
         assert!(merged[0].leader_view);
-        assert!(merged[0].dual_leader, "the second leader is not dropped unseen");
+        assert!(
+            merged[0].dual_leader,
+            "the second leader is not dropped unseen"
+        );
 
         // Reverse arrival order must reach the same verdict (higher term wins).
         let merged_rev = merge_shards(&[leader_high.clone(), leader_low.clone()]);

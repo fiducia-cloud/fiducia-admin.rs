@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { chromium } from "playwright";
 import { chromeExecutablePath, startAdmin } from "./admin-browser-harness.mjs";
 
-test("playwright drives the admin dashboard, account, and infra scale flows", async (t) => {
+test("playwright drives the isolated admin dashboard and infra scale flow", async (t) => {
   const server = await startAdmin();
   t.after(() => server.stop());
 
@@ -25,8 +25,7 @@ test("playwright drives the admin dashboard, account, and infra scale flows", as
   await assertVisibleText(page, "Welcome");
 
   assert.equal(await page.locator('nav a[href="/keys"]').count(), 0);
-  await page.locator('nav a[href="/account"]').click();
-  await assertVisibleText(page, "Organization & members");
+  assert.equal(await page.locator('nav a[href="/account"]').count(), 0);
 
   // Infra: set target_nodes, Apply — htmx swaps the infra panel in place.
   await page.locator('nav a[href="/infra"]').click();

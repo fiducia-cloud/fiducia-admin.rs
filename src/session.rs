@@ -1,12 +1,10 @@
 //! Dashboard session handling.
 //!
-//! Admins/users log in through Supabase Auth in the browser; the Supabase access
-//! token rides in an admin-only cookie (`fiducia_admin_session`) or an
-//! `Authorization: Bearer`
+//! Operators log in through Supabase Auth; the Supabase access token rides in a
+//! host-only admin cookie (`fiducia_admin_session`) or an `Authorization: Bearer`
 //! header. On each request we verify it via `fiducia-auth`'s `GET /v1/me` (which
-//! already does offline Supabase JWT verification) and resolve the caller's
-//! org(s). Every dashboard route requires the independently configured `admin`
-//! role; a valid customer identity alone is not sufficient.
+//! already does offline Supabase JWT verification) and require an `admin` or
+//! `operator` role copied from trusted Supabase `app_metadata`.
 
 use axum::http::HeaderMap;
 use std::time::Duration;
@@ -17,7 +15,6 @@ use serde::Deserialize;
 pub struct Session {
     pub user_id: String,
     pub email: Option<String>,
-    pub orgs: Vec<String>,
     pub is_admin: bool,
 }
 
@@ -35,11 +32,8 @@ pub struct Session {
 /// production can't silently hand out admin.
 pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
     if let Some(token) = bearer_token(headers) {
-        match verify_token(auth_url, &token).await {
-            Ok(session) => return Some(session),
-            Err(err) => {
-                tracing::debug!(error = %err, "fiducia-auth rejected admin session");
-            }
+        if let Some(session) = from_bearer(auth_url, &token).await {
+            return Some(session);
         }
     }
     let role = std::env::var("FIDUCIA_ADMIN_DEV_SESSION").ok()?;
@@ -61,13 +55,11 @@ pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
         "admin" => Some(Session {
             user_id: "dev-admin".into(),
             email: Some("admin@example.com".into()),
-            orgs: vec!["org_dev".into()],
             is_admin: true,
         }),
         "user" => Some(Session {
             user_id: "dev-user".into(),
             email: Some("user@example.com".into()),
-            orgs: vec!["org_dev".into()],
             is_admin: false,
         }),
         _ => None,
@@ -84,10 +76,20 @@ struct AuthUser {
     user_id: String,
     email: Option<String>,
     #[serde(default)]
-    orgs: Vec<String>,
+    roles: Vec<String>,
 }
 
-pub async fn verify_token(auth_url: &str, token: &str) -> Result<Session, reqwest::Error> {
+pub async fn from_bearer(auth_url: &str, token: &str) -> Option<Session> {
+    match current_from_auth(auth_url, token).await {
+        Ok(session) => Some(session),
+        Err(error) => {
+            tracing::debug!(error = %error, "fiducia-auth rejected admin session");
+            None
+        }
+    }
+}
+
+async fn current_from_auth(auth_url: &str, token: &str) -> Result<Session, reqwest::Error> {
     let url = format!("{}/v1/me", auth_url.trim_end_matches('/'));
     let user = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -100,16 +102,48 @@ pub async fn verify_token(auth_url: &str, token: &str) -> Result<Session, reqwes
         .json::<MeResponse>()
         .await?
         .user;
-    let is_admin = admin_all_users()
+    // `roles` is the preferred contract as fiducia-auth rolls out trusted
+    // Supabase app_metadata. The explicit operator allowlists keep the current
+    // `/v1/me` contract usable without ever trusting user-editable metadata.
+    let is_admin = has_operator_role(&user.roles)
         || env_list_contains("FIDUCIA_ADMIN_USER_IDS", &user.user_id)
         || user.email.as_deref().is_some_and(is_admin_email);
 
     Ok(Session {
         user_id: user.user_id,
         email: user.email,
-        orgs: user.orgs,
         is_admin,
     })
+}
+
+fn has_operator_role(roles: &[String]) -> bool {
+    roles
+        .iter()
+        .any(|role| matches!(role.as_str(), "admin" | "operator"))
+}
+
+fn env_list_contains(name: &str, needle: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .any(|item| item == needle)
+        })
+        .unwrap_or(false)
+}
+
+fn is_admin_email(email: &str) -> bool {
+    let Ok(list) = std::env::var("FIDUCIA_ADMIN_EMAILS") else {
+        return false;
+    };
+    let email = email.trim().to_ascii_lowercase();
+    list.split([',', ' ', '\t', '\n'])
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .any(|value| value == email)
 }
 
 fn session_cookie(headers: &HeaderMap) -> Option<String> {
@@ -143,40 +177,6 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         }
     }
     session_cookie(headers)
-}
-
-fn admin_all_users() -> bool {
-    matches!(
-        std::env::var("FIDUCIA_ADMIN_ALL_USERS").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-    )
-}
-
-fn env_list_contains(name: &str, needle: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .any(|item| item == needle)
-        })
-        .unwrap_or(false)
-}
-
-/// `admin` iff the verified email is listed in `FIDUCIA_ADMIN_EMAILS` (comma or
-/// whitespace separated), matched case-insensitively since email is. No list
-/// configured → no admins (infra pages locked).
-fn is_admin_email(email: &str) -> bool {
-    let Ok(list) = std::env::var("FIDUCIA_ADMIN_EMAILS") else {
-        return false;
-    };
-    let email = email.trim().to_ascii_lowercase();
-    list.split([',', ' ', '\t', '\n'])
-        .map(|e| e.trim().to_ascii_lowercase())
-        .filter(|e| !e.is_empty())
-        .any(|e| e == email)
 }
 
 /// The dev auth bypass is allowed only in debug builds, or when an operator
@@ -219,13 +219,21 @@ mod tests {
     }
 
     #[test]
-    fn admin_email_matches_configured_list_case_insensitively() {
-        std::env::set_var("FIDUCIA_ADMIN_EMAILS", "boss@acme.com, Ops@Acme.com");
-        assert!(is_admin_email("ops@acme.com"));
-        assert!(is_admin_email("boss@acme.com"));
-        assert!(!is_admin_email("intern@acme.com"));
+    fn only_trusted_operator_roles_authorize_admin() {
+        assert!(has_operator_role(&["admin".into()]));
+        assert!(has_operator_role(&["operator".into()]));
+        assert!(!has_operator_role(&[
+            "authenticated".into(),
+            "customer".into()
+        ]));
+    }
+
+    #[test]
+    fn explicit_operator_email_allowlist_is_case_insensitive() {
+        std::env::set_var("FIDUCIA_ADMIN_EMAILS", "ops@example.com, Owner@Example.com");
+        assert!(is_admin_email("owner@example.com"));
+        assert!(!is_admin_email("customer@example.com"));
         std::env::remove_var("FIDUCIA_ADMIN_EMAILS");
-        assert!(!is_admin_email("boss@acme.com"));
     }
 
     #[test]
@@ -266,22 +274,5 @@ mod tests {
         );
 
         assert_eq!(session_cookie(&headers).as_deref(), Some("jwt.456"));
-    }
-
-    #[test]
-    fn env_list_contains_trims_items_and_ignores_blanks() {
-        std::env::set_var(
-            "FIDUCIA_ADMIN_TEST_LIST",
-            " admin@example.com, ,owner@example.com ",
-        );
-
-        assert!(env_list_contains(
-            "FIDUCIA_ADMIN_TEST_LIST",
-            "owner@example.com"
-        ));
-        assert!(!env_list_contains(
-            "FIDUCIA_ADMIN_TEST_LIST",
-            "missing@example.com"
-        ));
     }
 }

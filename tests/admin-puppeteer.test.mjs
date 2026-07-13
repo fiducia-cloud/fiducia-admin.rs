@@ -5,7 +5,7 @@ import { test } from "node:test";
 import puppeteer from "puppeteer";
 import { chromeExecutablePath, startAdmin } from "./admin-browser-harness.mjs";
 
-test("puppeteer drives the admin dashboard, account, and infra scale flows", async (t) => {
+test("puppeteer drives the isolated admin dashboard and infra scale flow", async (t) => {
   const server = await startAdmin();
   t.after(() => server.stop());
 
@@ -26,11 +26,7 @@ test("puppeteer drives the admin dashboard, account, and infra scale flows", asy
   assert.match(await pageText(page), /Welcome/);
 
   assert.equal(await page.$$('nav a[href="/keys"]').then((nodes) => nodes.length), 0);
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: "networkidle0" }),
-    page.click('nav a[href="/account"]'),
-  ]);
-  assert.match(await pageText(page), /Organization & members/);
+  assert.equal(await page.$$('nav a[href="/account"]').then((nodes) => nodes.length), 0);
 
   // Infra: set target_nodes, Apply — htmx swaps the infra panel (no reload).
   await Promise.all([

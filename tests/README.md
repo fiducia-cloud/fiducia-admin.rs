@@ -3,7 +3,7 @@
 Node-driven browser E2E for the admin dashboard. Each spec boots the real axum
 binary (via `cargo run` with only the dev-session bypass and an empty
 `DATABASE_URL`, proving the UI renders with no admin DB) and drives the dashboard,
-operator-account and infra-scale flows through a headless Chrome — exercising the HTMX
+operator dashboard and infra-scale flows through a headless Chrome — exercising the HTMX
 progressive-enhancement swaps end to end.
 
 - **`admin-browser-harness.mjs`** — the shared boot recipe: Chrome discovery and

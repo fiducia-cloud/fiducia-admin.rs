@@ -24,7 +24,7 @@ const CSS: &str = r#"
 a{color:#c4b5fd;text-decoration:none}a:hover{text-decoration:underline}
 .nav{display:flex;gap:1.2rem;align-items:center;padding:.9rem 1.4rem;border-bottom:1px solid var(--line);background:rgba(18,26,54,.6)}
 .brand{font-weight:700}.brand b{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
-.nav .sp{flex:1}.nav .who{color:var(--dim);font-size:.9rem}.nav form{margin:0}
+.nav .sp{flex:1}.nav .who{color:var(--dim);font-size:.9rem}
 .wrap{max-width:980px;margin:0 auto;padding:1.6rem 1.4rem}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:1.2rem 1.4rem;margin:1rem 0}
 h1{font-size:1.5rem;margin:.2rem 0 1rem}h2{font-size:1.1rem;margin:.2rem 0 .8rem}
@@ -61,10 +61,9 @@ pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
             body {
                 nav class="nav" {
                     span class="brand" { "Fiducia" b { ".admin" } }
-                    @if let Some(s) = session {
+                    @if session.is_some() {
                         a href="/" { "Dashboard" }
-                        a href="/account" { "Account" }
-                        @if s.is_admin { a href="/infra" { "Infra" } }
+                        a href="/infra" { "Infra" }
                     } @else {
                         a href="/login" { "Sign in" }
                     }
@@ -72,9 +71,9 @@ pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
                     @if let Some(s) = session {
                         span class="who" {
                             (ident(s))
-                            @if s.is_admin { " · admin" }
+                            " · operator"
                         }
-                        form method="post" action="/logout" {
+                        form method="post" action="/logout" style="margin:0" {
                             button class="btn btn--ghost" type="submit" { "Sign out" }
                         }
                     }
@@ -121,7 +120,7 @@ pub fn forbidden(s: &Session) -> Markup {
     )
 }
 
-pub fn login(error: Option<&str>) -> Markup {
+pub fn login(message: Option<&str>) -> Markup {
     page(
         "Sign in",
         None,
@@ -129,11 +128,8 @@ pub fn login(error: Option<&str>) -> Markup {
             h1 { "Sign in" }
             div class="card" {
                 p class="muted" {
-                    "Authenticate with your Supabase account. The dashboard verifies the "
-                    "session via " code { "fiducia-auth" } "."
-                }
-                @if let Some(error) = error {
-                    p role="alert" { (error) }
+                    "Authenticate with an operator Supabase account. " code { "fiducia-auth" }
+                    " verifies the session and trusted operator role before an admin cookie is issued."
                 }
                 form method="post" action="/login" {
                     label { "Email" }
@@ -141,6 +137,9 @@ pub fn login(error: Option<&str>) -> Markup {
                     label { "Password" }
                     input name="password" type="password" autocomplete="current-password" required;
                     button class="btn" { "Sign in" }
+                }
+                @if let Some(message) = message {
+                    p class="muted" role="alert" { (message) }
                 }
                 p class="muted" {
                     "For local development, " code { "FIDUCIA_ADMIN_DEV_SESSION=admin" }
@@ -160,34 +159,9 @@ pub fn dashboard(s: &Session) -> Markup {
             div class="card" {
                 h2 { "Welcome" }
                 p class="muted" {
-                    "Signed in as " b { (ident(s)) } ". Orgs: " (s.orgs.join(", ")) "."
+                    "Signed in as operator " b { (ident(s)) } "."
                 }
-                @if s.is_admin {
-                    p { a href="/infra" { "Cluster & infra ops →" } }
-                }
-            }
-        },
-    )
-}
-
-pub fn account(s: &Session) -> Markup {
-    page(
-        "Account",
-        Some(s),
-        html! {
-            h1 { "Account" }
-            div class="card" {
-                h2 { "Organization & members" }
-                p class="muted" {
-                    "Identity and organization membership come from the verified session."
-                }
-                @if s.orgs.is_empty() {
-                    p class="muted" { "No organizations are attached to this session." }
-                } @else {
-                    ul {
-                        @for org in &s.orgs { li { (org) } }
-                    }
-                }
+                p { a href="/infra" { "Cluster & infra ops →" } }
             }
         },
     )
@@ -289,15 +263,13 @@ mod tests {
         Session {
             user_id: "u".into(),
             email: Some("a@b.c".into()),
-            orgs: vec!["org".into()],
-            is_admin: false,
+            is_admin: true,
         }
     }
 
     #[test]
     fn dashboard_keeps_welcome_and_infra_link_for_admin() {
-        let mut admin = user();
-        admin.is_admin = true;
+        let admin = user();
         let html = dashboard(&admin).into_string();
         assert!(html.contains("Dashboard"));
         assert!(html.contains("Welcome"));
@@ -316,8 +288,7 @@ mod tests {
 
     #[test]
     fn infra_renders_scale_controls_and_recent_ops_when_present() {
-        let mut admin = user();
-        admin.is_admin = true;
+        let admin = user();
         let recent = vec![json!({
             "action": "scale",
             "target_nodes": 9,

@@ -1,8 +1,10 @@
 //! Calls to the other fiducia services.
 //!
 //! The admin app is a thin web tier: it renders HTML but the data and actions
-//! live in `fiducia-brain`. Each call returns a typed success or an error to the
-//! handler; dependency failures are never presented as empty, successful data.
+//! live in `fiducia-brain`. Customer account and API-key traffic is deliberately
+//! absent from this operator-only application. Each call returns a typed success
+//! or an error to the handler; dependency failures are never presented as empty,
+//! successful data.
 
 use std::io;
 use std::time::Duration;
@@ -21,7 +23,7 @@ fn client() -> UpstreamResult<reqwest::Client> {
 
 /// The cluster trusted-hop secret, read once. The brain's `/v1` enforces it when
 /// configured, so admin's brain calls (membership / placement / scale) must
-/// present it.
+/// present it. (Auth calls use the caller's bearer token instead.)
 fn internal_secret() -> UpstreamResult<&'static str> {
     static SECRET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     SECRET

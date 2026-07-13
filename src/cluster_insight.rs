@@ -464,14 +464,24 @@ fn untrusted_observation(target: NodeTarget) -> NodeObservation {
 /// Fetch `/v1/observe/metrics` from every target concurrently (same partial-
 /// failure contract as [`observe_shards_fanout`]).
 pub async fn observe_metrics_fanout(targets: &[NodeTarget]) -> Vec<NodeMetrics> {
+    let mut results: Vec<Option<NodeMetrics>> = vec![None; targets.len()];
     let mut set = JoinSet::new();
     for (index, target) in targets.iter().cloned().enumerate() {
+        // Untrusted addresses are refused, never dialed (H1).
+        if !target.trusted {
+            results[index] = Some(NodeMetrics {
+                node_id: target.node_id,
+                base_url: target.base_url,
+                operations: None,
+                error: Some(UNTRUSTED_ADDRESS.to_string()),
+            });
+            continue;
+        }
         set.spawn(async move {
             let outcome = observe_get(&target.base_url, "/v1/observe/metrics").await;
             (index, target, outcome)
         });
     }
-    let mut results: Vec<Option<NodeMetrics>> = vec![None; targets.len()];
     while let Some(joined) = set.join_next().await {
         let Ok((index, target, outcome)) = joined else {
             continue;
@@ -487,7 +497,7 @@ pub async fn observe_metrics_fanout(targets: &[NodeTarget]) -> Vec<NodeMetrics> 
                 node_id: target.node_id,
                 base_url: target.base_url,
                 operations: None,
-                error: Some(err.to_string()),
+                error: Some(upstream::error_class(&*err)),
             },
         });
     }

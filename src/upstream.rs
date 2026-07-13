@@ -95,11 +95,15 @@ pub async fn set_scale(brain_url: &str, target_nodes: u32) -> UpstreamResult<boo
 }
 
 async fn get_array(base_url: &str, path: &str, field: &str) -> UpstreamResult<Vec<Value>> {
-    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-    // get_array only fetches from the brain (nodes / placement), so always present
-    // the trusted-hop secret.
-    let value = get_json(attach_internal(client()?.get(url))?).await?;
+    let value = get_object(base_url, path).await?;
     json_array(&value, field)
+}
+
+async fn get_object(base_url: &str, path: &str) -> UpstreamResult<Value> {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    // These helpers only fetch from the brain, so always present the trusted-hop
+    // secret.
+    get_json(attach_internal(client()?.get(url))?).await
 }
 
 fn json_array(value: &Value, field: &str) -> UpstreamResult<Vec<Value>> {

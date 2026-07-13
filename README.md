@@ -36,6 +36,9 @@ canonical `Host`, and writes reject a supplied non-admin `Origin`.
 | `POST /logout` | clear the admin-only session cookie |
 | `GET /` | operator dashboard |
 | `GET /infra` · `POST /infra/scale` | cluster operations |
+| `GET /cluster` | cluster insight page (summary, shards, nodes, events) |
+| `GET /cluster/{shards,nodes,events}` | polled htmx fragments (full page without `HX-Request`) |
+| `GET /api/admin/cluster/{overview,shards,events,metrics}` | cluster insight as JSON for bearer/API callers |
 | `GET /api/admin/sync/{table}?cursor=N&limit=M` | ordered catch-up changes (`changes`, `next_cursor`, `has_more`) |
 | `POST /api/admin/sync/{table}` | version-CAS mutation with mandatory `Idempotency-Key` |
 | `GET /admin/ws` | authorized admin-plane realtime stream |

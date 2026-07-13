@@ -596,8 +596,16 @@ pub fn merge_shards(observations: &[NodeObservation]) -> Vec<MergedShard> {
 /// merged shard rows. Feeds the summary cards and the overview API.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ClusterQuorum {
-    /// Shards for which no reporting node claims leadership.
+    /// Shards where NO node reported any `leader_id` — genuinely leaderless
+    /// (election in progress or lost). A shard whose leader is merely unreachable
+    /// is *not* counted here (M5); see `leader_unreached`.
     pub leaderless: Vec<u32>,
+    /// Shards that have a known `leader_id` but no reachable leader view merged in
+    /// — the leader node timed out or is partitioned from admin (M5). Distinct
+    /// from `leaderless` so partial-visibility incidents raise no false alarm.
+    pub leader_unreached: Vec<u32>,
+    /// Shards for which two or more nodes each claimed leadership (M4 split-brain).
+    pub dual_leader: Vec<u32>,
     /// Union of every leader's `at_risk_led_shards` (led, but a majority is not
     /// caught up — one more failure stalls the shard).
     pub at_risk: Vec<u32>,
@@ -607,6 +615,11 @@ pub struct ClusterQuorum {
     pub unresponsive: Vec<u32>,
     pub nodes_reporting: usize,
     pub nodes_failed: usize,
+    /// Set when the discovered fan-out target list exceeded [`MAX_NODES`] (M3):
+    /// the original count, for the "showing 512 of N" note. `None` in the normal
+    /// case (set by the handler after target planning, not by [`cluster_quorum`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub targets_truncated_from: Option<usize>,
 }
 
 pub fn cluster_quorum(observations: &[NodeObservation], merged: &[MergedShard]) -> ClusterQuorum {
@@ -625,11 +638,21 @@ pub fn cluster_quorum(observations: &[NodeObservation], merged: &[MergedShard]) 
             None => rollup.nodes_failed += 1,
         }
     }
-    rollup.leaderless = merged
-        .iter()
-        .filter(|shard| !shard.leader_view)
-        .map(|shard| shard.shard_id)
-        .collect();
+    // `merged` is shard-id ordered (BTreeMap), so each bucket comes out ascending.
+    for shard in merged {
+        if shard.dual_leader {
+            rollup.dual_leader.push(shard.shard_id);
+        }
+        if !shard.leader_view {
+            // No leader view merged. Distinguish "a leader exists but we could not
+            // reach it" (leader_id present) from "nobody knows a leader" (M5).
+            if shard.view.leader_id.is_some() {
+                rollup.leader_unreached.push(shard.shard_id);
+            } else {
+                rollup.leaderless.push(shard.shard_id);
+            }
+        }
+    }
     rollup.at_risk = at_risk.into_iter().collect();
     rollup.storage_faulted = storage_faulted.into_iter().collect();
     rollup.unresponsive = unresponsive.into_iter().collect();

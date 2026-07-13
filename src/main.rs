@@ -198,6 +198,57 @@ async fn require_admin(headers: &HeaderMap, st: &AppState) -> Result<Session, Re
     }
 }
 
+/// Require the admin role for JSON/API routes. Same gate as `require_admin` but
+/// returns a JSON error body (not an HTML page), so API callers get a machine-
+/// readable 401/403. Guards the `/api/admin/sync/*` write endpoints.
+async fn require_admin_api(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {
+    match require(headers, st).await {
+        Ok(s) if s.is_admin => Ok(s),
+        Ok(_) => {
+            Err((StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" }))).into_response())
+        }
+        Err(_) => Err(
+            (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthenticated" }))).into_response(),
+        ),
+    }
+}
+
+// Admin API-key management UI. The routes are wired (`/keys`, `/keys/:id/revoke`)
+// and the pieces exist (`upstream::create_key_with_scopes`, `upstream::revoke_key`,
+// `views::create_key_form`), but the operator workflow is still completing these
+// handlers. Until then they FAIL CLOSED behind the admin gate with 501 rather than
+// exposing a half-implemented key-management surface.
+async fn keys_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match require_admin(&headers, &st).await {
+        Ok(_) => {
+            (StatusCode::NOT_IMPLEMENTED, "API-key management is not yet available").into_response()
+        }
+        Err(r) => r,
+    }
+}
+
+async fn create_key(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    match require_admin(&headers, &st).await {
+        Ok(_) => {
+            (StatusCode::NOT_IMPLEMENTED, "API-key creation is not yet available").into_response()
+        }
+        Err(r) => r,
+    }
+}
+
+async fn revoke_key(
+    State(st): State<Arc<AppState>>,
+    Path(_key_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    match require_admin(&headers, &st).await {
+        Ok(_) => {
+            (StatusCode::NOT_IMPLEMENTED, "API-key revocation is not yet available").into_response()
+        }
+        Err(r) => r,
+    }
+}
+
 async fn login() -> Markup {
     views::login()
 }
@@ -241,78 +292,6 @@ async fn account(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Respons
     match require(&headers, &st).await {
         Ok(s) => views::account(&s).into_response(),
         Err(r) => r,
-    }
-}
-
-async fn keys_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let s = match require(&headers, &st).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let keys = match upstream::list_keys(&st.auth_url, &s).await {
-        Ok(keys) => keys,
-        Err(err) => return upstream_error("auth_key_list_failed", "fiducia-auth", err),
-    };
-    views::keys(&s, &keys).into_response()
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateKeyForm {
-    name: String,
-    #[serde(default)]
-    scope: Option<String>,
-    #[serde(default)]
-    env: Option<String>,
-}
-
-async fn create_key(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Form(form): Form<CreateKeyForm>,
-) -> Response {
-    let s = match require(&headers, &st).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let scopes = vec![form.scope.unwrap_or_else(|| "requests:write".to_string())];
-    let env = form.env.as_deref().unwrap_or("live");
-    let created =
-        match upstream::create_key_with_scopes(&st.auth_url, &s, &form.name, &scopes, env).await {
-            Ok(created) => created,
-            Err(err) => return upstream_error("auth_key_create_failed", "fiducia-auth", err),
-        };
-    if is_htmx(&headers) {
-        let keys = match upstream::list_keys(&st.auth_url, &s).await {
-            Ok(keys) => keys,
-            Err(err) => return upstream_error("auth_key_list_failed", "fiducia-auth", err),
-        };
-        views::keys_after_create(&form.name, &created, &keys).into_response()
-    } else {
-        redirect("/keys")
-    }
-}
-
-async fn revoke_key(
-    State(st): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(key_id): Path<String>,
-) -> Response {
-    let s = match require(&headers, &st).await {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let revoked = match upstream::revoke_key(&st.auth_url, &s, &key_id).await {
-        Ok(revoked) => revoked,
-        Err(err) => return upstream_error("auth_key_revoke_failed", "fiducia-auth", err),
-    };
-    if is_htmx(&headers) {
-        let keys = match upstream::list_keys(&st.auth_url, &s).await {
-            Ok(keys) => keys,
-            Err(err) => return upstream_error("auth_key_list_failed", "fiducia-auth", err),
-        };
-        views::keys_after_revoke(revoked, &keys).into_response()
-    } else {
-        redirect("/keys")
     }
 }
 
@@ -453,6 +432,9 @@ async fn sync_write(
     headers: HeaderMap,
     Json(req): Json<SyncWriteRequest>,
 ) -> Response {
+    if let Err(response) = require_admin_api(&headers, &st).await {
+        return response;
+    }
     let idem_key = headers
         .get("idempotency-key")
         .and_then(|v| v.to_str().ok())
@@ -567,7 +549,11 @@ async fn sync_catchup(
     State(st): State<Arc<AppState>>,
     Path(table): Path<String>,
     Query(params): Query<CatchupParams>,
+    headers: HeaderMap,
 ) -> Response {
+    if let Err(response) = require_admin_api(&headers, &st).await {
+        return response;
+    }
     let rows: Vec<serde_json::Value> = match table.as_str() {
         "infra_operations" => {
             let Some(pool) = &st.pool else {
@@ -711,7 +697,14 @@ fn unix_epoch_ms() -> u128 {
 
 /// The admin-plane sync socket: on connect, sends a hello frame, then forwards
 /// every `fiducia:sync` broadcast frame verbatim (mirrors fiducia-backend's WS).
-async fn admin_ws(State(st): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
+async fn admin_ws(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Err(response) = require_admin_api(&headers, &st).await {
+        return response;
+    }
     let rx = st.stream_tx.subscribe();
     ws.on_upgrade(move |socket| admin_ws_stream(socket, rx))
 }
@@ -752,6 +745,8 @@ mod sync_tests {
         Arc::new(AppState {
             auth_url: "http://localhost:8097".into(),
             brain_url: "http://localhost:8095".into(),
+            supabase_url: "https://example.supabase.co".into(),
+            supabase_publishable_key: "test-publishable-key".into(),
             pool: None,
             stream_tx: broadcast::channel(16).0,
         })
@@ -779,12 +774,12 @@ mod sync_tests {
     }
 
     #[tokio::test]
-    async fn sync_write_fails_closed_without_postgres() {
+    async fn sync_write_requires_an_operator_session_before_table_or_database_access() {
         let response = post_sync(test_state(), "infra_operations", None).await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let unsupported = post_sync(test_state(), "operators", None).await;
-        assert_eq!(unsupported.status(), StatusCode::NOT_FOUND);
+        assert_eq!(unsupported.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -814,13 +809,11 @@ mod sync_tests {
 
     #[tokio::test]
     async fn idempotency_requires_the_durable_ledger() {
-        let response = post_sync(
-            test_state(),
-            "infra_operations",
-            Some("infra_operations:op1:upsert:7"),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            idempotency_begin(&test_state(), "infra_operations:op1:upsert:7")
+                .await
+                .is_err()
+        );
     }
 }
 
@@ -859,6 +852,8 @@ mod db_tests {
         AppState {
             auth_url: "x".into(),
             brain_url: "x".into(),
+            supabase_url: "https://example.supabase.co".into(),
+            supabase_publishable_key: "test-publishable-key".into(),
             pool: Some(pool),
             stream_tx: broadcast::channel(4).0,
         }

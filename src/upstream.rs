@@ -1,16 +1,15 @@
 //! Calls to the other fiducia services.
 //!
 //! The admin app is a thin web tier: it renders HTML but the data and actions
-//! live elsewhere — **accounts/API keys** in `fiducia-auth`, **infra** in
-//! `fiducia-brain`. Each call returns a typed success or an error to the handler;
-//! dependency failures are never presented as empty, successful data.
+//! live in `fiducia-brain`. Customer account and API-key traffic is deliberately
+//! absent from this operator-only application. Each call returns a typed success
+//! or an error to the handler; dependency failures are never presented as empty,
+//! successful data.
 
 use std::io;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-
-use crate::session::Session;
 
 /// Shared HTTP client (connection pooling + a sane timeout) so a slow upstream
 /// can't hang a dashboard request.
@@ -47,79 +46,6 @@ fn internal_secret() -> UpstreamResult<&'static str> {
 /// Attach the required trusted-hop header to an outbound brain request.
 fn attach_internal(builder: reqwest::RequestBuilder) -> UpstreamResult<reqwest::RequestBuilder> {
     Ok(builder.header("x-fiducia-internal-auth", internal_secret()?))
-}
-
-/// `fiducia-auth`: list the caller's org API keys (masked). Forwards the caller's
-/// session bearer so auth resolves the same identity the dashboard authenticated.
-pub async fn list_keys(auth_url: &str, session: &Session) -> UpstreamResult<Vec<Value>> {
-    let token = session
-        .bearer_token
-        .as_deref()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "missing bearer session"))?;
-    let url = format!("{}/v1/keys", auth_url.trim_end_matches('/'));
-    let value = get_json(client()?.get(url).bearer_auth(token)).await?;
-    json_array(&value, "keys")
-}
-
-/// `fiducia-auth`: create a scoped key. Returns the raw key (shown once) + meta.
-pub async fn create_key_with_scopes(
-    auth_url: &str,
-    session: &Session,
-    name: &str,
-    scopes: &[String],
-    env: &str,
-) -> UpstreamResult<Value> {
-    let token = session
-        .bearer_token
-        .as_deref()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "missing bearer session"))?;
-    let scopes = normalized_scopes(scopes);
-    let env = match env.trim() {
-        "" => "live",
-        value => value,
-    };
-    let url = format!("{}/v1/keys", auth_url.trim_end_matches('/'));
-    post_json(
-        url,
-        Some(token),
-        json!({ "name": name, "org_id": session.orgs.first(), "scopes": scopes, "env": env }),
-    )
-    .await
-}
-
-fn normalized_scopes(scopes: &[String]) -> Vec<String> {
-    let mut out = scopes
-        .iter()
-        .map(|scope| scope.trim())
-        .filter(|scope| !scope.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if out.is_empty() {
-        out.push("requests:write".to_string());
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-/// `fiducia-auth`: revoke a key. Returns whether auth reported it revoked.
-pub async fn revoke_key(auth_url: &str, session: &Session, key_id: &str) -> UpstreamResult<bool> {
-    let token = session
-        .bearer_token
-        .as_deref()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "missing bearer session"))?;
-    let url = format!(
-        "{}/v1/keys/{}",
-        auth_url.trim_end_matches('/'),
-        urlencode(key_id)
-    );
-    let value = get_json(client()?.delete(url).bearer_auth(token)).await?;
-    value
-        .get("revoked")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "auth response omitted revoked").into()
-        })
 }
 
 /// `fiducia-brain`: cluster membership.
@@ -169,35 +95,8 @@ fn json_array(value: &Value, field: &str) -> UpstreamResult<Vec<Value>> {
         })
 }
 
-/// Percent-encode a single path segment (key ids are opaque but kept URL-safe).
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 async fn get_json(
     request: reqwest::RequestBuilder,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     Ok(request.send().await?.error_for_status()?.json().await?)
-}
-
-async fn post_json(
-    url: String,
-    bearer: Option<&str>,
-    body: Value,
-) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    let mut request = client()?.post(url).json(&body);
-    if let Some(token) = bearer {
-        request = request.bearer_auth(token);
-    }
-    let value = request.send().await?.error_for_status()?.json().await?;
-    Ok(value)
 }

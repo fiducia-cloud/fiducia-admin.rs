@@ -801,13 +801,9 @@ pub async fn recent_cluster_events(
         end_ns,
         LOKI_QUERY_LIMIT,
     );
-    let body: Value = client(OBSERVABILITY_TIMEOUT_SECS)?
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let request = client(OBSERVABILITY_TIMEOUT_SECS)?.get(url);
+    let raw = upstream::send_capped(request).await?;
+    let body: Value = serde_json::from_slice(&raw)?;
     Ok(parse_loki_events(&body))
 }
 

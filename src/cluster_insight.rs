@@ -48,8 +48,29 @@ type InsightResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 fn client(timeout_secs: u64) -> InsightResult<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
+        // A node/observability hop is a single in-cluster call; a redirect is
+        // never legitimate and must not carry the cluster secret to an
+        // upstream-chosen `Location` (reqwest resends custom headers across
+        // redirects). Surface a 3xx as an error instead of following it (H1).
+        .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }
+
+/// The reachability class for a target admin refused to dial (H1), sourced from
+/// the shared [`upstream::UpstreamError`] so JSON, tooltips, and the L7 error
+/// classes all agree on one spelling.
+fn untrusted_address_class() -> String {
+    upstream::UpstreamError::UntrustedAddress.to_string()
+}
+
+/// Hard cap on the fan-out target count (M3). A buggy or hostile brain returning
+/// a huge `/v1/nodes` must not make admin spawn unbounded concurrent tasks.
+pub const MAX_NODES: usize = 512;
+
+/// Default in-cluster DNS suffix a brain-discovered node address must carry
+/// before admin will dial it with the cluster secret (H1). Overridable via
+/// `FIDUCIA_NODE_HOST_SUFFIX` for clusters that heartbeat a different domain.
+pub const DEFAULT_NODE_HOST_SUFFIX: &str = ".svc.cluster.local";
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -67,18 +88,54 @@ pub struct NodeTarget {
     /// URL's host so explicit targets still label their table rows.
     pub node_id: String,
     pub base_url: String,
+    /// Whether this address is safe to dial with the cluster secret (H1). An
+    /// explicit operator URL is trusted once it parses as http(s); a
+    /// brain-discovered address must additionally be loopback or carry the
+    /// in-cluster suffix. An untrusted target is never dialed — the fan-out turns
+    /// it into an "untrusted address" observation, kept as data like a down node.
+    pub trusted: bool,
+}
+
+/// Trust policy for node targets (H1). Explicit operator URLs are trusted as-is;
+/// brain-discovered addresses must resolve to a loopback host or one ending in
+/// `suffix` before admin attaches the cluster secret and dials them.
+#[derive(Debug, Clone)]
+pub struct NodeHostPolicy {
+    /// In-cluster DNS suffix accepted for brain-discovered hosts.
+    pub suffix: String,
+}
+
+impl NodeHostPolicy {
+    /// Read the policy from `FIDUCIA_NODE_HOST_SUFFIX` (default
+    /// [`DEFAULT_NODE_HOST_SUFFIX`]).
+    pub fn from_env() -> Self {
+        let suffix = std::env::var("FIDUCIA_NODE_HOST_SUFFIX")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_NODE_HOST_SUFFIX.to_string());
+        NodeHostPolicy { suffix }
+    }
+
+    /// Whether a brain-discovered host may be dialed with the cluster secret.
+    fn allows_discovered_host(&self, host: &str) -> bool {
+        host_is_loopback(host) || host_has_suffix(host, &self.suffix)
+    }
 }
 
 /// Targets from the explicit `FIDUCIA_NODE_URLS` override (comma-separated base
 /// URLs). Explicit config wins over brain discovery so an operator can point the
-/// dashboard at nodes the brain has not registered (or a local stack).
-pub fn explicit_node_targets(urls: &[String]) -> Vec<NodeTarget> {
+/// dashboard at nodes the brain has not registered (or a local stack); these are
+/// trusted as-is (H1) once they parse as an http(s) URL with a host.
+pub fn explicit_node_targets(urls: &[String], policy: &NodeHostPolicy) -> Vec<NodeTarget> {
     urls.iter()
         .map(|url| {
             let base_url = normalize_base_url(url);
+            let trusted = base_url_is_trusted(&base_url, true, policy);
             NodeTarget {
                 node_id: host_label(&base_url),
                 base_url,
+                trusted,
             }
         })
         .collect()
@@ -87,8 +144,10 @@ pub fn explicit_node_targets(urls: &[String]) -> Vec<NodeTarget> {
 /// Targets discovered from the brain's `/v1/nodes` membership snapshot: each
 /// `NodeInfo` carries the `address` (`host:port`) the node heartbeats in.
 /// Entries without an address are skipped (a node that never heartbeated an
-/// address has nothing to dial).
-pub fn targets_from_brain_nodes(nodes: &[Value]) -> Vec<NodeTarget> {
+/// address has nothing to dial). Each address is trust-checked against `policy`
+/// (H1): a compromised/spoofed brain cannot make admin ship the cluster secret to
+/// an arbitrary host — an out-of-cluster address becomes an untrusted target.
+pub fn targets_from_brain_nodes(nodes: &[Value], policy: &NodeHostPolicy) -> Vec<NodeTarget> {
     nodes
         .iter()
         .filter_map(|node| {
@@ -101,12 +160,33 @@ pub fn targets_from_brain_nodes(nodes: &[Value]) -> Vec<NodeTarget> {
                 .and_then(Value::as_str)
                 .unwrap_or(address)
                 .to_string();
+            let base_url = normalize_base_url(address);
+            let trusted = base_url_is_trusted(&base_url, false, policy);
             Some(NodeTarget {
                 node_id,
-                base_url: normalize_base_url(address),
+                base_url,
+                trusted,
             })
         })
         .collect()
+}
+
+/// Truncate the fan-out target list to [`MAX_NODES`] (M3) and return the original
+/// count when truncation happened (for the "showing 512 of N" note); `None`
+/// otherwise. Logs a warning so the elision is visible in operations.
+pub fn truncate_targets(targets: &mut Vec<NodeTarget>) -> Option<usize> {
+    let total = targets.len();
+    if total > MAX_NODES {
+        targets.truncate(MAX_NODES);
+        tracing::warn!(
+            total,
+            shown = MAX_NODES,
+            "cluster insight fan-out targets truncated"
+        );
+        Some(total)
+    } else {
+        None
+    }
 }
 
 /// Node addresses arrive as `host:port` from heartbeats or full URLs from env;
@@ -118,6 +198,63 @@ fn normalize_base_url(address: &str) -> String {
     } else {
         format!("http://{address}")
     }
+}
+
+/// Parse a normalized base URL and return its lowercased `(scheme, host)`, or
+/// `None` if it isn't a dialable http(s) URL with a host (H1). Uses reqwest's own
+/// URL parser, so validation sees exactly the host reqwest would dial — no
+/// parser-differential where a `user@host` trick fools the check but not the
+/// client.
+fn scheme_and_host(base_url: &str) -> Option<(String, String)> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let scheme = url.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    // IPv6 literals come back bracketed ("[::1]"); strip for comparison.
+    let host = url
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    Some((scheme, host))
+}
+
+/// Whether `base_url` may be dialed with the cluster secret (H1). Both sources
+/// require an http(s) scheme and a host; brain-discovered addresses additionally
+/// must satisfy the in-cluster host policy.
+fn base_url_is_trusted(base_url: &str, explicit: bool, policy: &NodeHostPolicy) -> bool {
+    let Some((_scheme, host)) = scheme_and_host(base_url) else {
+        return false;
+    };
+    explicit || policy.allows_discovered_host(&host)
+}
+
+/// Case-insensitive, label-boundary suffix match. The leading dot is enforced
+/// even when the configured suffix omits it, so `evilsvc.cluster.local` does not
+/// match a `svc.cluster.local` policy.
+fn host_has_suffix(host: &str, suffix: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let core = suffix
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if core.is_empty() {
+        return false;
+    }
+    host == core || host.ends_with(&format!(".{core}"))
+}
+
+/// Loopback host (the local-stack / in-pod case): `localhost`, or any address in
+/// IPv4 `127.0.0.0/8` or IPv6 `::1`.
+fn host_is_loopback(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "localhost" {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|addr| addr.is_loopback())
+        .unwrap_or(false)
 }
 
 /// A short host-derived label for explicitly configured targets
@@ -236,6 +373,11 @@ pub struct NodeObservation {
     pub shards: Option<NodeShards>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// True when `error` is set because the address failed trust validation and
+    /// was never dialed (H1) — a distinct reachability state from unreachable.
+    /// Omitted from JSON in the common (trusted) case.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub untrusted: bool,
 }
 
 /// One node's `/v1/observe/metrics` fan-out outcome (per-op counters).
@@ -252,7 +394,10 @@ pub struct NodeMetrics {
 async fn observe_get(base_url: &str, path: &str) -> InsightResult<Value> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
     let request = upstream::attach_internal(client(NODE_OBSERVE_TIMEOUT_SECS)?.get(url))?;
-    Ok(request.send().await?.error_for_status()?.json().await?)
+    // Status/redirect check + 16 MiB body cap (H1 + M2); parse from the bounded
+    // buffer.
+    let body = upstream::send_capped(request).await?;
+    Ok(serde_json::from_slice(&body)?)
 }
 
 /// Fetch `/v1/observe/shards` from every target concurrently. Partial failure is
@@ -260,14 +405,20 @@ async fn observe_get(base_url: &str, path: &str) -> InsightResult<Value> {
 /// — so per-node errors become data, not a page error. Results come back in the
 /// caller's target order.
 pub async fn observe_shards_fanout(targets: &[NodeTarget]) -> Vec<NodeObservation> {
+    let mut observations: Vec<Option<NodeObservation>> = vec![None; targets.len()];
     let mut set = JoinSet::new();
     for (index, target) in targets.iter().cloned().enumerate() {
+        // An untrusted address is never dialed (H1): no request, no secret — it
+        // becomes a per-node "untrusted address" observation, kept as data.
+        if !target.trusted {
+            observations[index] = Some(untrusted_observation(target));
+            continue;
+        }
         set.spawn(async move {
             let outcome = observe_get(&target.base_url, "/v1/observe/shards").await;
             (index, target, outcome)
         });
     }
-    let mut observations: Vec<Option<NodeObservation>> = vec![None; targets.len()];
     while let Some(joined) = set.join_next().await {
         let Ok((index, target, outcome)) = joined else {
             continue; // a panicked fetch task reports as a missing slot below
@@ -279,10 +430,11 @@ pub async fn observe_shards_fanout(targets: &[NodeTarget]) -> Vec<NodeObservatio
                     base_url: target.base_url,
                     shards: Some(shards),
                     error: None,
+                    untrusted: false,
                 },
-                Err(err) => observation_error(target, format!("unexpected payload: {err}")),
+                Err(_) => observation_error(target, "unexpected payload".to_string()),
             },
-            Err(err) => observation_error(target, err.to_string()),
+            Err(err) => observation_error(target, upstream::error_class(&*err)),
         });
     }
     observations
@@ -301,20 +453,43 @@ fn observation_error(target: NodeTarget, error: String) -> NodeObservation {
         base_url: target.base_url,
         shards: None,
         error: Some(error),
+        untrusted: false,
+    }
+}
+
+/// A per-node observation for an address admin refused to dial (H1) — a distinct
+/// reachability state from an unreachable node.
+fn untrusted_observation(target: NodeTarget) -> NodeObservation {
+    NodeObservation {
+        node_id: target.node_id,
+        base_url: target.base_url,
+        shards: None,
+        error: Some(untrusted_address_class()),
+        untrusted: true,
     }
 }
 
 /// Fetch `/v1/observe/metrics` from every target concurrently (same partial-
 /// failure contract as [`observe_shards_fanout`]).
 pub async fn observe_metrics_fanout(targets: &[NodeTarget]) -> Vec<NodeMetrics> {
+    let mut results: Vec<Option<NodeMetrics>> = vec![None; targets.len()];
     let mut set = JoinSet::new();
     for (index, target) in targets.iter().cloned().enumerate() {
+        // Untrusted addresses are refused, never dialed (H1).
+        if !target.trusted {
+            results[index] = Some(NodeMetrics {
+                node_id: target.node_id,
+                base_url: target.base_url,
+                operations: None,
+                error: Some(untrusted_address_class()),
+            });
+            continue;
+        }
         set.spawn(async move {
             let outcome = observe_get(&target.base_url, "/v1/observe/metrics").await;
             (index, target, outcome)
         });
     }
-    let mut results: Vec<Option<NodeMetrics>> = vec![None; targets.len()];
     while let Some(joined) = set.join_next().await {
         let Ok((index, target, outcome)) = joined else {
             continue;
@@ -330,7 +505,7 @@ pub async fn observe_metrics_fanout(targets: &[NodeTarget]) -> Vec<NodeMetrics> 
                 node_id: target.node_id,
                 base_url: target.base_url,
                 operations: None,
-                error: Some(err.to_string()),
+                error: Some(upstream::error_class(&*err)),
             },
         });
     }
@@ -359,6 +534,11 @@ pub struct MergedShard {
     /// True when `reported_by` leads the shard — the leader's view carries the
     /// authoritative quorum/replication columns.
     pub leader_view: bool,
+    /// True when two or more nodes each reported `role == leader` for this shard —
+    /// a split-brain signal (M4). The higher-term leader view is adopted, and this
+    /// flag records that the conflict happened so the merge does not silently mask
+    /// the exact incident this page exists to surface.
+    pub dual_leader: bool,
     #[serde(flatten)]
     pub view: ShardView,
 }
@@ -366,7 +546,9 @@ pub struct MergedShard {
 /// Merge every node's `/v1/observe/shards` into one row per shard. The leader's
 /// view wins (only the leader knows per-peer replication lag and quorum); when
 /// no reporting node leads a shard, keep the first follower/candidate view so a
-/// leaderless shard still renders with its last-known indices.
+/// leaderless shard still renders with its last-known indices. When a *second*
+/// node also claims leadership for the same shard, adopt the higher term and set
+/// `dual_leader` (M4) rather than dropping the conflicting leader unseen.
 pub fn merge_shards(observations: &[NodeObservation]) -> Vec<MergedShard> {
     let mut merged: std::collections::BTreeMap<u32, MergedShard> =
         std::collections::BTreeMap::new();
@@ -376,21 +558,37 @@ pub fn merge_shards(observations: &[NodeObservation]) -> Vec<MergedShard> {
         };
         for view in &shards.shards {
             let leader_view = view.role == "leader";
-            let row = || MergedShard {
+            let candidate = MergedShard {
                 shard_id: view.shard_id,
                 reported_by: observation.node_id.clone(),
                 leader_view,
+                dual_leader: false,
                 view: view.clone(),
             };
-            match merged.get(&view.shard_id) {
-                Some(existing) if existing.leader_view => {} // leader view already won
-                Some(_) if leader_view => {
-                    merged.insert(view.shard_id, row());
-                }
-                Some(_) => {}
+            match merged.get_mut(&view.shard_id) {
                 None => {
-                    merged.insert(view.shard_id, row());
+                    merged.insert(view.shard_id, candidate);
                 }
+                Some(existing) if leader_view && existing.leader_view => {
+                    // Two nodes both claim leadership: prefer the higher term
+                    // (tie keeps the incumbent), but flag the conflict either way.
+                    if view.term > existing.view.term {
+                        *existing = MergedShard {
+                            dual_leader: true,
+                            ..candidate
+                        };
+                    } else {
+                        existing.dual_leader = true;
+                    }
+                }
+                Some(existing) if leader_view => {
+                    // Leader view supersedes a follower/candidate view.
+                    *existing = MergedShard {
+                        dual_leader: existing.dual_leader,
+                        ..candidate
+                    };
+                }
+                Some(_) => {} // incumbent (leader, or first follower) kept
             }
         }
     }
@@ -401,8 +599,16 @@ pub fn merge_shards(observations: &[NodeObservation]) -> Vec<MergedShard> {
 /// merged shard rows. Feeds the summary cards and the overview API.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ClusterQuorum {
-    /// Shards for which no reporting node claims leadership.
+    /// Shards where NO node reported any `leader_id` — genuinely leaderless
+    /// (election in progress or lost). A shard whose leader is merely unreachable
+    /// is *not* counted here (M5); see `leader_unreached`.
     pub leaderless: Vec<u32>,
+    /// Shards that have a known `leader_id` but no reachable leader view merged in
+    /// — the leader node timed out or is partitioned from admin (M5). Distinct
+    /// from `leaderless` so partial-visibility incidents raise no false alarm.
+    pub leader_unreached: Vec<u32>,
+    /// Shards for which two or more nodes each claimed leadership (M4 split-brain).
+    pub dual_leader: Vec<u32>,
     /// Union of every leader's `at_risk_led_shards` (led, but a majority is not
     /// caught up — one more failure stalls the shard).
     pub at_risk: Vec<u32>,
@@ -412,6 +618,11 @@ pub struct ClusterQuorum {
     pub unresponsive: Vec<u32>,
     pub nodes_reporting: usize,
     pub nodes_failed: usize,
+    /// Set when the discovered fan-out target list exceeded [`MAX_NODES`] (M3):
+    /// the original count, for the "showing 512 of N" note. `None` in the normal
+    /// case (set by the handler after target planning, not by [`cluster_quorum`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub targets_truncated_from: Option<usize>,
 }
 
 pub fn cluster_quorum(observations: &[NodeObservation], merged: &[MergedShard]) -> ClusterQuorum {
@@ -430,11 +641,21 @@ pub fn cluster_quorum(observations: &[NodeObservation], merged: &[MergedShard]) 
             None => rollup.nodes_failed += 1,
         }
     }
-    rollup.leaderless = merged
-        .iter()
-        .filter(|shard| !shard.leader_view)
-        .map(|shard| shard.shard_id)
-        .collect();
+    // `merged` is shard-id ordered (BTreeMap), so each bucket comes out ascending.
+    for shard in merged {
+        if shard.dual_leader {
+            rollup.dual_leader.push(shard.shard_id);
+        }
+        if !shard.leader_view {
+            // No leader view merged. Distinguish "a leader exists but we could not
+            // reach it" (leader_id present) from "nobody knows a leader" (M5).
+            if shard.view.leader_id.is_some() {
+                rollup.leader_unreached.push(shard.shard_id);
+            } else {
+                rollup.leaderless.push(shard.shard_id);
+            }
+        }
+    }
     rollup.at_risk = at_risk.into_iter().collect();
     rollup.storage_faulted = storage_faulted.into_iter().collect();
     rollup.unresponsive = unresponsive.into_iter().collect();
@@ -485,13 +706,9 @@ pub const PROM_FIDUCIA_UP_QUERY: &str = "up{namespace=\"fiducia\"}";
 
 /// Run an instant query and return the `data.result` vector.
 pub async fn prom_instant_query(base_url: &str, query: &str) -> InsightResult<Vec<Value>> {
-    let value: Value = client(OBSERVABILITY_TIMEOUT_SECS)?
-        .get(prom_instant_query_url(base_url, query))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let request = client(OBSERVABILITY_TIMEOUT_SECS)?.get(prom_instant_query_url(base_url, query));
+    let body = upstream::send_capped(request).await?;
+    let value: Value = serde_json::from_slice(&body)?;
     prom_result_vector(&value)
 }
 
@@ -503,13 +720,10 @@ pub async fn prom_range_query(
     end: i64,
     step: u32,
 ) -> InsightResult<Vec<Value>> {
-    let value: Value = client(OBSERVABILITY_TIMEOUT_SECS)?
-        .get(prom_range_query_url(base_url, query, start, end, step))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let request = client(OBSERVABILITY_TIMEOUT_SECS)?
+        .get(prom_range_query_url(base_url, query, start, end, step));
+    let body = upstream::send_capped(request).await?;
+    let value: Value = serde_json::from_slice(&body)?;
     prom_result_vector(&value)
 }
 
@@ -590,13 +804,9 @@ pub async fn recent_cluster_events(
         end_ns,
         LOKI_QUERY_LIMIT,
     );
-    let body: Value = client(OBSERVABILITY_TIMEOUT_SECS)?
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let request = client(OBSERVABILITY_TIMEOUT_SECS)?.get(url);
+    let raw = upstream::send_capped(request).await?;
+    let body: Value = serde_json::from_slice(&raw)?;
     Ok(parse_loki_events(&body))
 }
 
@@ -804,18 +1014,30 @@ mod tests {
 
     // ---- discovery ----
 
+    fn test_policy() -> NodeHostPolicy {
+        NodeHostPolicy {
+            suffix: DEFAULT_NODE_HOST_SUFFIX.to_string(),
+        }
+    }
+
     #[test]
     fn explicit_node_urls_override_and_label_by_host() {
-        let targets = explicit_node_targets(&[
-            "http://fiducia-node-0.fiducia-node.fiducia.svc.cluster.local:8090/".to_string(),
-            "10.2.0.7:8090".to_string(),
-        ]);
+        let targets = explicit_node_targets(
+            &[
+                "http://fiducia-node-0.fiducia-node.fiducia.svc.cluster.local:8090/".to_string(),
+                "10.2.0.7:8090".to_string(),
+            ],
+            &test_policy(),
+        );
         assert_eq!(
             targets[0].base_url,
             "http://fiducia-node-0.fiducia-node.fiducia.svc.cluster.local:8090"
         );
         assert_eq!(targets[0].node_id, "fiducia-node-0");
         assert_eq!(targets[1].base_url, "http://10.2.0.7:8090");
+        // Explicit operator URLs are trusted as-is (H1): even the non-suffixed
+        // private-IP entry is dialable.
+        assert!(targets[0].trusted && targets[1].trusted);
     }
 
     #[test]
@@ -825,11 +1047,124 @@ mod tests {
             json!({ "node_id": "node-b", "address": "", "health": "dead" }),
             json!({ "node_id": "node-c", "address": "https://node-c:8090" }),
         ];
-        let targets = targets_from_brain_nodes(&nodes);
+        let targets = targets_from_brain_nodes(&nodes, &test_policy());
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].node_id, "node-a");
         assert_eq!(targets[0].base_url, "http://10.0.0.1:8090");
         assert_eq!(targets[1].base_url, "https://node-c:8090");
+        // Neither discovered host is loopback or in-cluster-suffixed, so neither
+        // is trusted to receive the cluster secret (H1).
+        assert!(!targets[0].trusted && !targets[1].trusted);
+    }
+
+    // ---- H1: SSRF / secret-leak allowlist ----
+
+    #[test]
+    fn only_http_schemes_pass_validation() {
+        assert!(scheme_and_host("http://x.svc.cluster.local:8090").is_some());
+        assert!(scheme_and_host("https://node-a:8090").is_some());
+        // Non-http(s) schemes never get the cluster secret.
+        assert!(scheme_and_host("ftp://x.svc.cluster.local").is_none());
+        assert!(scheme_and_host("file:///etc/passwd").is_none());
+        assert!(scheme_and_host("gopher://x.svc.cluster.local").is_none());
+        assert!(scheme_and_host("javascript:alert(1)").is_none());
+        assert!(scheme_and_host("not a url").is_none());
+    }
+
+    #[test]
+    fn discovered_targets_are_trusted_only_when_loopback_or_suffixed() {
+        let nodes = vec![
+            json!({ "node_id": "loop", "address": "127.0.0.1:8090" }),
+            json!({ "node_id": "loop6", "address": "[::1]:8090" }),
+            json!({ "node_id": "svc", "address": "fiducia-node-0.fiducia-node.fiducia.svc.cluster.local:8090" }),
+            json!({ "node_id": "ext", "address": "attacker.example.com:8090" }),
+            // Suffix must sit on a label boundary — no `…local.evil.com` bypass.
+            json!({ "node_id": "sneaky", "address": "x.svc.cluster.local.evil.com:8090" }),
+            // userinfo must not smuggle a trusted-looking host past the real host.
+            json!({ "node_id": "userinfo", "address": "http://real.svc.cluster.local@evil.com:8090" }),
+        ];
+        let targets = targets_from_brain_nodes(&nodes, &test_policy());
+        let trust: std::collections::HashMap<&str, bool> = targets
+            .iter()
+            .map(|target| (target.node_id.as_str(), target.trusted))
+            .collect();
+        assert!(trust["loop"], "IPv4 loopback is in-cluster");
+        assert!(trust["loop6"], "IPv6 loopback is in-cluster");
+        assert!(trust["svc"], "in-cluster suffix is trusted");
+        assert!(!trust["ext"], "public host is refused");
+        assert!(!trust["sneaky"], "suffix must be on a label boundary");
+        assert!(
+            !trust["userinfo"],
+            "the real host (evil.com) is checked, not the userinfo"
+        );
+    }
+
+    #[test]
+    fn explicit_targets_are_trusted_as_is_but_still_require_http_scheme() {
+        let targets = explicit_node_targets(
+            &[
+                "http://fiducia-node-0.internal:8090".to_string(), // operator-trusted
+                "javascript:alert(1)".to_string(),                 // not dialable
+            ],
+            &test_policy(),
+        );
+        assert!(
+            targets[0].trusted,
+            "an explicit operator URL is trusted even without the suffix"
+        );
+        assert!(
+            !targets[1].trusted,
+            "a non-http(s) explicit target is still refused"
+        );
+    }
+
+    #[test]
+    fn a_custom_suffix_overrides_the_default() {
+        let policy = NodeHostPolicy {
+            suffix: ".nodes.internal".to_string(),
+        };
+        let nodes = vec![
+            json!({ "node_id": "custom", "address": "n0.nodes.internal:8090" }),
+            json!({ "node_id": "default-suffix", "address": "n0.svc.cluster.local:8090" }),
+        ];
+        let targets = targets_from_brain_nodes(&nodes, &policy);
+        assert!(targets[0].trusted, "matches the configured suffix");
+        assert!(
+            !targets[1].trusted,
+            "the default suffix no longer applies once overridden"
+        );
+    }
+
+    #[test]
+    fn untrusted_address_class_is_the_documented_l7_string() {
+        // The string the fan-out stamps on a refused target is the shared L7
+        // class, so JSON (`node_observations[].error`) and tooltips agree (H1).
+        assert_eq!(untrusted_address_class(), "untrusted address");
+    }
+
+    // ---- M3: fan-out target cap ----
+
+    #[test]
+    fn fanout_targets_are_capped_at_max_nodes() {
+        let nodes: Vec<Value> = (0..(MAX_NODES as u64 + 40))
+            .map(|i| json!({ "node_id": format!("n{i}"), "address": format!("127.0.0.1:{}", 8000 + i) }))
+            .collect();
+        let mut targets = targets_from_brain_nodes(&nodes, &test_policy());
+        let total = targets.len();
+        assert_eq!(total, MAX_NODES + 40);
+        let truncated = truncate_targets(&mut targets);
+        assert_eq!(targets.len(), MAX_NODES, "target list is capped");
+        assert_eq!(
+            truncated,
+            Some(total),
+            "original count reported for the note"
+        );
+        // Within the cap, nothing is dropped and no note is raised.
+        let mut small = targets_from_brain_nodes(
+            &[json!({ "node_id": "n", "address": "127.0.0.1:8090" })],
+            &test_policy(),
+        );
+        assert_eq!(truncate_targets(&mut small), None);
     }
 
     // ---- merge ----
@@ -851,6 +1186,7 @@ mod tests {
                 shards,
             }),
             error: None,
+            untrusted: false,
         }
     }
 
@@ -869,6 +1205,7 @@ mod tests {
             base_url: "http://node-c:8090".into(),
             shards: None,
             error: Some("connection refused".into()),
+            untrusted: false,
         };
 
         let merged = merge_shards(&[follower_first, leader_second, down]);
@@ -903,15 +1240,80 @@ mod tests {
             base_url: "http://node-c:8090".into(),
             shards: None,
             error: Some("timeout".into()),
+            untrusted: false,
         };
         let merged = merge_shards(&[healthy.clone(), follower_only.clone(), down.clone()]);
         let quorum = cluster_quorum(&[healthy, follower_only, down], &merged);
         assert_eq!(quorum.nodes_reporting, 2);
         assert_eq!(quorum.nodes_failed, 1);
         assert_eq!(quorum.leaderless, vec![1], "no node leads shard 1");
+        assert_eq!(quorum.leader_unreached, Vec::<u32>::new());
+        assert_eq!(quorum.dual_leader, Vec::<u32>::new());
         assert_eq!(quorum.at_risk, vec![0]);
         assert_eq!(quorum.storage_faulted, vec![2]);
         assert_eq!(quorum.unresponsive, vec![1]);
+    }
+
+    // ---- M4: split-brain (dual leadership) ----
+
+    #[test]
+    fn merge_flags_dual_leadership_and_adopts_the_higher_term() {
+        let leader_low = observation("node-a", vec![shard_view(0, "leader", 5)]);
+        let leader_high = observation("node-b", vec![shard_view(0, "leader", 8)]);
+
+        // Lower term first, then the higher term: adopt the higher, flag the clash.
+        let merged = merge_shards(&[leader_low.clone(), leader_high.clone()]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].view.term, 8, "higher term adopted");
+        assert_eq!(merged[0].reported_by, "node-b");
+        assert!(merged[0].leader_view);
+        assert!(
+            merged[0].dual_leader,
+            "the second leader is not dropped unseen"
+        );
+
+        // Reverse arrival order must reach the same verdict (higher term wins).
+        let merged_rev = merge_shards(&[leader_high.clone(), leader_low.clone()]);
+        assert_eq!(merged_rev[0].view.term, 8);
+        assert_eq!(merged_rev[0].reported_by, "node-b");
+        assert!(merged_rev[0].dual_leader);
+
+        // The quorum rollup surfaces the conflict as a count.
+        let quorum = cluster_quorum(&[leader_low, leader_high], &merged);
+        assert_eq!(quorum.dual_leader, vec![0]);
+        // A dual-leader shard has a reachable leader, so it is neither leaderless
+        // nor leader-unreached.
+        assert!(quorum.leaderless.is_empty() && quorum.leader_unreached.is_empty());
+    }
+
+    // ---- M5: leaderless vs. merely-unreachable leader ----
+
+    #[test]
+    fn quorum_separates_leaderless_from_leader_unreached() {
+        // Shard 0: a follower that still knows its leader — the leader node simply
+        // timed out / its view was never merged. NOT leaderless.
+        let follower_knows_leader = observation(
+            "node-a",
+            vec![serde_json::from_value(
+                json!({ "shard_id": 0, "role": "follower", "term": 4, "leader_id": "node-z" }),
+            )
+            .unwrap()],
+        );
+        // Shard 1: a follower with no leader_id at all — genuinely leaderless.
+        let follower_no_leader = observation("node-b", vec![shard_view(1, "follower", 9)]);
+        let observations = [follower_knows_leader, follower_no_leader];
+        let merged = merge_shards(&observations);
+        let quorum = cluster_quorum(&observations, &merged);
+        assert_eq!(
+            quorum.leaderless,
+            vec![1],
+            "only the shard with no known leader is leaderless"
+        );
+        assert_eq!(
+            quorum.leader_unreached,
+            vec![0],
+            "a known-but-unreachable leader is a separate bucket, not a false alarm"
+        );
     }
 
     // ---- query construction ----

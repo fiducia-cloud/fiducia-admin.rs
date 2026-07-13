@@ -15,10 +15,108 @@ use serde_json::{json, Value};
 /// can't hang a dashboard request.
 type UpstreamResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Hard cap on any single upstream response body admin buffers (M2). Every
+/// upstream JSON payload (brain status/config/policies, node observe, Prometheus
+/// / Loki queries) is kilobytes in the steady state; a body past this cap is a
+/// bug or a hostile/compromised upstream trying to exhaust admin's memory — the
+/// concurrent node fan-out amplifies it — so the read is aborted, not allocated.
+pub(crate) const MAX_UPSTREAM_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// An upstream failure reduced to a short, URL-free class (L7). reqwest's own
+/// `Display` embeds the target URL, which must never reach
+/// `node_observations[].error` or a view tooltip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpstreamError {
+    /// The target host is not in-cluster / not operator-trusted, so admin refused
+    /// to dial it with the cluster secret (H1). Never becomes a request.
+    UntrustedAddress,
+    /// The body exceeded [`MAX_UPSTREAM_BODY_BYTES`] and the read was aborted (M2).
+    OversizedResponse,
+    /// A non-2xx status. A 3xx is included: in-cluster hops are single calls and
+    /// the clients never follow redirects (H1), so a 3xx surfaces here as an error.
+    BadStatus(u16),
+}
+
+impl std::fmt::Display for UpstreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpstreamError::UntrustedAddress => f.write_str("untrusted address"),
+            UpstreamError::OversizedResponse => f.write_str("oversized response"),
+            UpstreamError::BadStatus(code) => write!(f, "bad status: {code}"),
+        }
+    }
+}
+
+impl std::error::Error for UpstreamError {}
+
 fn client() -> UpstreamResult<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        // In-cluster hops are single calls; a redirect is never legitimate and
+        // must not carry the trusted-hop secret to an upstream-chosen `Location`
+        // (reqwest resends custom headers across redirects) — surface 3xx as an
+        // error instead of following it (H1).
+        .redirect(reqwest::redirect::Policy::none())
         .build()?)
+}
+
+/// Collapse any upstream error to a short, URL-free class for
+/// `node_observations[].error`, Prometheus/Loki tooltips, and metric-fan-out rows
+/// (L7). Recognizes our own [`UpstreamError`] sentinels and walks the source chain
+/// for a reqwest cause; anything else is a generic class, never a raw URL.
+pub(crate) fn error_class(error: &(dyn std::error::Error + Send + Sync + 'static)) -> String {
+    if let Some(upstream) = error.downcast_ref::<UpstreamError>() {
+        return upstream.to_string();
+    }
+    if let Some(request) = error.downcast_ref::<reqwest::Error>() {
+        return reqwest_class(request);
+    }
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(request) = cause.downcast_ref::<reqwest::Error>() {
+            return reqwest_class(request);
+        }
+        source = cause.source();
+    }
+    "upstream error".to_string()
+}
+
+fn reqwest_class(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "timeout".to_string()
+    } else if let Some(status) = error.status() {
+        format!("bad status: {}", status.as_u16())
+    } else {
+        // Connect refused/reset, DNS failure, mid-body transport error: all
+        // "we could not get an answer" — one class, and crucially URL-free.
+        "unreachable".to_string()
+    }
+}
+
+/// Send a request, reject any non-2xx (a 3xx included — the clients never follow
+/// redirects, H1), and read the body under a running byte cap (M2). Returns the
+/// bounded buffer for the caller to deserialize.
+pub(crate) async fn send_capped(request: reqwest::RequestBuilder) -> UpstreamResult<Vec<u8>> {
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(UpstreamError::BadStatus(status.as_u16()).into());
+    }
+    read_capped_body(response).await
+}
+
+/// Buffer a response body, aborting past [`MAX_UPSTREAM_BODY_BYTES`] (M2). Reads
+/// via `chunk()` so the cap is enforced as bytes arrive — the advertised
+/// `Content-Length` is untrusted (it can be absent or a lie).
+async fn read_capped_body(mut response: reqwest::Response) -> UpstreamResult<Vec<u8>> {
+    let mut buffer = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if buffer.len().saturating_add(chunk.len()) > MAX_UPSTREAM_BODY_BYTES {
+            return Err(UpstreamError::OversizedResponse.into());
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
 }
 
 /// The cluster trusted-hop secret, read once. The brain's `/v1` enforces it when
@@ -123,5 +221,8 @@ fn json_array(value: &Value, field: &str) -> UpstreamResult<Vec<Value>> {
 async fn get_json(
     request: reqwest::RequestBuilder,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(request.send().await?.error_for_status()?.json().await?)
+    // Status/redirect check and the 16 MiB body cap live in `send_capped` (M2);
+    // deserialize from the bounded buffer.
+    let body = send_capped(request).await?;
+    Ok(serde_json::from_slice(&body)?)
 }

@@ -53,6 +53,12 @@ aliases = ["node-urls"]
 type = "string"
 help = "Comma-separated fiducia-node base URLs; overrides brain-based node discovery (optional)."
 
+[flags.node-host-suffix]
+env = "FIDUCIA_NODE_HOST_SUFFIX"
+aliases = ["node-host-suffix"]
+type = "string"
+help = "In-cluster DNS suffix a brain-discovered node address must carry (or be loopback) before the observe fan-out dials it with the cluster secret (default .svc.cluster.local)."
+
 [flags.admin-origin]
 env = "FIDUCIA_ADMIN_ORIGIN"
 aliases = ["admin-origin"]

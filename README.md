@@ -99,6 +99,9 @@ like the infra pattern). The same data is served as JSON under
 Node discovery: `FIDUCIA_NODE_URLS` (comma-separated base URLs) wins when set;
 otherwise targets come from the brain's `/v1/nodes` — each node's heartbeated
 `address` (`host:port`), normalized to `http://` when no scheme is given.
+Brain-discovered addresses are **trust-checked before the cluster secret is
+attached** (see below); an address that fails the check becomes a per-node
+"untrusted address" observation instead of a request.
 
 **Security posture:** every cluster page, fragment, and `/api/admin/cluster/*`
 route sits behind the same operator gate as the rest of the app
@@ -109,6 +112,36 @@ mutation, no CSRF surface. The brain and node calls carry
 services, which is why their URLs are optional, operator-supplied
 configuration and their query results are rendered (HTML-escaped by Maud) but
 never executed or persisted.
+
+**Fan-out SSRF & resource hardening.** The node fan-out ships the cluster
+trusted-hop secret, so the target set is constrained before any request:
+
+- **Address allowlist (SSRF).** A brain-discovered `address` receives the secret
+  only when its host is loopback or ends in the in-cluster DNS suffix
+  (`FIDUCIA_NODE_HOST_SUFFIX`, default `.svc.cluster.local`); explicit
+  operator-provided `FIDUCIA_NODE_URLS` are trusted as-is. Hosts are parsed with
+  reqwest's own URL parser (no parser-differential), non-`http(s)` schemes are
+  rejected, and the suffix match is label-boundary anchored. A failing target is
+  never dialed — it renders as a distinct "untrusted address" state, so a
+  compromised or spoofed brain cannot harvest the secret to an arbitrary host.
+- **No redirects.** Both the node and brain HTTP clients set
+  `redirect::Policy::none()`. In-cluster hops are single calls; a `3xx` surfaces
+  as an error rather than being followed (reqwest resends custom headers such as
+  `x-fiducia-internal-auth` across redirects, so a cross-origin `Location` could
+  otherwise bounce the secret out).
+- **Body cap.** Every upstream body (node observe, brain status/config/policies,
+  Prometheus/Loki) is read through a running byte counter and aborted past
+  16 MiB, so an oversized response is an error observation, not an OOM — the
+  concurrent fan-out cannot be turned into a memory-exhaustion amplifier.
+- **Target cap.** The fan-out target list is truncated to 512 nodes (a
+  "targets truncated (showing 512 of N)" note is surfaced and logged), bounding
+  concurrency against a buggy or hostile membership snapshot.
+- **Error hygiene.** Upstream failures are normalized to a short class
+  (`timeout` / `unreachable` / `untrusted address` / `bad status: NNN` /
+  `oversized response`) before reaching `node_observations[].error` or a view
+  tooltip, so raw client errors never leak internal URLs. Split-brain
+  (two leaders for one shard) and a merely-unreachable leader are surfaced as
+  distinct signals rather than being masked by the shard merge.
 
 ## Run locally
 
@@ -145,6 +178,7 @@ Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-tel
 | `FIDUCIA_LOKI_URL` | string | no | Loki base URL (e.g. `http://dd-loki.observability.svc.cluster.local:3100`) for the Cluster Insight events panel. Optional. | events panel shows "not configured" |
 | `FIDUCIA_GRAFANA_PUBLIC_URL` | string | no | Public Grafana base URL or path prefix (e.g. `/telemetry`) for Explore deep links. Optional. | no deep-link buttons |
 | `FIDUCIA_NODE_URLS` | string | no | Comma-separated fiducia-node client-plane base URLs; overrides brain `/v1/nodes` discovery for the observe fan-out. Optional. | discover from `fiducia-brain` |
+| `FIDUCIA_NODE_HOST_SUFFIX` | string | no | In-cluster DNS suffix a brain-discovered node address must carry (or be loopback) before the fan-out dials it with the cluster secret (SSRF allowlist). Explicit `FIDUCIA_NODE_URLS` bypass it. | `.svc.cluster.local` |
 | `PORT` | integer | no | Listen port. | `8096` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | string | no | OpenTelemetry collector endpoint (optional). | telemetry off |
 | `TEST_DATABASE_URL` | string | **yes** (creds) | Postgres URL for the DB-backed integration test only; unset → that test skips. | — (tests only) |

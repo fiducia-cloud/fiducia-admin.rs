@@ -474,6 +474,8 @@ pub fn cluster_status_panel(
             div class="stat" {
                 div class="n" {
                     (gap_count("leaderless", quorum.leaderless.len() as u64, "#shard-table"))
+                    (gap_count("leader-unreached", quorum.leader_unreached.len() as u64, "#shard-table"))
+                    (gap_count("dual-leader", quorum.dual_leader.len() as u64, "#shard-table"))
                     (gap_count("at-risk", quorum.at_risk.len() as u64, "#shard-table"))
                     (gap_count("storage-faulted", quorum.storage_faulted.len() as u64, "#shard-table"))
                     (gap_count("unresponsive", quorum.unresponsive.len() as u64, "#shard-table"))
@@ -482,6 +484,12 @@ pub fn cluster_status_panel(
                     "raft quorum (observed from "
                     a href="#node-table" { (quorum.nodes_reporting) " of " (quorum.nodes_reporting + quorum.nodes_failed) " nodes" }
                     ")"
+                    @if let Some(total) = quorum.targets_truncated_from {
+                        " · "
+                        span class="tag tag--warn" {
+                            "targets truncated (showing " (crate::cluster_insight::MAX_NODES) " of " (total) ")"
+                        }
+                    }
                 }
             }
             div class="stat" {
@@ -526,7 +534,16 @@ pub fn cluster_status_panel(
                     @for shard in shards {
                         tr {
                             td { (shard.shard_id) }
-                            td { span class="tag" { (shard.view.role) } }
+                            td {
+                                span class="tag" { (shard.view.role) }
+                                @if shard.dual_leader {
+                                    " "
+                                    span class="tag tag--bad"
+                                        title="two nodes reported leadership for this shard (split-brain); the higher-term view is shown" {
+                                        "dual-leader"
+                                    }
+                                }
+                            }
                             td { (shard.view.leader_id.as_deref().unwrap_or("—")) }
                             td class="muted" { (shard.view.term) }
                             td class="muted" { (shard.view.commit_index) " / " (shard.view.last_applied) }
@@ -565,6 +582,13 @@ pub fn cluster_status_panel(
 /// the fan-out target set at all.
 fn observe_cell(observation: Option<&NodeObservation>) -> Markup {
     match observation {
+        // Refused before any request: a distinct state from unreachable (H1).
+        Some(observation) if observation.untrusted => html! {
+            span class="tag tag--warn"
+                title="brain-supplied address is not in-cluster; refused (never dialed with the cluster secret)" {
+                "untrusted address"
+            }
+        },
         Some(NodeObservation {
             shards: Some(shards),
             ..
@@ -774,15 +798,19 @@ mod tests {
             shard_id: 0,
             reported_by: "node-a".into(),
             leader_view: true,
+            dual_leader: false,
             view,
         }];
         let quorum = ClusterQuorum {
             leaderless: vec![],
+            leader_unreached: vec![],
+            dual_leader: vec![],
             at_risk: vec![0],
             storage_faulted: vec![0],
             unresponsive: vec![],
             nodes_reporting: 2,
             nodes_failed: 1,
+            targets_truncated_from: None,
         };
         let html = cluster_status_panel(
             &status,
@@ -820,6 +848,7 @@ mod tests {
             base_url: "http://10.0.0.1:8090".into(),
             shards: None,
             error: Some("connect timeout".into()),
+            untrusted: false,
         }];
         let html = cluster_nodes_panel(&nodes, &observations).into_string();
         assert!(html.contains(r#"id="node-table""#));
@@ -830,6 +859,80 @@ mod tests {
             "error carried in the tooltip"
         );
         assert!(html.contains("2 / 1"), "hosted / leading counts");
+    }
+
+    #[test]
+    fn cluster_nodes_panel_shows_untrusted_address_as_a_distinct_state() {
+        let nodes = vec![json!({
+            "node_id": "spoofed", "address": "attacker.example.com:8090", "health": "healthy",
+            "last_seen_ms": 1_752_400_000_000i64, "hosted_shards": [], "leading_shards": []
+        })];
+        let observations = vec![NodeObservation {
+            node_id: "spoofed".into(),
+            base_url: "http://attacker.example.com:8090".into(),
+            shards: None,
+            error: Some("untrusted address".into()),
+            untrusted: true,
+        }];
+        let html = cluster_nodes_panel(&nodes, &observations).into_string();
+        assert!(html.contains("untrusted address"), "distinct refused badge");
+        // It must not read as a mere transient reachability failure.
+        assert!(!html.contains(">unreachable<"));
+    }
+
+    #[test]
+    fn cluster_status_panel_flags_dual_leader_unreached_and_truncation() {
+        let status = json!({ "cluster_id": "fiducia-test", "version": "0.1.0" });
+        let leader_view: crate::cluster_insight::ShardView = serde_json::from_value(json!({
+            "shard_id": 0, "role": "leader", "term": 9, "leader_id": "node-b", "has_quorum": true
+        }))
+        .unwrap();
+        let follower_view: crate::cluster_insight::ShardView = serde_json::from_value(json!({
+            "shard_id": 1, "role": "follower", "term": 4, "leader_id": "node-z"
+        }))
+        .unwrap();
+        let shards = vec![
+            MergedShard {
+                shard_id: 0,
+                reported_by: "node-b".into(),
+                leader_view: true,
+                dual_leader: true,
+                view: leader_view,
+            },
+            MergedShard {
+                shard_id: 1,
+                reported_by: "node-a".into(),
+                leader_view: false,
+                dual_leader: false,
+                view: follower_view,
+            },
+        ];
+        let quorum = ClusterQuorum {
+            leaderless: vec![],
+            leader_unreached: vec![1],
+            dual_leader: vec![0],
+            at_risk: vec![],
+            storage_faulted: vec![],
+            unresponsive: vec![],
+            nodes_reporting: 2,
+            nodes_failed: 1,
+            targets_truncated_from: Some(900),
+        };
+        let html =
+            cluster_status_panel(&status, &shards, &quorum, &PromScrape::NotConfigured, None)
+                .into_string();
+        assert!(
+            html.contains("dual-leader"),
+            "split-brain badge + card count"
+        );
+        assert!(html.contains("1 leader-unreached"), "M5 bucket in the card");
+        assert!(html.contains("1 dual-leader"), "M4 count in the card");
+        assert!(
+            html.contains("targets truncated (showing 512 of 900)"),
+            "M3 truncation note"
+        );
+        // Shard 1 has a known leader_id, so it reads as "no leader report", not leaderless.
+        assert!(html.contains("no leader report"));
     }
 
     #[test]

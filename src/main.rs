@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         request_security,
         prometheus_url: optional_env("FIDUCIA_PROMETHEUS_URL"),
         loki_url: optional_env("FIDUCIA_LOKI_URL"),
-        grafana_public_url: optional_env("FIDUCIA_GRAFANA_PUBLIC_URL"),
+        grafana_public_url: validated_grafana_public_url()?,
         node_urls: csv_env("FIDUCIA_NODE_URLS"),
     });
 
@@ -202,6 +202,34 @@ fn optional_env(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Validate `FIDUCIA_GRAFANA_PUBLIC_URL` at startup (L8). The value becomes a
+/// clickable `href` on the cluster page, so it must be empty (feature off), an
+/// http(s):// URL, or a root-relative path (`/telemetry`) — never a
+/// `javascript:`/`data:` scheme or a protocol-relative `//host` that would
+/// navigate off-origin. A set-but-invalid value fails startup closed.
+fn validated_grafana_public_url() -> result::Result<Option<String>, io::Error> {
+    match optional_env("FIDUCIA_GRAFANA_PUBLIC_URL") {
+        None => Ok(None),
+        Some(value) if grafana_public_url_is_valid(&value) => Ok(Some(value)),
+        Some(value) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "FIDUCIA_GRAFANA_PUBLIC_URL must be an http(s):// URL or a root-relative \
+                 path starting with '/': got {value:?}"
+            ),
+        )),
+    }
+}
+
+fn grafana_public_url_is_valid(value: &str) -> bool {
+    let value = value.trim();
+    if value.starts_with("http://") || value.starts_with("https://") {
+        return true;
+    }
+    // Root-relative path only; reject protocol-relative `//host` (off-origin).
+    value.starts_with('/') && !value.starts_with("//")
 }
 
 /// Comma-separated optional list (`FIDUCIA_NODE_URLS`); blank entries dropped.
@@ -722,15 +750,19 @@ async fn cluster_data(st: &AppState) -> Result<ClusterData, Response> {
         .await
         .map_err(|err| upstream_error("brain_nodes_failed", "fiducia-brain", err))?;
     // Explicit FIDUCIA_NODE_URLS wins; otherwise dial the addresses the nodes
-    // heartbeat into the brain.
-    let targets = if st.node_urls.is_empty() {
-        cluster_insight::targets_from_brain_nodes(&nodes)
+    // heartbeat into the brain — trust-checked so a spoofed brain address can't
+    // harvest the cluster secret (H1) — and capped in count (M3).
+    let policy = cluster_insight::NodeHostPolicy::from_env();
+    let mut targets = if st.node_urls.is_empty() {
+        cluster_insight::targets_from_brain_nodes(&nodes, &policy)
     } else {
-        cluster_insight::explicit_node_targets(&st.node_urls)
+        cluster_insight::explicit_node_targets(&st.node_urls, &policy)
     };
+    let truncated_from = cluster_insight::truncate_targets(&mut targets);
     let observations = cluster_insight::observe_shards_fanout(&targets).await;
     let merged = cluster_insight::merge_shards(&observations);
-    let quorum = cluster_insight::cluster_quorum(&observations, &merged);
+    let mut quorum = cluster_insight::cluster_quorum(&observations, &merged);
+    quorum.targets_truncated_from = truncated_from;
     Ok(ClusterData {
         status,
         nodes,
@@ -759,7 +791,7 @@ async fn prom_scrape(st: &AppState) -> cluster_insight::PromScrape {
                 .count(),
         },
         Err(err) => cluster_insight::PromScrape::Error {
-            error: err.to_string(),
+            error: upstream::error_class(&*err),
         },
     }
 }
@@ -772,7 +804,7 @@ async fn loki_events(st: &AppState, since_minutes: i64) -> views::EventsPanel {
     };
     match cluster_insight::recent_cluster_events(url, since_minutes).await {
         Ok(events) => views::EventsPanel::Events(events),
-        Err(err) => views::EventsPanel::Error(err.to_string()),
+        Err(err) => views::EventsPanel::Error(upstream::error_class(&*err)),
     }
 }
 
@@ -968,15 +1000,17 @@ async fn cluster_metrics_api(State(st): State<Arc<AppState>>, headers: HeaderMap
     if let Err(response) = require_admin_api(&headers, &st).await {
         return response;
     }
-    let targets = if st.node_urls.is_empty() {
+    let policy = cluster_insight::NodeHostPolicy::from_env();
+    let mut targets = if st.node_urls.is_empty() {
         let nodes = match upstream::nodes(&st.brain_url).await {
             Ok(nodes) => nodes,
             Err(err) => return upstream_error("brain_nodes_failed", "fiducia-brain", err),
         };
-        cluster_insight::targets_from_brain_nodes(&nodes)
+        cluster_insight::targets_from_brain_nodes(&nodes, &policy)
     } else {
-        cluster_insight::explicit_node_targets(&st.node_urls)
+        cluster_insight::explicit_node_targets(&st.node_urls, &policy)
     };
+    let targets_truncated_from = cluster_insight::truncate_targets(&mut targets);
     let nodes = cluster_insight::observe_metrics_fanout(&targets).await;
     let prometheus_up_range = match &st.prometheus_url {
         None => Value::Null,
@@ -993,13 +1027,14 @@ async fn cluster_metrics_api(State(st): State<Arc<AppState>>, headers: HeaderMap
             {
                 Ok(series) => json!(series),
                 // The optional plane degrades in place, like the per-node errors.
-                Err(err) => json!({ "error": err.to_string() }),
+                Err(err) => json!({ "error": upstream::error_class(&*err) }),
             }
         }
     };
     Json(json!({
         "nodes": nodes,
         "prometheus_up_range": prometheus_up_range,
+        "targets_truncated_from": targets_truncated_from,
         "generated_at_ms": cluster_insight::now_ms(),
     }))
     .into_response()
@@ -2190,6 +2225,32 @@ mod auth_flow_tests {
     }
 
     #[test]
+    fn grafana_public_url_validation_rejects_dangerous_schemes() {
+        // Allowed: http(s) URLs and root-relative paths (deep-link prefixes).
+        assert!(grafana_public_url_is_valid("https://grafana.example.com"));
+        assert!(grafana_public_url_is_valid("http://dd-grafana:3000"));
+        assert!(grafana_public_url_is_valid("/telemetry"));
+        // Rejected: anything that could become a dangerous or off-origin href.
+        assert!(!grafana_public_url_is_valid("javascript:alert(1)"));
+        assert!(!grafana_public_url_is_valid(
+            "data:text/html,<script>1</script>"
+        ));
+        assert!(!grafana_public_url_is_valid("//evil.example.com"));
+        assert!(!grafana_public_url_is_valid("ftp://grafana"));
+        assert!(!grafana_public_url_is_valid("telemetry")); // not root-relative
+                                                            // A set-but-invalid value fails startup closed; unset stays a no-op.
+        std::env::set_var("FIDUCIA_GRAFANA_PUBLIC_URL", "javascript:alert(1)");
+        assert!(validated_grafana_public_url().is_err());
+        std::env::set_var("FIDUCIA_GRAFANA_PUBLIC_URL", "/telemetry");
+        assert_eq!(
+            validated_grafana_public_url().unwrap(),
+            Some("/telemetry".to_string())
+        );
+        std::env::remove_var("FIDUCIA_GRAFANA_PUBLIC_URL");
+        assert_eq!(validated_grafana_public_url().unwrap(), None);
+    }
+
+    #[test]
     fn insecure_cookie_escape_requires_an_explicit_truthy_value() {
         assert!(explicitly_enabled(Some("1")));
         assert!(explicitly_enabled(Some("true")));
@@ -2637,7 +2698,11 @@ mod cluster_tests {
         );
         assert_eq!(overview["quorum"]["nodes_reporting"], 1);
         assert_eq!(overview["quorum"]["nodes_failed"], 1);
-        assert_eq!(overview["quorum"]["leaderless"], json!([1]));
+        // Shard 1's leader is the *down* node: its follower row still knows a
+        // leader_id, so it is "leader unreached", never miscounted as leaderless
+        // during a partial-visibility incident (M5).
+        assert_eq!(overview["quorum"]["leaderless"], json!([]));
+        assert_eq!(overview["quorum"]["leader_unreached"], json!([1]));
         assert_eq!(overview["prometheus"]["state"], "up");
         assert_eq!(
             overview["prometheus"]["targets"], 2,
@@ -2769,6 +2834,173 @@ mod cluster_tests {
         assert!(html.contains("FIDUCIA_LOKI_URL"));
 
         auth_task.abort();
+    }
+
+    /// H1: the fan-out must (a) refuse a brain-supplied address that is not
+    /// in-cluster — never dialing it with the cluster secret — and (b) never
+    /// follow a redirect, so a trusted node that answers a cross-origin 302 can't
+    /// bounce the secret to an attacker's `Location`.
+    #[tokio::test]
+    async fn node_fanout_refuses_untrusted_addresses_and_never_follows_redirects() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        std::env::set_var("FIDUCIA_INTERNAL_SECRET", TEST_INTERNAL_SECRET);
+        let auth = Router::new().route(
+            "/v1/me",
+            get(|| async {
+                Json(json!({
+                    "user": { "user_id": "dev-admin", "email": "op@example.com", "roles": ["admin"] }
+                }))
+            }),
+        );
+        let (auth_url, auth_task) = spawn_mock(auth).await;
+
+        // A capture server standing in for the attacker's redirect target. It
+        // records any hit and whether the cluster secret rode along.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let leaked = Arc::new(AtomicBool::new(false));
+        let hits_handler = hits.clone();
+        let leaked_handler = leaked.clone();
+        let capture = Router::new().route(
+            "/leak",
+            get(move |headers: HeaderMap| {
+                let hits_handler = hits_handler.clone();
+                let leaked_handler = leaked_handler.clone();
+                async move {
+                    hits_handler.fetch_add(1, Ordering::SeqCst);
+                    if headers
+                        .get("x-fiducia-internal-auth")
+                        .and_then(|value| value.to_str().ok())
+                        == Some(TEST_INTERNAL_SECRET)
+                    {
+                        leaked_handler.store(true, Ordering::SeqCst);
+                    }
+                    StatusCode::OK
+                }
+            }),
+        );
+        let (capture_url, capture_task) = spawn_mock(capture).await;
+
+        // A trusted (loopback) node that answers observe with a cross-origin 302
+        // pointing at the capture server.
+        let leak_location = format!("{capture_url}/leak");
+        let redirect_node = Router::new().route(
+            "/v1/observe/shards",
+            get(move || {
+                let leak_location = leak_location.clone();
+                async move { (StatusCode::FOUND, [(LOCATION, leak_location)]).into_response() }
+            }),
+        );
+        let (redirect_url, redirect_task) = spawn_mock(redirect_node).await;
+        let redirect_address = redirect_url.trim_start_matches("http://").to_string();
+
+        let brain = Router::new()
+            .route(
+                "/v1/status",
+                get(|| async {
+                    Json(json!({
+                        "service": "fiducia-brain", "version": "0.1.0",
+                        "cluster_id": "fiducia-test", "shard_count": 0, "replication_factor": 3
+                    }))
+                }),
+            )
+            .route(
+                "/v1/nodes",
+                get(move || {
+                    let redirect_address = redirect_address.clone();
+                    async move {
+                        Json(json!({
+                            "nodes": [
+                                // Not loopback, not in-cluster: must be refused pre-request.
+                                { "node_id": "evil", "address": "attacker.example.com:8090", "health": "healthy" },
+                                // Loopback (trusted) but answers with a redirect.
+                                { "node_id": "redir", "address": redirect_address, "health": "healthy" }
+                            ]
+                        }))
+                    }
+                }),
+            );
+        let (brain_url, brain_task) = spawn_mock(brain).await;
+
+        let state = insight_state(auth_url, brain_url, None, None, None, Vec::new());
+        let response = get_with(
+            cluster_router(state),
+            "/api/admin/cluster/shards",
+            Some("verified.jwt"),
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "never a page failure");
+        let body = body_json(response).await;
+        let observations = body["node_observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 2);
+
+        let evil = observations
+            .iter()
+            .find(|o| o["node_id"] == "evil")
+            .unwrap();
+        assert_eq!(
+            evil["error"], "untrusted address",
+            "the out-of-cluster address is a distinct refused state"
+        );
+        assert_eq!(evil["untrusted"], true);
+
+        let redir = observations
+            .iter()
+            .find(|o| o["node_id"] == "redir")
+            .unwrap();
+        assert!(
+            redir["error"].as_str().unwrap().contains("302"),
+            "the 302 surfaces as an error, not followed: got {:?}",
+            redir["error"]
+        );
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the redirect was never followed"
+        );
+        assert!(
+            !leaked.load(Ordering::SeqCst),
+            "the cluster secret never reached the redirect target"
+        );
+
+        for task in [auth_task, brain_task, redirect_task, capture_task] {
+            task.abort();
+        }
+    }
+
+    /// M2: an upstream body past the cap is an error observation, not an OOM or a
+    /// panic — the fan-out reads with a running byte counter and aborts.
+    #[tokio::test]
+    async fn oversized_upstream_body_is_an_error_not_an_oom() {
+        std::env::set_var("FIDUCIA_INTERNAL_SECRET", TEST_INTERNAL_SECRET);
+        // Larger than upstream::MAX_UPSTREAM_BODY_BYTES (16 MiB).
+        let oversized = "x".repeat(17 * 1024 * 1024);
+        let node = Router::new().route(
+            "/v1/observe/shards",
+            get(move || {
+                let oversized = oversized.clone();
+                async move { oversized }
+            }),
+        );
+        let (node_url, node_task) = spawn_mock(node).await;
+
+        let targets = vec![cluster_insight::NodeTarget {
+            node_id: "big".into(),
+            base_url: node_url,
+            trusted: true,
+        }];
+        let observations = cluster_insight::observe_shards_fanout(&targets).await;
+        assert_eq!(observations.len(), 1);
+        assert!(observations[0].shards.is_none());
+        assert_eq!(
+            observations[0].error.as_deref(),
+            Some("oversized response"),
+            "the body cap is enforced as bytes arrive"
+        );
+
+        node_task.abort();
     }
 }
 

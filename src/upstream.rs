@@ -221,5 +221,8 @@ fn json_array(value: &Value, field: &str) -> UpstreamResult<Vec<Value>> {
 async fn get_json(
     request: reqwest::RequestBuilder,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(request.send().await?.error_for_status()?.json().await?)
+    // Status/redirect check and the 16 MiB body cap live in `send_capped` (M2);
+    // deserialize from the bounded buffer.
+    let body = send_capped(request).await?;
+    Ok(serde_json::from_slice(&body)?)
 }

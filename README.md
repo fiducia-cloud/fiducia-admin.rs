@@ -69,8 +69,7 @@ Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-tel
 | `PORT` | integer | no | Listen port. | `8096` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | string | no | OpenTelemetry collector endpoint (optional). | telemetry off |
 | `TEST_DATABASE_URL` | string | **yes** (creds) | Postgres URL for the DB-backed integration test only; unset → that test skips. | — (tests only) |
-| `FIDUCIA_ADMIN_DEV_SESSION` | bool | no | **INSECURE** — full auth bypass (`user`\|`admin` fabricated session). | unset (secure) |
-| `FIDUCIA_ALLOW_INSECURE_DEV_SESSION` | bool | no | **INSECURE** — forces the dev bypass ON in release builds. | off (secure) |
+| `FIDUCIA_ADMIN_DEV_SESSION` | bool | no | **INSECURE** — full auth bypass (`user`\|`admin` fabricated session); debug builds only, compiled out of release. | unset (secure) |
 | `FIDUCIA_INSECURE_COOKIES` | bool | no | **INSECURE** — drops `Secure` from the session cookie (plain-http dev). | off → cookie is `Secure` |
 
 ### ⚠️ Insecure-mode flags — MUST be OFF/unset in production

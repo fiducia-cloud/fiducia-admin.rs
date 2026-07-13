@@ -953,13 +953,13 @@ mod tests {
 
     #[test]
     fn relative_and_absolute_timestamps() {
-        let now = 1_752_400_681_123; // 2026-07-13T09:58:01.123Z
+        let now = 1_752_400_681_123; // 2025-07-13T09:58:01.123Z
         assert_eq!(relative_age(now - 2_000, now), "just now");
         assert_eq!(relative_age(now - 45_000, now), "45s ago");
         assert_eq!(relative_age(now - 150_000, now), "2m ago");
         assert_eq!(relative_age(now - 3 * 3_600_000, now), "3h ago");
         assert_eq!(relative_age(now - 3 * 86_400_000, now), "3d ago");
-        assert_eq!(utc_timestamp(now), "2026-07-13 09:58:01Z");
+        assert_eq!(utc_timestamp(now), "2025-07-13 09:58:01Z");
         assert_eq!(utc_timestamp(0), "1970-01-01 00:00:00Z");
         assert_eq!(utc_timestamp(951_868_800_000), "2000-03-01 00:00:00Z");
     }

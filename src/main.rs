@@ -2316,6 +2316,10 @@ mod db_tests {
             db: Some(db),
             stream_tx: broadcast::channel(4).0,
             request_security: test_request_security(),
+            prometheus_url: None,
+            loki_url: None,
+            grafana_public_url: None,
+            node_urls: Vec::new(),
         }
     }
 

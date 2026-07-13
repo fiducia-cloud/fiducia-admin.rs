@@ -159,13 +159,6 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
     session_cookie(headers)
 }
 
-/// The dev auth bypass is allowed only in debug builds, or when an operator
-/// explicitly opts in via `FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1`.
-fn dev_session_allowed() -> bool {
-    cfg!(debug_assertions)
-        || std::env::var("FIDUCIA_ALLOW_INSECURE_DEV_SESSION").as_deref() == Ok("1")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

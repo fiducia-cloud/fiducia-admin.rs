@@ -39,6 +39,10 @@ th{color:var(--dim);font-weight:600;font-size:.85rem}
 .btn--ghost{background:transparent;border:1px solid var(--line);color:var(--ink)}
 input,select{background:#0c1330;border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:.5rem .6rem;font:inherit}
 .muted{color:var(--dim)}.tag{font-size:.75rem;color:var(--dim);border:1px solid var(--line);border-radius:6px;padding:.05rem .4rem}
+.tag--ok{color:#6ee7b7;border-color:#166534}.tag--warn{color:#fcd34d;border-color:#854d0e}.tag--bad{color:#fca5a5;border-color:#991b1b}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:.8rem;margin:1rem 0}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:.8rem 1rem}
+.stat .n{font-size:1.35rem;font-weight:700}.stat .l{color:var(--dim);font-size:.8rem}
 "#;
 
 /// The signed-in identity label (email, else the user id).

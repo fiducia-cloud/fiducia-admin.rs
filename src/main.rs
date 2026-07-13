@@ -655,6 +655,17 @@ async fn scale(
     if let Err(error) = require_form_security(&headers, &st, &s, &form.csrf_token) {
         return request_security_error(error);
     }
+    // Validate the target BEFORE the audit write and the brain side effect. A
+    // `u32` above `i32::MAX` would otherwise wrap negative when persisted into the
+    // audit record's `i32` column, silently corrupting the durable record while
+    // the brain receives the un-wrapped value.
+    if !scale_target_is_valid(form.target_nodes) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_target_nodes", "min": MIN_SCALE_TARGET_NODES })),
+        )
+            .into_response();
+    }
     // Write the audit intent before the external side effect. An operator action
     // is never executed without a durable record.
     if let Err(err) = record_scale(&st, &s, form.target_nodes).await {

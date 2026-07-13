@@ -61,11 +61,9 @@ pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
             body {
                 nav class="nav" {
                     span class="brand" { "Fiducia" b { ".admin" } }
-                    @if let Some(s) = session {
+                    @if session.is_some() {
                         a href="/" { "Dashboard" }
-                        a href="/keys" { "API keys" }
-                        a href="/account" { "Account" }
-                        @if s.is_admin { a href="/infra" { "Infra" } }
+                        a href="/infra" { "Infra" }
                     } @else {
                         a href="/login" { "Sign in" }
                     }
@@ -73,7 +71,10 @@ pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
                     @if let Some(s) = session {
                         span class="who" {
                             (ident(s))
-                            @if s.is_admin { " · admin" }
+                            " · operator"
+                        }
+                        form method="post" action="/logout" style="margin:0" {
+                            button class="btn btn--ghost" type="submit" { "Sign out" }
                         }
                     }
                 }
@@ -119,7 +120,7 @@ pub fn forbidden(s: &Session) -> Markup {
     )
 }
 
-pub fn login() -> Markup {
+pub fn login(message: Option<&str>) -> Markup {
     page(
         "Sign in",
         None,
@@ -127,13 +128,18 @@ pub fn login() -> Markup {
             h1 { "Sign in" }
             div class="card" {
                 p class="muted" {
-                    "Authenticate with your Supabase account. The dashboard verifies the "
-                    "session via " code { "fiducia-auth" } "."
+                    "Authenticate with an operator Supabase account. " code { "fiducia-auth" }
+                    " verifies the session and trusted operator role before an admin cookie is issued."
                 }
                 form method="post" action="/login" {
-                    label { "Supabase access token" }
-                    input name="token" type="password" autocomplete="current-password" required;
+                    label { "Email" }
+                    input name="email" type="email" autocomplete="username" required;
+                    label { "Password" }
+                    input name="password" type="password" autocomplete="current-password" required;
                     button class="btn" { "Sign in" }
+                }
+                @if let Some(message) = message {
+                    p class="muted" role="alert" { (message) }
                 }
                 p class="muted" {
                     "For local development, " code { "FIDUCIA_ADMIN_DEV_SESSION=admin" }
@@ -153,177 +159,12 @@ pub fn dashboard(s: &Session) -> Markup {
             div class="card" {
                 h2 { "Welcome" }
                 p class="muted" {
-                    "Signed in as " b { (ident(s)) } ". Orgs: " (s.orgs.join(", ")) "."
+                    "Signed in as operator " b { (ident(s)) } "."
                 }
-                p { a href="/keys" { "Manage API keys →" } }
-                @if s.is_admin {
-                    p { a href="/infra" { "Cluster & infra ops →" } }
-                }
+                p { a href="/infra" { "Cluster & infra ops →" } }
             }
         },
     )
-}
-
-pub fn account(s: &Session) -> Markup {
-    page(
-        "Account",
-        Some(s),
-        html! {
-            h1 { "Account" }
-            div class="card" {
-                h2 { "Organization & members" }
-                p class="muted" {
-                    "Identity and organization membership come from the verified session."
-                }
-                @if s.orgs.is_empty() {
-                    p class="muted" { "No organizations are attached to this session." }
-                } @else {
-                    ul {
-                        @for org in &s.orgs { li { (org) } }
-                    }
-                }
-            }
-        },
-    )
-}
-
-// ---- API keys ---------------------------------------------------------------
-
-const SCOPE_OPTIONS: &[&str] = &[
-    "requests:write",
-    "locks:write",
-    "kv:read",
-    "kv:write",
-    "services:read",
-    "services:write",
-    "elections:write",
-    "cron:write",
-    "rate-limit:write",
-];
-
-/// The create-key form. Doubles as a no-JS `POST /keys` and, with htmx, swaps the
-/// refreshed keys panel in place (`#keys-panel`).
-fn create_key_form() -> Markup {
-    html! {
-        form method="post" action="/keys"
-            hx-post="/keys" hx-target="#keys-panel" hx-swap="innerHTML"
-            style="display:flex;gap:.6rem;flex-wrap:wrap" {
-            input name="name" placeholder="key name (e.g. prod-checkout)" required;
-            select name="scope" aria-label="Scope" {
-                @for scope in SCOPE_OPTIONS {
-                    option value=(scope) { (scope) }
-                }
-            }
-            select name="env" aria-label="Environment" {
-                option value="live" { "live" }
-                option value="test" { "test" }
-            }
-            button class="btn" type="submit" { "Create" }
-        }
-    }
-}
-
-pub fn keys(s: &Session, keys: &[Value]) -> Markup {
-    page(
-        "API keys",
-        Some(s),
-        html! {
-            h1 { "API keys" }
-            div class="card" {
-                h2 { "Create a key" }
-                (create_key_form())
-                p class="muted" { "The raw key is shown once on creation. Only its hash is stored." }
-            }
-            // htmx swap target: the create/revoke handlers return `keys_panel`.
-            div id="keys-panel" { (keys_panel(keys, None)) }
-        },
-    )
-}
-
-fn key_scopes(k: &Value) -> String {
-    k.get("scopes")
-        .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_else(|| "—".to_string())
-}
-
-fn key_row(k: &Value) -> Markup {
-    let key_id = k.get("key_id").and_then(Value::as_str).unwrap_or("");
-    html! {
-        tr {
-            td { (k.get("name").and_then(Value::as_str).unwrap_or("—")) }
-            td { span class="tag" { (k.get("env").and_then(Value::as_str).unwrap_or("live")) } }
-            td class="muted" { (if key_id.is_empty() { "—" } else { key_id }) }
-            td class="muted" { (key_scopes(k)) }
-            td {
-                form method="post" action=(format!("/keys/{key_id}/revoke"))
-                    hx-post=(format!("/keys/{key_id}/revoke")) hx-target="#keys-panel" hx-swap="innerHTML" {
-                    button class="btn btn--ghost" { "Revoke" }
-                }
-            }
-        }
-    }
-}
-
-/// The "Your keys" panel — an optional status banner (after a create/revoke)
-/// followed by the keys table. This is the htmx fragment the mutating handlers
-/// return, and it is also embedded on the full page.
-pub fn keys_panel(keys: &[Value], status: Option<Markup>) -> Markup {
-    html! {
-        @if let Some(status) = status { (status) }
-        div class="card" {
-            h2 { "Your keys" }
-            table {
-                tr { th { "Name" } th { "Env" } th { "Key ID" } th { "Scopes" } th {} }
-                @if keys.is_empty() {
-                    tr { td colspan="5" class="muted" {
-                        "No keys yet — create one above. (Live data comes from fiducia-auth.)"
-                    } }
-                } @else {
-                    @for k in keys { (key_row(k)) }
-                }
-            }
-        }
-    }
-}
-
-/// Fragment returned after a create. `created` is the upstream `fiducia-auth`
-/// response; when it carries a one-time raw secret we surface it, otherwise we
-/// confirm the submission (the E2E / dev path has no upstream to mint a secret).
-pub fn keys_after_create(name: &str, created: &Value, keys: &[Value]) -> Markup {
-    let secret = ["key", "secret", "raw", "token", "api_key"]
-        .iter()
-        .find_map(|f| created.get(*f).and_then(Value::as_str));
-    let status = html! {
-        div class="card" data-keys-status="" {
-            @match secret {
-                Some(sec) => {
-                    p { "Key " b { (name) } " created. Store this secret now — it is shown once:" }
-                    p { code { (sec) } }
-                }
-                None => {
-                    p { "Key " b { (name) } " submitted." }
-                }
-            }
-        }
-    };
-    keys_panel(keys, Some(status))
-}
-
-/// Fragment returned after a revoke.
-pub fn keys_after_revoke(revoked: bool, keys: &[Value]) -> Markup {
-    let status = html! {
-        div class="card" data-keys-status="" {
-            p { (if revoked { "Key revoked." } else { "Revoke request submitted." }) }
-        }
-    };
-    keys_panel(keys, Some(status))
 }
 
 // ---- Infra ------------------------------------------------------------------
@@ -422,42 +263,13 @@ mod tests {
         Session {
             user_id: "u".into(),
             email: Some("a@b.c".into()),
-            orgs: vec!["org".into()],
-            is_admin: false,
-            bearer_token: None,
+            is_admin: true,
         }
-    }
-
-    // The MASH "M" auto-escapes every interpolation, so a hostile key name must
-    // render inert (the old esc()-based guarantee, now enforced by Maud).
-    #[test]
-    fn key_names_are_escaped_in_the_table() {
-        let key_list = vec![json!({
-            "name": "<script>alert(1)</script>",
-            "env": "live",
-            "key_id": "abc123",
-        })];
-        let html = keys(&user(), &key_list).into_string();
-        assert!(
-            !html.contains("<script>alert(1)</script>"),
-            "raw payload leaked"
-        );
-        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
-    }
-
-    // A hostile key name routed through the htmx create fragment must also be
-    // escaped — the fragment path skips the full page but not Maud's escaping.
-    #[test]
-    fn create_fragment_escapes_key_name() {
-        let html = keys_after_create("<img src=x onerror=alert(1)>", &json!({}), &[]).into_string();
-        assert!(!html.contains("<img src=x onerror=alert(1)>"));
-        assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
     }
 
     #[test]
     fn dashboard_keeps_welcome_and_infra_link_for_admin() {
-        let mut admin = user();
-        admin.is_admin = true;
+        let admin = user();
         let html = dashboard(&admin).into_string();
         assert!(html.contains("Dashboard"));
         assert!(html.contains("Welcome"));
@@ -466,8 +278,7 @@ mod tests {
 
     #[test]
     fn infra_renders_scale_controls_and_recent_ops_when_present() {
-        let mut admin = user();
-        admin.is_admin = true;
+        let admin = user();
         let recent = vec![json!({
             "action": "scale",
             "target_nodes": 9,

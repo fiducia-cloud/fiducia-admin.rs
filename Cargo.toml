@@ -2,7 +2,7 @@
 name = "fiducia-admin"
 version = "0.1.0"
 edition = "2021"
-description = "Admin app for fiducia.cloud — server-rendered HTML dashboard for accounts/API keys (via fiducia-auth) and infra ops (via fiducia-brain)."
+description = "Operator-only admin app for fiducia.cloud infrastructure operations."
 
 [dependencies]
 # `ws` powers the admin-plane /admin/ws sync broadcast (P2).
@@ -27,25 +27,20 @@ fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.
 # the one source of truth for the types every fiducia service speaks.
 fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
 
-# Generated sqlx::FromRow row types for the ADMIN Postgres plane (its OWN DB, a
-# security boundary — never the customer DB). The infra_operations vertical
-# reads/writes these when DATABASE_URL is set.
-fiducia-interfaces-db = { path = "../fiducia-interfaces/generated/rust-db" }
-
 # The local-first sync protocol core (native build, no wasm). The admin server
 # builds its fiducia:sync change frames and write-acks from THESE types so it and
 # the @fiducia/sync browser client share one protocol definition (same as customer).
 fiducia-sync-core = { path = "../fiducia-sync" }
 
-# SQLx for the DB-backed infra_operations handlers (P2). Runtime-checked queries
-# (query_as, not the compile-time macros) so `cargo build` needs no live DB.
-sqlx = { version = "0.8", features = [
-    "postgres",
+# SeaORM owns the isolated admin-plane Postgres connection and all runtime CRUD.
+# Entities in src/entity mirror the canonical fiducia-interfaces admin schema.
+sea-orm = { version = "1.1", default-features = false, features = [
+    "sqlx-postgres",
     "runtime-tokio-rustls",
-    "uuid",
-    "chrono",
-    "json",
     "macros",
+    "with-uuid",
+    "with-chrono",
+    "with-json",
 ] }
 uuid = { version = "1", features = ["serde", "v4"] }
 

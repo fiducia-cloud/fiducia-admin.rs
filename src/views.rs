@@ -24,7 +24,7 @@ const CSS: &str = r#"
 a{color:#c4b5fd;text-decoration:none}a:hover{text-decoration:underline}
 .nav{display:flex;gap:1.2rem;align-items:center;padding:.9rem 1.4rem;border-bottom:1px solid var(--line);background:rgba(18,26,54,.6)}
 .brand{font-weight:700}.brand b{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
-.nav .sp{flex:1}.nav .who{color:var(--dim);font-size:.9rem}
+.nav .sp{flex:1}.nav .who{color:var(--dim);font-size:.9rem}.nav form{margin:0}
 .wrap{max-width:980px;margin:0 auto;padding:1.6rem 1.4rem}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:1.2rem 1.4rem;margin:1rem 0}
 h1{font-size:1.5rem;margin:.2rem 0 1rem}h2{font-size:1.1rem;margin:.2rem 0 .8rem}
@@ -75,6 +75,9 @@ pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
                             (ident(s))
                             @if s.is_admin { " · admin" }
                         }
+                        form method="post" action="/logout" {
+                            button class="btn btn--ghost" type="submit" { "Sign out" }
+                        }
                     }
                 }
                 div class="wrap" { (body) }
@@ -119,7 +122,7 @@ pub fn forbidden(s: &Session) -> Markup {
     )
 }
 
-pub fn login() -> Markup {
+pub fn login(error: Option<&str>) -> Markup {
     page(
         "Sign in",
         None,
@@ -130,9 +133,14 @@ pub fn login() -> Markup {
                     "Authenticate with your Supabase account. The dashboard verifies the "
                     "session via " code { "fiducia-auth" } "."
                 }
+                @if let Some(error) = error {
+                    p role="alert" { (error) }
+                }
                 form method="post" action="/login" {
-                    label { "Supabase access token" }
-                    input name="token" type="password" autocomplete="current-password" required;
+                    label { "Email" }
+                    input name="email" type="email" autocomplete="username" required;
+                    label { "Password" }
+                    input name="password" type="password" autocomplete="current-password" required;
                     button class="btn" { "Sign in" }
                 }
                 p class="muted" {
@@ -462,6 +470,16 @@ mod tests {
         assert!(html.contains("Dashboard"));
         assert!(html.contains("Welcome"));
         assert!(html.contains(r#"href="/infra""#));
+    }
+
+    #[test]
+    fn login_collects_credentials_without_exposing_token_paste() {
+        let html = login(Some("Invalid email or password.")).into_string();
+        assert!(html.contains(r#"name="email""#));
+        assert!(html.contains(r#"name="password""#));
+        assert!(html.contains("Invalid email or password."));
+        assert!(!html.contains(r#"name="token""#));
+        assert!(!html.contains("access token"));
     }
 
     #[test]

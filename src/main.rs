@@ -1,14 +1,13 @@
 //! fiducia-admin — the server-rendered admin dashboard (MASH: Maud + Axum + SQLx
 //! + HTMX).
 //!
-//! One web app, two role-gated areas:
-//!   * **everyone signed in** — account/org + API keys (data from `fiducia-auth`);
-//!   * **admins** — cluster & infra ops: scale, nodes, shard placement (via
-//!     `fiducia-brain`).
+//! Admin-only account context, API-key operations, and cluster/infra operations.
+//! Customer identities use the separate customer portal and cannot cross into
+//! this app without an independently configured admin role.
 //!
-//! Auth is a Supabase session (verified through `fiducia-auth`). This is the
-//! authenticated app — distinct from `fiducia-backend`, which serves the public
-//! marketing site.
+//! Login exchanges credentials with Supabase server-side, verifies the returned
+//! session through `fiducia-auth`, applies the admin allowlist, and stores it in
+//! an admin-only cookie.
 //!
 //! ADMIN plane isolation: when `DATABASE_URL` is set it points at the admin app's
 //! OWN Postgres (operators, infra_operations, admin_audit_log) — a separate
@@ -101,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/assets/htmx.min.js", get(htmx_js))
         .route("/assets/fiducia-sync.js", get(sync_js))
         .route("/login", get(login).post(login_submit))
+        .route("/logout", post(logout))
         .route("/", get(dashboard))
         .route("/account", get(account))
         .route("/keys", get(keys_page).post(create_key))
@@ -199,19 +199,85 @@ async fn require_admin(headers: &HeaderMap, st: &AppState) -> Result<Session, Re
 }
 
 async fn login() -> Markup {
-    views::login()
+    views::login(None)
 }
 
 #[derive(Debug, Deserialize)]
 struct LoginForm {
-    token: String,
+    email: String,
+    password: String,
 }
 
-async fn login_submit(Form(form): Form<LoginForm>) -> Response {
-    let token = form.token.trim();
-    if token.is_empty() {
-        return redirect("/login");
+#[derive(Debug, Deserialize)]
+struct SupabasePasswordSession {
+    access_token: String,
+    expires_in: u64,
+}
+
+async fn login_submit(State(st): State<Arc<AppState>>, Form(form): Form<LoginForm>) -> Response {
+    let email = form.email.trim();
+    if email.is_empty() || form.password.is_empty() {
+        return login_error("Email and password are required.");
     }
+
+    let Ok(supabase_url) = required_env("SUPABASE_URL") else {
+        return login_error("Admin login is not configured.");
+    };
+    let Ok(supabase_anon_key) = required_env("SUPABASE_ANON_KEY") else {
+        return login_error("Admin login is not configured.");
+    };
+    let token_url = format!(
+        "{}/auth/v1/token?grant_type=password",
+        supabase_url.trim_end_matches('/')
+    );
+    let response = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .and_then(|client| {
+            client
+                .post(token_url)
+                .header("apikey", supabase_anon_key)
+                .json(&json!({ "email": email, "password": form.password }))
+                .build()
+                .map(|request| (client, request))
+        }) {
+        Ok((client, request)) => client.execute(request).await,
+        Err(error) => {
+            tracing::error!(%error, "could not build Supabase admin login request");
+            return login_error("Login is temporarily unavailable.");
+        }
+    };
+    let response = match response {
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            tracing::info!(status = %response.status(), "Supabase rejected admin login");
+            return login_error("Invalid email or password.");
+        }
+        Err(error) => {
+            tracing::error!(%error, "Supabase admin login failed");
+            return login_error("Login is temporarily unavailable.");
+        }
+    };
+    let session = match response.json::<SupabasePasswordSession>().await {
+        Ok(session) if !session.access_token.is_empty() => session,
+        Ok(_) => return login_error("Supabase returned an invalid session."),
+        Err(error) => {
+            tracing::error!(%error, "could not decode Supabase admin session");
+            return login_error("Login is temporarily unavailable.");
+        }
+    };
+    let identity = match session::verify_token(&st.auth_url, &session.access_token).await {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(%error, "fiducia-auth rejected Supabase admin session");
+            return login_error("This account is not authorized for Fiducia.");
+        }
+    };
+    if !identity.is_admin {
+        tracing::warn!(user_id = %identity.user_id, "non-admin identity attempted admin login");
+        return login_error("Admin access is required.");
+    }
+
     // Security: the session cookie is HttpOnly + SameSite=Strict + Secure. `Secure`
     // means the cookie is only sent over HTTPS; gate it off with
     // FIDUCIA_INSECURE_COOKIES=1 for a plain-http local escape hatch. (Local dev
@@ -222,7 +288,10 @@ async fn login_submit(Form(form): Form<LoginForm>) -> Response {
     } else {
         "; Secure"
     };
-    let cookie = format!("fiducia_session={token}; Path=/; HttpOnly; SameSite=Strict{secure}");
+    let cookie = format!(
+        "fiducia_admin_session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        session.access_token, session.expires_in, secure
+    );
     (
         StatusCode::SEE_OTHER,
         [(LOCATION, "/".to_string()), (SET_COOKIE, cookie)],
@@ -230,22 +299,40 @@ async fn login_submit(Form(form): Form<LoginForm>) -> Response {
         .into_response()
 }
 
+fn login_error(message: &str) -> Response {
+    (StatusCode::UNAUTHORIZED, views::login(Some(message))).into_response()
+}
+
+async fn logout() -> Response {
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (LOCATION, "/login".to_string()),
+            (
+                SET_COOKIE,
+                "fiducia_admin_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".to_string(),
+            ),
+        ],
+    )
+        .into_response()
+}
+
 async fn dashboard(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match require(&headers, &st).await {
+    match require_admin(&headers, &st).await {
         Ok(s) => views::dashboard(&s).into_response(),
         Err(r) => r,
     }
 }
 
 async fn account(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match require(&headers, &st).await {
+    match require_admin(&headers, &st).await {
         Ok(s) => views::account(&s).into_response(),
         Err(r) => r,
     }
 }
 
 async fn keys_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let s = match require(&headers, &st).await {
+    let s = match require_admin(&headers, &st).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -270,7 +357,7 @@ async fn create_key(
     headers: HeaderMap,
     Form(form): Form<CreateKeyForm>,
 ) -> Response {
-    let s = match require(&headers, &st).await {
+    let s = match require_admin(&headers, &st).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -297,7 +384,7 @@ async fn revoke_key(
     headers: HeaderMap,
     Path(key_id): Path<String>,
 ) -> Response {
-    let s = match require(&headers, &st).await {
+    let s = match require_admin(&headers, &st).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -821,6 +908,103 @@ mod sync_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+#[cfg(test)]
+mod auth_flow_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn spawn_mock(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn login_exchanges_supabase_password_and_verifies_with_auth() {
+        let supabase = Router::new().route(
+            "/auth/v1/token",
+            post(|| async { Json(json!({ "access_token": "verified.jwt", "expires_in": 900 })) }),
+        );
+        let auth = Router::new().route(
+            "/v1/me",
+            get(|| async {
+                Json(json!({
+                    "user": {
+                        "user_id": "operator-1",
+                        "email": "operator@example.com",
+                        "orgs": ["org_admin"]
+                    }
+                }))
+            }),
+        );
+        let (supabase_url, supabase_task) = spawn_mock(supabase).await;
+        let (auth_url, auth_task) = spawn_mock(auth).await;
+        std::env::set_var("SUPABASE_URL", supabase_url);
+        std::env::set_var("SUPABASE_ANON_KEY", "public-anon-key");
+        std::env::set_var("FIDUCIA_ADMIN_ALL_USERS", "1");
+
+        let state = Arc::new(AppState {
+            auth_url,
+            brain_url: "http://localhost:8095".into(),
+            pool: None,
+            stream_tx: broadcast::channel(4).0,
+        });
+        let app = Router::new()
+            .route("/login", post(login_submit))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "email=operator%40example.com&password=correct-horse",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        std::env::remove_var("SUPABASE_URL");
+        std::env::remove_var("SUPABASE_ANON_KEY");
+        std::env::remove_var("FIDUCIA_ADMIN_ALL_USERS");
+        supabase_task.abort();
+        auth_task.abort();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(cookie.starts_with("fiducia_admin_session=verified.jwt;"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Secure"));
+    }
+
+    #[tokio::test]
+    async fn logout_expires_only_the_admin_cookie() {
+        let response = logout().await;
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(cookie.starts_with("fiducia_admin_session="));
+        assert!(cookie.contains("Max-Age=0"));
+        assert!(!cookie.contains("fiducia_session="));
     }
 }
 

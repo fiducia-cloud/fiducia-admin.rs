@@ -1,11 +1,12 @@
 //! Dashboard session handling.
 //!
 //! Admins/users log in through Supabase Auth in the browser; the Supabase access
-//! token rides in a cookie (`fiducia_session`) or an `Authorization: Bearer`
+//! token rides in an admin-only cookie (`fiducia_admin_session`) or an
+//! `Authorization: Bearer`
 //! header. On each request we verify it via `fiducia-auth`'s `GET /v1/me` (which
 //! already does offline Supabase JWT verification) and resolve the caller's
-//! org(s). `infra` pages require the `admin` role; account/key pages need any
-//! authenticated user.
+//! org(s). Every dashboard route requires the independently configured `admin`
+//! role; a valid customer identity alone is not sufficient.
 
 use axum::http::HeaderMap;
 use std::time::Duration;
@@ -26,7 +27,7 @@ pub struct Session {
 /// Resolve the session for a request, or `None` if not signed in.
 ///
 /// Tries real auth first — the bearer from the `Authorization` header or the
-/// `fiducia_session` cookie, verified with `fiducia-auth` `GET /v1/me` — and only
+/// `fiducia_admin_session` cookie, verified with `fiducia-auth` `GET /v1/me` — and only
 /// then falls back to the dev bypass.
 ///
 /// A dev bypass (`FIDUCIA_ADMIN_DEV_SESSION=user|admin`) lets you click through
@@ -37,15 +38,13 @@ pub struct Session {
 /// production can't silently hand out admin.
 pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
     if let Some(token) = bearer_token(headers) {
-        match current_from_auth(auth_url, &token).await {
+        match verify_token(auth_url, &token).await {
             Ok(session) => return Some(session),
             Err(err) => {
-                tracing::debug!(error = %err, "fiducia-auth rejected dashboard session");
+                tracing::debug!(error = %err, "fiducia-auth rejected admin session");
             }
         }
     }
-
-
     let role = std::env::var("FIDUCIA_ADMIN_DEV_SESSION").ok()?;
 
     if !dev_session_allowed() {
@@ -93,7 +92,7 @@ struct AuthUser {
     orgs: Vec<String>,
 }
 
-async fn current_from_auth(auth_url: &str, token: &str) -> Result<Session, reqwest::Error> {
+pub async fn verify_token(auth_url: &str, token: &str) -> Result<Session, reqwest::Error> {
     let url = format!("{}/v1/me", auth_url.trim_end_matches('/'));
     let user = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -128,7 +127,7 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
             let Some((name, cookie_value)) = part.trim().split_once('=') else {
                 continue;
             };
-            if name == "fiducia_session" && !cookie_value.trim().is_empty() {
+            if name == "fiducia_admin_session" && !cookie_value.trim().is_empty() {
                 return Some(cookie_value.trim().to_string());
             }
         }
@@ -137,7 +136,7 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Pull the bearer token from the `Authorization` header, else fall back to the
-/// `fiducia_session` cookie — so both browser (cookie) and API (header) callers
+/// `fiducia_admin_session` cookie — so both browser (cookie) and API (header) callers
 /// work, as the module contract promises.
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     if let Some(jwt) = headers
@@ -215,7 +214,7 @@ mod tests {
 
     #[test]
     fn bearer_token_falls_back_to_session_cookie() {
-        let h = headers_with("cookie", "other=1; fiducia_session=xyz; more=2");
+        let h = headers_with("cookie", "other=1; fiducia_admin_session=xyz; more=2");
         assert_eq!(bearer_token(&h).as_deref(), Some("xyz"));
     }
 
@@ -236,24 +235,30 @@ mod tests {
     }
 
     #[test]
-    fn session_cookie_reads_fiducia_session_from_cookie_header() {
+    fn session_cookie_reads_admin_session_from_cookie_header() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "cookie",
-            HeaderValue::from_static("theme=dark; fiducia_session=jwt.123; other=x"),
+            HeaderValue::from_static("theme=dark; fiducia_admin_session=jwt.123; other=x"),
         );
 
         assert_eq!(session_cookie(&headers).as_deref(), Some("jwt.123"));
     }
 
     #[test]
-    fn session_cookie_ignores_empty_fiducia_session_values() {
+    fn session_cookie_ignores_empty_admin_session_values() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "cookie",
-            HeaderValue::from_static("fiducia_session= ; theme=dark"),
+            HeaderValue::from_static("fiducia_admin_session= ; theme=dark"),
         );
 
+        assert_eq!(session_cookie(&headers), None);
+    }
+
+    #[test]
+    fn session_cookie_ignores_customer_session_cookie() {
+        let headers = headers_with("cookie", "fiducia_session=customer.jwt");
         assert_eq!(session_cookie(&headers), None);
     }
 
@@ -263,7 +268,7 @@ mod tests {
         headers.append("cookie", HeaderValue::from_static("theme=dark"));
         headers.append(
             "cookie",
-            HeaderValue::from_static("fiducia_session=jwt.456"),
+            HeaderValue::from_static("fiducia_admin_session=jwt.456"),
         );
 
         assert_eq!(session_cookie(&headers).as_deref(), Some("jwt.456"));

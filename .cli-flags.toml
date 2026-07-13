@@ -29,6 +29,30 @@ aliases = ["brain-url"]
 type = "string"
 help = "Brain service base URL."
 
+[flags.prometheus-url]
+env = "FIDUCIA_PROMETHEUS_URL"
+aliases = ["prometheus-url"]
+type = "string"
+help = "Prometheus base URL for the Cluster Insight summary probe (optional)."
+
+[flags.loki-url]
+env = "FIDUCIA_LOKI_URL"
+aliases = ["loki-url"]
+type = "string"
+help = "Loki base URL for the Cluster Insight events panel (optional)."
+
+[flags.grafana-public-url]
+env = "FIDUCIA_GRAFANA_PUBLIC_URL"
+aliases = ["grafana-public-url"]
+type = "string"
+help = "Public Grafana base URL or path prefix used for Explore deep links (optional)."
+
+[flags.node-urls]
+env = "FIDUCIA_NODE_URLS"
+aliases = ["node-urls"]
+type = "string"
+help = "Comma-separated fiducia-node base URLs; overrides brain-based node discovery (optional)."
+
 [flags.admin-origin]
 env = "FIDUCIA_ADMIN_ORIGIN"
 aliases = ["admin-origin"]

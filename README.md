@@ -36,6 +36,9 @@ canonical `Host`, and writes reject a supplied non-admin `Origin`.
 | `POST /logout` | clear the admin-only session cookie |
 | `GET /` | operator dashboard |
 | `GET /infra` · `POST /infra/scale` | cluster operations |
+| `GET /cluster` | cluster insight page (summary, shards, nodes, events) |
+| `GET /cluster/{shards,nodes,events}` | polled htmx fragments (full page without `HX-Request`) |
+| `GET /api/admin/cluster/{overview,shards,events,metrics}` | cluster insight as JSON for bearer/API callers |
 | `GET /api/admin/sync/{table}?cursor=N&limit=M` | ordered catch-up changes (`changes`, `next_cursor`, `has_more`) |
 | `POST /api/admin/sync/{table}` | version-CAS mutation with mandatory `Idempotency-Key` |
 | `GET /admin/ws` | authorized admin-plane realtime stream |
@@ -46,10 +49,66 @@ canonical `Host`, and writes reject a supplied non-admin `Origin`.
 | File | Responsibility |
 |------|----------------|
 | `src/main.rs` | routes + role gating (`require` / `require_admin`) |
+| `src/cluster_insight.rs` | Cluster Insight clients: node observe fan-out, Loki event extraction, Prometheus queries |
 | `src/entity/` | SeaORM models for the isolated admin Postgres schema |
 | `src/views.rs` | server-rendered HTML templates |
 | `src/session.rs` | Supabase session + trusted-role resolution through `fiducia-auth` |
 | `src/upstream.rs` | operator-only HTTP calls to `fiducia-brain` |
+
+## Cluster insight
+
+`GET /cluster` is the read-only observability page for the coordination plane.
+It renders three panels that poll their own htmx fragment endpoints
+(`/cluster/shards` and `/cluster/nodes` every 5 s, `/cluster/events` every
+15 s; each fragment route serves the full page to non-htmx requests, exactly
+like the infra pattern). The same data is served as JSON under
+`/api/admin/cluster/*` for bearer/API callers.
+
+**Data sources** (all fetched per request; nothing is cached or persisted):
+
+- **fiducia-brain** — `GET /v1/status` feeds the summary cards (cluster id,
+  shard count × RF, placement generation, brain leader/HA/availability, node
+  counts by health, placement gaps); `GET /v1/nodes` feeds the node registry
+  table and, by default, node discovery. The overview API additionally returns
+  `/v1/config` and `/v1/policies`. All brain calls present
+  `FIDUCIA_INTERNAL_SECRET` in the `x-fiducia-internal-auth` trusted-hop header.
+- **fiducia-node** — `GET /v1/observe/shards` and `GET /v1/observe/metrics`,
+  fanned out **concurrently to every node** with a 3 s per-node timeout. These
+  two paths are exempt from the node's org-scope middleware (they are node
+  introspection with no tenant state — see fiducia-node `org_scope::is_exempt`),
+  so the calls need only the internal-auth header, no `x-fiducia-org-id`.
+  A down node never breaks the page: its fetch error is carried per node into
+  the tables and the JSON (`node_observations[].error`). Per-shard rows are
+  merged across all nodes' reports with the **leader's view winning** per shard
+  (only the leader knows per-peer replication lag and quorum).
+- **Loki** (optional, `FIDUCIA_LOKI_URL`) — the events panel runs one
+  `query_range` over `{namespace="fiducia"}` with line filters, then parses
+  each JSON log line in Rust (fiducia-telemetry's tracing JSON layer flattens
+  event fields to the top level) and classifies raft leader transfers,
+  elections/step-downs, check-quorum step-downs, brain membership changes
+  (registered/draining/dead), and placement (re)assignments into typed events.
+  `?since_minutes=` is clamped to `[1, 1440]`, default 30.
+- **Prometheus** (optional, `FIDUCIA_PROMETHEUS_URL`) — the summary card runs
+  the instant query `up{namespace="fiducia"}` and counts up targets (an empty
+  result renders as a count of 0, since scrape config is deployment-specific);
+  the metrics API adds a 15-minute range of the same query.
+- **Grafana** (optional, `FIDUCIA_GRAFANA_PUBLIC_URL`) — when set, the events
+  panel and the Prometheus card render best-effort Grafana Explore deep links
+  with the exact LogQL/PromQL prefilled.
+
+Node discovery: `FIDUCIA_NODE_URLS` (comma-separated base URLs) wins when set;
+otherwise targets come from the brain's `/v1/nodes` — each node's heartbeated
+`address` (`host:port`), normalized to `http://` when no scheme is given.
+
+**Security posture:** every cluster page, fragment, and `/api/admin/cluster/*`
+route sits behind the same operator gate as the rest of the app
+(`require_admin` for HTML, `require_admin_api` for JSON: verified operator role
+**and** enabled operator registry row). All routes are read-only GETs — no
+mutation, no CSRF surface. The brain and node calls carry
+`FIDUCIA_INTERNAL_SECRET`; Prometheus and Loki are unauthenticated in-cluster
+services, which is why their URLs are optional, operator-supplied
+configuration and their query results are rendered (HTML-escaped by Maud) but
+never executed or persisted.
 
 ## Run locally
 
@@ -82,6 +141,10 @@ Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-tel
 | `SUPABASE_PUBLISHABLE_KEY` | string | no | Browser-safe Supabase publishable key used by the server-mediated password exchange. | — (required) |
 | `FIDUCIA_ADMIN_ORIGIN` | origin | no | Exact public admin origin used for `Host`/`Origin` enforcement (scheme + authority only); release builds require HTTPS. | debug: `http://127.0.0.1:$PORT`; release: required |
 | `FIDUCIA_ADMIN_CSRF_SECRET` | string | **yes** | HMAC key for credential-bound CSRF tokens; at least 32 bytes. Required in release builds. | debug-only fixed key; release: required |
+| `FIDUCIA_PROMETHEUS_URL` | string | no | Prometheus base URL (e.g. `http://dd-prometheus.observability.svc.cluster.local:9090`) for the Cluster Insight summary probe. Optional. | insight card shows "not configured" |
+| `FIDUCIA_LOKI_URL` | string | no | Loki base URL (e.g. `http://dd-loki.observability.svc.cluster.local:3100`) for the Cluster Insight events panel. Optional. | events panel shows "not configured" |
+| `FIDUCIA_GRAFANA_PUBLIC_URL` | string | no | Public Grafana base URL or path prefix (e.g. `/telemetry`) for Explore deep links. Optional. | no deep-link buttons |
+| `FIDUCIA_NODE_URLS` | string | no | Comma-separated fiducia-node client-plane base URLs; overrides brain `/v1/nodes` discovery for the observe fan-out. Optional. | discover from `fiducia-brain` |
 | `PORT` | integer | no | Listen port. | `8096` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | string | no | OpenTelemetry collector endpoint (optional). | telemetry off |
 | `TEST_DATABASE_URL` | string | **yes** (creds) | Postgres URL for the DB-backed integration test only; unset → that test skips. | — (tests only) |
@@ -137,9 +200,10 @@ Hardening in place (verified this audit):
   writes, and WebSocket handshakes reject sibling origins. Form and sync writes
   additionally require a constant-time-verified HMAC token bound to the exact
   verified credential; canonical-host checks also cover bearer API writes.
-- **Complete route gate.** Dashboard, infra, sync catch-up/write, and WebSocket
-  handshake paths all enforce the operator role. Customer account/API-key routes
-  are not compiled into this service.
+- **Complete route gate.** Dashboard, infra, cluster insight (page, fragments,
+  and JSON), sync catch-up/write, and WebSocket handshake paths all enforce the
+  operator role. Customer account/API-key routes are not compiled into this
+  service.
 - **Templating.** All HTML is rendered with Maud, which HTML-escapes every
   dynamic interpolation by construction (stored-XSS defense, covered by tests).
 - **Persistence.** SeaORM owns the Postgres connection and all application CRUD

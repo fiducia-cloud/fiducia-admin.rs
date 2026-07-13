@@ -15,6 +15,7 @@
 //! customer database, and startup fails closed when the admin DB is unavailable.
 
 mod entity;
+mod request_security;
 mod session;
 mod upstream;
 mod views;
@@ -27,25 +28,27 @@ use std::{io, result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Form, Path, Query, State,
+        Form, Path, Query, Request, State,
     },
     http::{
         header::{CONTENT_TYPE, LOCATION, SET_COOKIE},
-        HeaderMap, StatusCode,
+        HeaderMap, HeaderName, HeaderValue, StatusCode,
     },
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use fiducia_sync_core::{ChangeEvent, ChangeOp, WriteAck};
-use maud::Markup;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, DatabaseConnection,
-    DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    DatabaseTransaction, DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    TransactionTrait,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 use tower_http::{
     catch_panic::CatchPanicLayer, limit::RequestBodyLimitLayer, timeout::TimeoutLayer,
@@ -55,7 +58,8 @@ use uuid::Uuid;
 
 use entity::{infra_operations, operators, sync_idempotency_keys};
 use infra_operations::Model as InfraOperationsRow;
-use session::Session;
+use request_security::{RequestSecurity, RequestSecurityError};
+use session::{Session, ADMIN_SESSION_COOKIE, LOGIN_CSRF_COOKIE};
 
 const SERVICE: &str = "fiducia-admin";
 
@@ -63,6 +67,9 @@ const SERVICE: &str = "fiducia-admin";
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Cap request bodies (HTML form posts are tiny).
 const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Bound attacker-controlled idempotency/echo keys before persisting them.
+const MAX_WRITE_KEY_BYTES: usize = 256;
+const CSRF_HEADER: &str = "x-fiducia-csrf";
 
 /// The vendored htmx bundle, compiled into the binary and served same-origin at
 /// `/assets/htmx.min.js`. No CDN — the dashboard (and the offline E2E) get htmx
@@ -83,14 +90,21 @@ struct AppState {
     db: Option<DatabaseConnection>,
     /// Fans `fiducia:sync` frames out to `/admin/ws` subscribers.
     stream_tx: broadcast::Sender<String>,
+    /// Exact canonical admin origin + credential-bound CSRF signer.
+    request_security: RequestSecurity,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fiducia_telemetry::init(SERVICE);
 
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8096);
     let db = connect_admin_db().await?;
     required_env("FIDUCIA_INTERNAL_SECRET")?;
+    let request_security = RequestSecurity::from_env(port)?;
     let (stream_tx, _) = broadcast::channel::<String>(256);
 
     let state = Arc::new(AppState {
@@ -100,6 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         supabase_publishable_key: required_env("SUPABASE_PUBLISHABLE_KEY")?,
         db: Some(db),
         stream_tx,
+        request_security,
     });
 
     let app = Router::new()
@@ -117,17 +132,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/admin/sync/:table", post(sync_write).get(sync_catchup))
         .route("/admin/ws", get(admin_ws))
         .with_state(state)
-        // Hardening stack (outermost last): catch handler panics → 500, bound
-        // request time, and cap body size.
+        // Hardening stack (outermost last): catch handler panics → 500, cap
+        // request time/body size, and attach security headers to every response
+        // those inner layers produce (including their error responses).
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
-        .layer(CatchPanicLayer::new());
+        .layer(CatchPanicLayer::new())
+        .layer(middleware::from_fn(security_headers));
 
-    let port: u16 = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8096);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("{SERVICE} listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -184,22 +197,111 @@ fn is_htmx(headers: &HeaderMap) -> bool {
     headers.contains_key("hx-request")
 }
 
+fn csrf_token(st: &AppState, session: &Session) -> String {
+    st.request_security.csrf_token(session.csrf_binding())
+}
+
+fn request_security_error(error: RequestSecurityError) -> Response {
+    tracing::warn!(reason = error.code(), "rejected untrusted admin request");
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "admin_request_rejected", "reason": error.code() })),
+    )
+        .into_response()
+}
+
+fn require_form_security(
+    headers: &HeaderMap,
+    st: &AppState,
+    session: &Session,
+    provided_csrf: &str,
+) -> Result<(), RequestSecurityError> {
+    st.request_security
+        .require_same_origin(headers)
+        .and_then(|()| {
+            st.request_security
+                .verify_csrf_token(session.csrf_binding(), provided_csrf)
+        })
+}
+
+fn require_sync_write_security(
+    headers: &HeaderMap,
+    st: &AppState,
+    session: &Session,
+) -> Result<(), RequestSecurityError> {
+    if session.is_browser_session() {
+        st.request_security.require_same_origin(headers)?;
+        let provided = headers
+            .get(CSRF_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        st.request_security
+            .verify_csrf_token(session.csrf_binding(), provided)
+    } else {
+        // Explicit bearer callers are not ambient-cookie CSRF targets. They may
+        // omit Origin, but still cannot address the service through another Host.
+        st.request_security.require_api_host(headers)
+    }
+}
+
+/// Response-side clickjacking and cross-origin form defenses. Request-side
+/// Origin/Host/CSRF checks live beside each authenticated mutation below.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let sensitive_response =
+        !request.uri().path().starts_with("/assets/") && request.uri().path() != "/healthz";
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    if sensitive_response {
+        headers.insert(
+            HeaderName::from_static("cache-control"),
+            HeaderValue::from_static("no-store"),
+        );
+    }
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(
+            "frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'",
+        ),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
 /// Require any signed-in user, else redirect to /login.
 async fn require(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {
-    session::current(headers, &st.auth_url)
+    let session = session::current(headers, &st.auth_url)
         .await
-        .ok_or_else(|| redirect("/login"))
+        .ok_or_else(|| redirect("/login"))?;
+    st.request_security
+        .require_host(headers)
+        .map_err(request_security_error)?;
+    Ok(session)
 }
 
 /// Require the admin role, else 403.
 async fn require_admin(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {
     let s = require(headers, st).await?;
     if !s.is_admin {
-        return Err((StatusCode::FORBIDDEN, views::forbidden(&s)).into_response());
+        let csrf = csrf_token(st, &s);
+        return Err((StatusCode::FORBIDDEN, views::forbidden(&s, Some(&csrf))).into_response());
     }
     match operator_is_enabled(st, &s).await {
         Ok(true) => Ok(s),
-        Ok(false) => Err((StatusCode::FORBIDDEN, views::forbidden(&s)).into_response()),
+        Ok(false) => {
+            let csrf = csrf_token(st, &s);
+            Err((StatusCode::FORBIDDEN, views::forbidden(&s, Some(&csrf))).into_response())
+        }
         Err(error) => Err(dependency_error("operator_registry_unavailable", error)),
     }
 }
@@ -243,10 +345,11 @@ async fn enabled_operator(
         .filter(operators::Column::Disabled.eq(false))
         .one(db)
         .await?;
-    Ok(
-        operator
-            .filter(|operator| matches!(operator.role.as_str(), "owner" | "admin" | "operator")),
-    )
+    Ok(operator.filter(|operator| operator_registry_role_allows_access(&operator.role)))
+}
+
+fn operator_registry_role_allows_access(role: &str) -> bool {
+    matches!(role, "owner" | "admin" | "operator")
 }
 
 async fn operator_is_enabled(st: &AppState, session: &Session) -> Result<bool, DbErr> {
@@ -256,12 +359,13 @@ async fn operator_is_enabled(st: &AppState, session: &Session) -> Result<bool, D
     Ok(enabled_operator(st, session).await?.is_some())
 }
 
-async fn login() -> Markup {
-    views::login(None)
+async fn login(State(st): State<Arc<AppState>>) -> Response {
+    login_page(&st, None)
 }
 
 #[derive(Debug, Deserialize)]
 struct LoginForm {
+    csrf_token: String,
     email: String,
     password: String,
 }
@@ -271,10 +375,17 @@ struct SupabasePasswordSession {
     access_token: String,
 }
 
-async fn login_submit(State(st): State<Arc<AppState>>, Form(form): Form<LoginForm>) -> Response {
+async fn login_submit(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    if let Err(error) = require_login_security(&headers, &st, &form.csrf_token) {
+        return request_security_error(error);
+    }
     let email = form.email.trim();
     if email.is_empty() || form.password.is_empty() {
-        return views::login(Some("Email and password are required.")).into_response();
+        return login_page(&st, Some("Email and password are required."));
     }
 
     let token_url = format!(
@@ -299,7 +410,7 @@ async fn login_submit(State(st): State<Arc<AppState>>, Form(form): Form<LoginFor
         Err(error) => return upstream_error("supabase_login_failed", "supabase", error),
     };
     if !response.status().is_success() {
-        return views::login(Some("Supabase rejected those credentials.")).into_response();
+        return login_page(&st, Some("Supabase rejected those credentials."));
     }
     let password_session = match response.json::<SupabasePasswordSession>().await {
         Ok(session) => session,
@@ -307,52 +418,149 @@ async fn login_submit(State(st): State<Arc<AppState>>, Form(form): Form<LoginFor
     };
     let Some(session) = session::from_bearer(&st.auth_url, &password_session.access_token).await
     else {
-        return views::login(Some("The identity could not be verified.")).into_response();
+        return login_page(&st, Some("The identity could not be verified."));
     };
     if !session.is_admin {
-        return (StatusCode::FORBIDDEN, views::forbidden(&session)).into_response();
+        return (StatusCode::FORBIDDEN, views::forbidden(&session, None)).into_response();
     }
     match operator_is_enabled(&st, &session).await {
         Ok(true) => {}
-        Ok(false) => return (StatusCode::FORBIDDEN, views::forbidden(&session)).into_response(),
+        Ok(false) => {
+            return (StatusCode::FORBIDDEN, views::forbidden(&session, None)).into_response()
+        }
         Err(error) => return dependency_error("operator_registry_unavailable", error),
     }
 
-    let cookie = make_session_cookie(&password_session.access_token);
-    (
-        StatusCode::SEE_OTHER,
-        [(LOCATION, "/".to_string()), (SET_COOKIE, cookie)],
+    let mut response = redirect("/");
+    append_set_cookie(
+        &mut response,
+        &make_session_cookie(&password_session.access_token),
+    );
+    append_set_cookie(&mut response, &clear_login_csrf_cookie());
+    response
+}
+
+fn login_page(st: &AppState, message: Option<&str>) -> Response {
+    let nonce = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let binding = format!("login\0{nonce}");
+    let csrf = st.request_security.csrf_token(&binding);
+    let mut response = views::login(message, &csrf).into_response();
+    append_set_cookie(&mut response, &make_login_csrf_cookie(&nonce));
+    response
+}
+
+fn require_login_security(
+    headers: &HeaderMap,
+    st: &AppState,
+    provided_csrf: &str,
+) -> Result<(), RequestSecurityError> {
+    st.request_security.require_same_origin(headers)?;
+    let nonce = session::cookie_value(headers, LOGIN_CSRF_COOKIE)
+        .ok_or(RequestSecurityError::InvalidCsrfToken)?;
+    st.request_security
+        .verify_csrf_token(&format!("login\0{nonce}"), provided_csrf)
+}
+
+fn append_set_cookie(response: &mut Response, cookie: &str) {
+    response.headers_mut().append(
+        SET_COOKIE,
+        HeaderValue::from_str(cookie).expect("server-generated cookie is a valid header value"),
+    );
+}
+
+fn explicitly_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+}
+
+const fn cookie_secure_suffix_for(
+    release_hardened: bool,
+    insecure_http_explicitly_enabled: bool,
+) -> &'static str {
+    if release_hardened || !insecure_http_explicitly_enabled {
+        "; Secure"
+    } else {
+        ""
+    }
+}
+
+/// Debug builds may opt into plain-HTTP cookies for local development. Release
+/// binaries always emit `Secure`, even if a stale environment variable remains.
+#[cfg(debug_assertions)]
+fn cookie_secure_suffix() -> &'static str {
+    cookie_secure_suffix_for(
+        false,
+        explicitly_enabled(std::env::var("FIDUCIA_INSECURE_COOKIES").ok().as_deref()),
     )
-        .into_response()
+}
+
+#[cfg(not(debug_assertions))]
+fn cookie_secure_suffix() -> &'static str {
+    let insecure_requested =
+        explicitly_enabled(std::env::var("FIDUCIA_INSECURE_COOKIES").ok().as_deref());
+    if insecure_requested {
+        tracing::error!(
+            "FIDUCIA_INSECURE_COOKIES is set but IGNORED: release builds always emit Secure cookies"
+        );
+    }
+    cookie_secure_suffix_for(true, insecure_requested)
+}
+
+fn make_login_csrf_cookie(nonce: &str) -> String {
+    format!(
+        "{LOGIN_CSRF_COOKIE}={nonce}; Path=/; HttpOnly; SameSite=Strict; Max-Age=600{}",
+        cookie_secure_suffix()
+    )
+}
+
+fn clear_login_csrf_cookie() -> String {
+    format!(
+        "{LOGIN_CSRF_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        cookie_secure_suffix()
+    )
 }
 
 fn make_session_cookie(token: &str) -> String {
-    let secure = if std::env::var("FIDUCIA_INSECURE_COOKIES").as_deref() == Ok("1") {
-        ""
-    } else {
-        "; Secure"
-    };
-    format!("fiducia_admin_session={token}; Path=/; HttpOnly; SameSite=Strict{secure}")
+    format!(
+        "{ADMIN_SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict{}",
+        cookie_secure_suffix()
+    )
 }
 
-async fn logout() -> Response {
-    let secure = if std::env::var("FIDUCIA_INSECURE_COOKIES").as_deref() == Ok("1") {
-        ""
-    } else {
-        "; Secure"
-    };
-    let cookie =
-        format!("fiducia_admin_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{secure}");
-    (
-        StatusCode::SEE_OTHER,
-        [(LOCATION, "/login".to_string()), (SET_COOKIE, cookie)],
+fn clear_session_cookie() -> String {
+    format!(
+        "{ADMIN_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        cookie_secure_suffix()
     )
-        .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CsrfForm {
+    csrf_token: String,
+}
+
+async fn logout(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let session = match require(&headers, &st).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_form_security(&headers, &st, &session, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    let mut response = redirect("/login");
+    append_set_cookie(&mut response, &clear_session_cookie());
+    response
 }
 
 async fn dashboard(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     match require_admin(&headers, &st).await {
-        Ok(s) => views::dashboard(&s).into_response(),
+        Ok(s) => {
+            let csrf = csrf_token(&st, &s);
+            views::dashboard(&s, &csrf).into_response()
+        }
         Err(r) => r,
     }
 }
@@ -374,11 +582,13 @@ async fn infra_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         Ok(rows) => rows,
         Err(err) => return dependency_error("infra_audit_read_failed", err),
     };
-    views::infra(&s, &nodes, &placement, &recent).into_response()
+    let csrf = csrf_token(&st, &s);
+    views::infra(&s, &csrf, &nodes, &placement, &recent).into_response()
 }
 
 #[derive(Debug, Deserialize)]
 struct ScaleForm {
+    csrf_token: String,
     target_nodes: u32,
 }
 
@@ -391,6 +601,9 @@ async fn scale(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if let Err(error) = require_form_security(&headers, &st, &s, &form.csrf_token) {
+        return request_security_error(error);
+    }
     // Write the audit intent before the external side effect. An operator action
     // is never executed without a durable record.
     if let Err(err) = record_scale(&st, &s, form.target_nodes).await {
@@ -451,7 +664,15 @@ async fn record_scale(
     target_nodes: u32,
 ) -> Result<InfraOperationsRow, DbErr> {
     let db = st.db.as_ref().ok_or_else(database_unavailable)?;
-    let operator_id = enabled_operator(st, s).await?.map(|operator| operator.id);
+    let operator_id = match enabled_operator(st, s).await? {
+        Some(operator) => Some(operator.id),
+        None if cfg!(debug_assertions) && s.user_id == "dev-admin" => None,
+        None => {
+            return Err(DbErr::Custom(
+                "operator registry authorization changed before audit write".to_string(),
+            ))
+        }
+    };
     let row = infra_operations::ActiveModel {
         operator_id: Set(operator_id),
         action: Set("scale".to_string()),
@@ -462,7 +683,7 @@ async fn record_scale(
     }
     .insert(db)
     .await?;
-    broadcast_infra_change(st, &row);
+    broadcast_infra_change(st, &row, None);
     Ok(row)
 }
 
@@ -474,6 +695,12 @@ struct SyncWriteRequest {
     op: Option<String>,
     #[serde(default)]
     payload: Option<Value>,
+    #[serde(default)]
+    base_version: Option<i64>,
+    /// Client-minted durable identity used for both HTTP idempotency and exact
+    /// realtime echo matching. Older clients may omit it.
+    #[serde(default)]
+    key: Option<String>,
 }
 
 /// The @fiducia/sync write path, generic in `{table}` (only `infra_operations` is
@@ -487,30 +714,22 @@ async fn sync_write(
     headers: HeaderMap,
     Json(req): Json<SyncWriteRequest>,
 ) -> Response {
-    if let Err(response) = require_admin_api(&headers, &st).await {
-        return response;
+    let session = match require_admin_api(&headers, &st).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_sync_write_security(&headers, &st, &session) {
+        return request_security_error(error);
     }
-    let idem_key = headers
-        .get("idempotency-key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    if let Some(key) = &idem_key {
-        match idempotency_begin(&st, key).await {
-            Ok(Idem::Replay(v)) => return ack(&req.id, v),
-            Ok(Idem::InFlight) => {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "error": "idempotency_in_flight" })),
-                )
-                    .into_response()
-            }
-            Ok(Idem::Proceed) => {}
-            Err(err) => return dependency_error("idempotency_claim_failed", err),
+    let idem_key = match validated_write_key(&headers, &req) {
+        Ok(key) => key,
+        Err(error) => return write_key_error(error),
+    };
+    let fingerprint = sync_write_fingerprint(&session, &table, &req);
+    let outcome = match table.as_str() {
+        "infra_operations" => {
+            sync_write_infra_operations(&st, &req, idem_key.as_deref(), &fingerprint).await
         }
-    }
-
-    let committed = match table.as_str() {
-        "infra_operations" => sync_write_infra_operations_row(&st, &req).await,
         _ => {
             return (
                 StatusCode::NOT_FOUND,
@@ -519,31 +738,155 @@ async fn sync_write(
                 .into_response()
         }
     };
-    let version = match committed {
-        Ok(version) => version,
-        Err(SyncWriteError::InvalidId) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid_row_id" })),
-            )
-                .into_response()
+    match outcome {
+        Ok(SyncWriteOutcome::Replay(version)) => ack(&req.id, version),
+        Ok(SyncWriteOutcome::Committed(row)) => {
+            // Publish only after the row update and idempotency outcome commit
+            // together. A websocket echo must never expose a rolled-back write.
+            broadcast_infra_change(&st, &row, idem_key.as_deref());
+            ack(&req.id, row.version)
         }
-        Err(SyncWriteError::NotFound) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "row_not_found" })),
-            )
-                .into_response()
-        }
-        Err(SyncWriteError::Database(err)) => return dependency_error("sync_write_failed", err),
-    };
+        Err(SyncWriteError::InvalidId) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_row_id" })),
+        )
+            .into_response(),
+        Err(SyncWriteError::InvalidOperation) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_sync_operation" })),
+        )
+            .into_response(),
+        Err(SyncWriteError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "row_not_found" })),
+        )
+            .into_response(),
+        Err(SyncWriteError::IdempotencyInFlight) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "idempotency_in_flight" })),
+        )
+            .into_response(),
+        Err(SyncWriteError::IdempotencyMismatch) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "idempotency_key_reused" })),
+        )
+            .into_response(),
+        Err(SyncWriteError::Database(err)) => dependency_error("sync_write_failed", err),
+    }
+}
 
-    if let Some(key) = &idem_key {
-        if let Err(err) = idempotency_commit(&st, key, version).await {
-            return dependency_error("idempotency_commit_failed", err);
+/// Reconcile the HTTP Idempotency-Key with the same durable key carried in the
+/// queued-write body. Canonical clients send both. A mismatch is rejected: the
+/// server must never persist under one identity and publish a different one as
+/// the purported own-echo token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteKeyError {
+    Invalid,
+    Mismatch,
+}
+
+fn validated_write_key(
+    headers: &HeaderMap,
+    request: &SyncWriteRequest,
+) -> Result<Option<String>, WriteKeyError> {
+    let mut header_values = headers.get_all("idempotency-key").iter();
+    let header_key = match header_values.next() {
+        Some(value) => Some(value.to_str().map_err(|_| WriteKeyError::Invalid)?),
+        None => None,
+    };
+    if header_values.next().is_some() {
+        return Err(WriteKeyError::Invalid);
+    }
+    let body_key = request.key.as_deref();
+
+    for key in [header_key, body_key].into_iter().flatten() {
+        if key.is_empty()
+            || key.len() > MAX_WRITE_KEY_BYTES
+            || !key.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(WriteKeyError::Invalid);
         }
     }
-    ack(&req.id, version)
+    if let (Some(header_key), Some(body_key)) = (header_key, body_key) {
+        if header_key != body_key {
+            return Err(WriteKeyError::Mismatch);
+        }
+    }
+
+    Ok(header_key.or(body_key).map(str::to_owned))
+}
+
+fn write_key_error(error: WriteKeyError) -> Response {
+    let code = match error {
+        WriteKeyError::Invalid => "invalid_write_key",
+        WriteKeyError::Mismatch => "write_key_mismatch",
+    };
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": code }))).into_response()
+}
+
+/// Bind an idempotency key to the full semantic write identity. Object keys are
+/// hashed in sorted order so harmless JSON field reordering does not turn an
+/// exact retry into a mismatch.
+fn sync_write_fingerprint(session: &Session, table: &str, request: &SyncWriteRequest) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fiducia-admin-sync-write-v1\0");
+    fingerprint_field(&mut hasher, session.user_id.as_bytes());
+    fingerprint_field(&mut hasher, table.as_bytes());
+    fingerprint_field(&mut hasher, request.id.as_bytes());
+    let operation = request.op.as_deref().unwrap_or("upsert");
+    fingerprint_field(&mut hasher, operation.as_bytes());
+    match request.base_version {
+        Some(version) => {
+            hasher.update([1]);
+            hasher.update(version.to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    if operation == "delete" {
+        fingerprint_json(&mut hasher, &Value::Null);
+    } else if let Some(payload) = &request.payload {
+        fingerprint_json(&mut hasher, payload);
+    } else {
+        fingerprint_json(&mut hasher, &json!({}));
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn fingerprint_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn fingerprint_json(hasher: &mut Sha256, value: &Value) {
+    match value {
+        Value::Null => hasher.update([0]),
+        Value::Bool(value) => hasher.update([1, u8::from(*value)]),
+        Value::Number(value) => {
+            hasher.update([2]);
+            fingerprint_field(hasher, value.to_string().as_bytes());
+        }
+        Value::String(value) => {
+            hasher.update([3]);
+            fingerprint_field(hasher, value.as_bytes());
+        }
+        Value::Array(values) => {
+            hasher.update([4]);
+            hasher.update((values.len() as u64).to_be_bytes());
+            for value in values {
+                fingerprint_json(hasher, value);
+            }
+        }
+        Value::Object(values) => {
+            hasher.update([5]);
+            hasher.update((values.len() as u64).to_be_bytes());
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            for (key, value) in entries {
+                fingerprint_field(hasher, key.as_bytes());
+                fingerprint_json(hasher, value);
+            }
+        }
+    }
 }
 
 /// Idempotency decision for a claimed/seen key.
@@ -553,11 +896,17 @@ enum Idem {
     Proceed,
 }
 
-/// Begin idempotent handling in the durable admin ledger.
-async fn idempotency_begin(st: &AppState, key: &str) -> Result<Idem, DbErr> {
-    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
+/// Claim an idempotency key inside the SAME transaction as the protected row
+/// update. A concurrent duplicate blocks on the unique key and then observes the
+/// committed outcome; a failed owner rolls back both its claim and mutation.
+async fn idempotency_claim(
+    transaction: &DatabaseTransaction,
+    key: &str,
+    request_fingerprint: &str,
+) -> Result<Idem, SyncWriteError> {
     let claimed = sync_idempotency_keys::Entity::insert(sync_idempotency_keys::ActiveModel {
         key: Set(key.to_string()),
+        request_fingerprint: Set(Some(request_fingerprint.to_string())),
         ..Default::default()
     })
     .on_conflict(
@@ -565,34 +914,71 @@ async fn idempotency_begin(st: &AppState, key: &str) -> Result<Idem, DbErr> {
             .do_nothing()
             .to_owned(),
     )
-    .exec_without_returning(db)
-    .await?;
+    .exec_without_returning(transaction)
+    .await
+    .map_err(SyncWriteError::Database)?;
     if claimed > 0 {
         return Ok(Idem::Proceed);
     }
-    Ok(
-        match sync_idempotency_keys::Entity::find_by_id(key)
-            .one(db)
-            .await?
-            .and_then(|record| record.committed_version)
-        {
-            Some(version) => Idem::Replay(version),
-            None => Idem::InFlight,
-        },
+    let record = sync_idempotency_keys::Entity::find_by_id(key)
+        .one(transaction)
+        .await
+        .map_err(SyncWriteError::Database)?
+        .ok_or_else(|| {
+            SyncWriteError::Database(DbErr::Custom(
+                "idempotency key disappeared after unique-key conflict".to_string(),
+            ))
+        })?;
+    idempotency_decision(
+        record.request_fingerprint.as_deref(),
+        record.committed_version,
+        request_fingerprint,
     )
 }
 
-/// Record the committed version for `key` in the durable admin ledger.
-async fn idempotency_commit(st: &AppState, key: &str, version: i64) -> Result<(), DbErr> {
-    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
-    sync_idempotency_keys::Entity::update_many()
+fn idempotency_decision(
+    stored_fingerprint: Option<&str>,
+    committed_version: Option<i64>,
+    request_fingerprint: &str,
+) -> Result<Idem, SyncWriteError> {
+    let Some(stored_fingerprint) = stored_fingerprint else {
+        // A pre-upgrade row cannot prove which request it protected. Replaying
+        // its version for an arbitrary new payload would turn an old key into a
+        // confused-deputy acknowledgement, so require the caller to mint a new
+        // key instead.
+        return Err(SyncWriteError::IdempotencyMismatch);
+    };
+    if stored_fingerprint != request_fingerprint {
+        return Err(SyncWriteError::IdempotencyMismatch);
+    }
+    Ok(match committed_version {
+        Some(version) => Idem::Replay(version),
+        None => Idem::InFlight,
+    })
+}
+
+/// Complete the claimed key in the surrounding row-mutation transaction.
+async fn idempotency_complete(
+    transaction: &DatabaseTransaction,
+    key: &str,
+    request_fingerprint: &str,
+    version: i64,
+) -> Result<(), SyncWriteError> {
+    let result = sync_idempotency_keys::Entity::update_many()
         .col_expr(
             sync_idempotency_keys::Column::CommittedVersion,
             Expr::value(version),
         )
         .filter(sync_idempotency_keys::Column::Key.eq(key))
-        .exec(db)
-        .await?;
+        .filter(sync_idempotency_keys::Column::RequestFingerprint.eq(request_fingerprint))
+        .exec(transaction)
+        .await
+        .map_err(SyncWriteError::Database)?;
+    if result.rows_affected != 1 {
+        return Err(SyncWriteError::Database(DbErr::Custom(
+            "idempotency completion did not update its claimed key".to_string(),
+        )));
+    }
     Ok(())
 }
 
@@ -647,27 +1033,87 @@ fn ack(id: &str, committed_version: i64) -> Response {
     .into_response()
 }
 
+#[derive(Debug)]
+enum SyncWriteOutcome {
+    Replay(i64),
+    Committed(Box<InfraOperationsRow>),
+}
+
+#[derive(Debug)]
 enum SyncWriteError {
     InvalidId,
+    InvalidOperation,
     NotFound,
+    IdempotencyInFlight,
+    IdempotencyMismatch,
     Database(DbErr),
 }
 
-/// Persist one queued optimistic write to `infra_operations`, broadcasting the
-/// committed change. The BEFORE UPDATE trigger bumps `version`.
-async fn sync_write_infra_operations_row(
+/// Persist one queued optimistic write and its idempotency result atomically.
+/// The BEFORE UPDATE trigger bumps `version`; websocket publication happens in
+/// the caller only after this transaction has committed.
+async fn sync_write_infra_operations(
     st: &AppState,
     req: &SyncWriteRequest,
-) -> Result<i64, SyncWriteError> {
+    write_key: Option<&str>,
+    request_fingerprint: &str,
+) -> Result<SyncWriteOutcome, SyncWriteError> {
     let db = st
         .db
         .as_ref()
         .ok_or_else(|| SyncWriteError::Database(database_unavailable()))?;
     let id = Uuid::parse_str(&req.id).map_err(|_| SyncWriteError::InvalidId)?;
     let op = req.op.as_deref().unwrap_or("upsert");
+    if !matches!(op, "upsert" | "delete") {
+        return Err(SyncWriteError::InvalidOperation);
+    }
+
+    let transaction = db.begin().await.map_err(SyncWriteError::Database)?;
+    let outcome = sync_write_infra_operations_in_transaction(
+        &transaction,
+        req,
+        id,
+        op,
+        write_key,
+        request_fingerprint,
+    )
+    .await;
+    match outcome {
+        Ok(outcome) => {
+            transaction
+                .commit()
+                .await
+                .map_err(SyncWriteError::Database)?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            transaction
+                .rollback()
+                .await
+                .map_err(SyncWriteError::Database)?;
+            Err(error)
+        }
+    }
+}
+
+async fn sync_write_infra_operations_in_transaction(
+    transaction: &DatabaseTransaction,
+    req: &SyncWriteRequest,
+    id: Uuid,
+    op: &str,
+    write_key: Option<&str>,
+    request_fingerprint: &str,
+) -> Result<SyncWriteOutcome, SyncWriteError> {
+    if let Some(key) = write_key {
+        match idempotency_claim(transaction, key, request_fingerprint).await? {
+            Idem::Replay(version) => return Ok(SyncWriteOutcome::Replay(version)),
+            Idem::InFlight => return Err(SyncWriteError::IdempotencyInFlight),
+            Idem::Proceed => {}
+        }
+    }
 
     let current = infra_operations::Entity::find_by_id(id)
-        .one(db)
+        .one(transaction)
         .await
         .map_err(SyncWriteError::Database)?
         .ok_or(SyncWriteError::NotFound)?;
@@ -712,9 +1158,14 @@ async fn sync_write_infra_operations_row(
         }
     }
 
-    let row = active.update(db).await.map_err(SyncWriteError::Database)?;
-    broadcast_infra_change(st, &row);
-    Ok(row.version)
+    let row = active
+        .update(transaction)
+        .await
+        .map_err(SyncWriteError::Database)?;
+    if let Some(key) = write_key {
+        idempotency_complete(transaction, key, request_fingerprint, row.version).await?;
+    }
+    Ok(SyncWriteOutcome::Committed(Box::new(row)))
 }
 
 /// Load one bounded, monotonic catch-up page through the ORM.
@@ -754,7 +1205,7 @@ fn upstream_error(code: &str, dependency: &str, error: impl std::fmt::Display) -
 
 /// Broadcast a single infra_operations upsert as a `fiducia:sync` frame, built from
 /// the shared fiducia-sync-core ChangeEvent so server and client agree on one shape.
-fn broadcast_infra_change(st: &AppState, row: &InfraOperationsRow) {
+fn broadcast_infra_change(st: &AppState, row: &InfraOperationsRow, write_key: Option<&str>) {
     let change = ChangeEvent {
         table: "infra_operations".to_string(),
         op: ChangeOp::Upsert,
@@ -762,6 +1213,7 @@ fn broadcast_infra_change(st: &AppState, row: &InfraOperationsRow) {
         version: row.version,
         row: serde_json::to_value(row).unwrap_or_default(),
         at_ms: unix_epoch_ms() as i64,
+        write_key: write_key.map(str::to_owned),
     };
     let frame = json!({ "event": "fiducia:sync", "changes": [change] });
     let _ = st.stream_tx.send(frame.to_string());
@@ -783,6 +1235,9 @@ async fn admin_ws(
 ) -> Response {
     if let Err(response) = require_admin_api(&headers, &st).await {
         return response;
+    }
+    if let Err(error) = st.request_security.require_same_origin(&headers) {
+        return request_security_error(error);
     }
     let rx = st.stream_tx.subscribe();
     ws.on_upgrade(move |socket| admin_ws_stream(socket, rx))
@@ -814,13 +1269,22 @@ async fn admin_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<Stri
 }
 
 #[cfg(test)]
+fn test_request_security() -> RequestSecurity {
+    RequestSecurity::new(
+        "https://admin.fiducia.cloud",
+        b"0123456789abcdef0123456789abcdef".to_vec(),
+    )
+    .unwrap()
+}
+
+#[cfg(test)]
 mod sync_tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
-    fn test_state() -> Arc<AppState> {
+    pub(super) fn test_state() -> Arc<AppState> {
         Arc::new(AppState {
             auth_url: "http://localhost:8097".into(),
             brain_url: "http://localhost:8095".into(),
@@ -828,6 +1292,7 @@ mod sync_tests {
             supabase_publishable_key: "test-publishable-key".into(),
             db: None,
             stream_tx: broadcast::channel(16).0,
+            request_security: test_request_security(),
         })
     }
 
@@ -886,13 +1351,138 @@ mod sync_tests {
         assert!(String::from_utf8_lossy(&bytes).contains("FiduciaSyncAdmin"));
     }
 
-    #[tokio::test]
-    async fn idempotency_requires_the_durable_ledger() {
-        assert!(
-            idempotency_begin(&test_state(), "infra_operations:op1:upsert:7")
-                .await
-                .is_err()
+    #[test]
+    fn durable_write_key_must_match_header_and_body() {
+        let request = SyncWriteRequest {
+            id: "op1".into(),
+            op: Some("upsert".into()),
+            payload: None,
+            base_version: Some(7),
+            key: Some("write-key-1".into()),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", HeaderValue::from_static("write-key-1"));
+        assert_eq!(
+            validated_write_key(&headers, &request).unwrap().as_deref(),
+            Some("write-key-1")
         );
+
+        headers.insert("idempotency-key", HeaderValue::from_static("write-key-2"));
+        assert!(validated_write_key(&headers, &request).is_err());
+
+        headers.append("idempotency-key", HeaderValue::from_static("write-key-1"));
+        assert_eq!(
+            validated_write_key(&headers, &request),
+            Err(WriteKeyError::Invalid)
+        );
+
+        let invalid_body = SyncWriteRequest {
+            key: Some("not a header-safe key".into()),
+            ..request
+        };
+        assert_eq!(
+            validated_write_key(&HeaderMap::new(), &invalid_body),
+            Err(WriteKeyError::Invalid)
+        );
+    }
+
+    #[test]
+    fn legacy_keyless_and_body_only_keyed_writes_remain_supported() {
+        let mut request = SyncWriteRequest {
+            id: "op1".into(),
+            op: Some("upsert".into()),
+            payload: None,
+            base_version: Some(7),
+            key: None,
+        };
+        assert_eq!(
+            validated_write_key(&HeaderMap::new(), &request).unwrap(),
+            None
+        );
+
+        request.key = Some("body-only-key".into());
+        assert_eq!(
+            validated_write_key(&HeaderMap::new(), &request)
+                .unwrap()
+                .as_deref(),
+            Some("body-only-key")
+        );
+    }
+
+    #[test]
+    fn write_fingerprint_is_canonical_and_binds_every_semantic_identity() {
+        let session = Session::test_admin_bearer("operator-a", "verified.jwt");
+        let first = SyncWriteRequest {
+            id: "00000000-0000-0000-0000-000000000001".into(),
+            op: Some("upsert".into()),
+            payload: Some(
+                serde_json::from_str(r#"{"status":"applied","target_nodes":7}"#).unwrap(),
+            ),
+            base_version: Some(4),
+            key: Some("write-key-1".into()),
+        };
+        let reordered = SyncWriteRequest {
+            payload: Some(
+                serde_json::from_str(r#"{"target_nodes":7,"status":"applied"}"#).unwrap(),
+            ),
+            ..SyncWriteRequest {
+                id: first.id.clone(),
+                op: first.op.clone(),
+                payload: None,
+                base_version: first.base_version,
+                key: first.key.clone(),
+            }
+        };
+        let fingerprint = sync_write_fingerprint(&session, "infra_operations", &first);
+        assert_eq!(fingerprint.len(), 64);
+        assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            fingerprint,
+            sync_write_fingerprint(&session, "infra_operations", &reordered)
+        );
+
+        let changed_payload = SyncWriteRequest {
+            payload: Some(json!({ "status": "failed", "target_nodes": 7 })),
+            ..reordered
+        };
+        assert_ne!(
+            fingerprint,
+            sync_write_fingerprint(&session, "infra_operations", &changed_payload)
+        );
+        assert_ne!(
+            fingerprint,
+            sync_write_fingerprint(
+                &Session::test_admin_bearer("operator-b", "verified.jwt"),
+                "infra_operations",
+                &first,
+            )
+        );
+        assert_ne!(
+            fingerprint,
+            sync_write_fingerprint(&session, "other_table", &first)
+        );
+    }
+
+    #[test]
+    fn replay_requires_the_original_fingerprint() {
+        assert!(matches!(
+            idempotency_decision(Some("fingerprint-a"), Some(8), "fingerprint-a"),
+            Ok(Idem::Replay(8))
+        ));
+        assert!(matches!(
+            idempotency_decision(Some("fingerprint-a"), Some(8), "fingerprint-b"),
+            Err(SyncWriteError::IdempotencyMismatch)
+        ));
+        // A completed pre-upgrade record has no reconstructable fingerprint;
+        // fail closed rather than acknowledge an unprovable request.
+        assert!(matches!(
+            idempotency_decision(None, Some(8), "fingerprint-a"),
+            Err(SyncWriteError::IdempotencyMismatch)
+        ));
+        assert!(matches!(
+            idempotency_decision(Some("fingerprint-a"), None, "fingerprint-a"),
+            Ok(Idem::InFlight)
+        ));
     }
 }
 
@@ -941,7 +1531,12 @@ mod auth_flow_tests {
             supabase_publishable_key: "public-publishable-key".into(),
             db: None,
             stream_tx: broadcast::channel(4).0,
+            request_security: test_request_security(),
         });
+        let login_nonce = "registry-test-login-nonce";
+        let login_csrf = state
+            .request_security
+            .csrf_token(&format!("login\0{login_nonce}"));
         let app = Router::new()
             .route("/login", post(login_submit))
             .with_state(state);
@@ -950,10 +1545,14 @@ mod auth_flow_tests {
                 Request::builder()
                     .method("POST")
                     .uri("/login")
+                    .header("host", "admin.fiducia.cloud")
+                    .header("origin", "https://admin.fiducia.cloud")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("cookie", format!("{LOGIN_CSRF_COOKIE}={login_nonce}"))
                     .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-                    .body(Body::from(
-                        "email=operator%40example.com&password=correct-horse",
-                    ))
+                    .body(Body::from(format!(
+                        "csrf_token={login_csrf}&email=operator%40example.com&password=correct-horse"
+                    )))
                     .unwrap(),
             )
             .await
@@ -966,19 +1565,195 @@ mod auth_flow_tests {
         assert!(response.headers().get(SET_COOKIE).is_none());
     }
 
-    #[tokio::test]
-    async fn logout_expires_only_the_admin_cookie() {
-        let response = logout().await;
-        let cookie = response
-            .headers()
-            .get(SET_COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert!(cookie.starts_with("fiducia_admin_session="));
+    #[test]
+    fn logout_expires_only_the_admin_cookie() {
+        let cookie = clear_session_cookie();
+        assert!(cookie.starts_with(&format!("{ADMIN_SESSION_COOKIE}=")));
         assert!(cookie.contains("Max-Age=0"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Path=/"));
+        assert!(!cookie.contains("Domain="));
         assert!(!cookie.contains("fiducia_session="));
+        if !cfg!(debug_assertions) {
+            assert!(cookie.starts_with("__Host-"));
+            assert!(cookie.contains("; Secure"));
+        }
+    }
+
+    #[test]
+    fn only_mutating_registry_roles_are_enabled() {
+        for role in ["owner", "admin", "operator"] {
+            assert!(operator_registry_role_allows_access(role), "role={role}");
+        }
+        for role in ["viewer", "authenticated", "customer", ""] {
+            assert!(!operator_registry_role_allows_access(role), "role={role}");
+        }
+    }
+
+    #[test]
+    fn insecure_cookie_escape_requires_an_explicit_truthy_value() {
+        assert!(explicitly_enabled(Some("1")));
+        assert!(explicitly_enabled(Some("true")));
+        assert!(explicitly_enabled(Some(" TRUE ")));
+        assert!(!explicitly_enabled(None));
+        assert!(!explicitly_enabled(Some("0")));
+        assert!(!explicitly_enabled(Some("yes")));
+        assert_eq!(cookie_secure_suffix_for(false, true), "");
+        assert_eq!(cookie_secure_suffix_for(false, false), "; Secure");
+        assert_eq!(cookie_secure_suffix_for(true, true), "; Secure");
+        assert_eq!(cookie_secure_suffix_for(true, false), "; Secure");
+    }
+}
+
+#[cfg(test)]
+mod csrf_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn browser_headers(origin: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("admin.fiducia.cloud"));
+        headers.insert("origin", HeaderValue::from_str(origin).unwrap());
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        headers
+    }
+
+    #[test]
+    fn form_security_requires_exact_origin_and_credential_bound_token() {
+        let state = sync_tests::test_state();
+        let session = Session::test_admin("dev-admin");
+        let csrf = csrf_token(&state, &session);
+
+        assert!(require_form_security(
+            &browser_headers("https://admin.fiducia.cloud"),
+            &state,
+            &session,
+            &csrf,
+        )
+        .is_ok());
+        assert!(require_form_security(
+            &browser_headers("https://app.fiducia.cloud"),
+            &state,
+            &session,
+            &csrf,
+        )
+        .is_err());
+        assert!(require_form_security(
+            &browser_headers("https://admin.fiducia.cloud"),
+            &state,
+            &session,
+            "tampered",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn login_security_requires_exact_origin_host_cookie_and_bound_token() {
+        let state = sync_tests::test_state();
+        let nonce = "unit-test-login-nonce";
+        let csrf = state
+            .request_security
+            .csrf_token(&format!("login\0{nonce}"));
+        let mut exact = browser_headers("https://admin.fiducia.cloud");
+        exact.insert(
+            "cookie",
+            format!("{LOGIN_CSRF_COOKIE}={nonce}").parse().unwrap(),
+        );
+        assert!(require_login_security(&exact, &state, &csrf).is_ok());
+
+        let mut sibling = exact.clone();
+        sibling.insert(
+            "origin",
+            HeaderValue::from_static("https://app.fiducia.cloud"),
+        );
+        assert!(require_login_security(&sibling, &state, &csrf).is_err());
+
+        let mut missing_cookie = exact;
+        missing_cookie.remove("cookie");
+        assert!(require_login_security(&missing_cookie, &state, &csrf).is_err());
+    }
+
+    #[test]
+    fn sync_security_distinguishes_cookie_and_bearer_provenance() {
+        let state = sync_tests::test_state();
+        let cookie_session = Session::test_admin_cookie("operator-a", "cookie.jwt");
+        let csrf = csrf_token(&state, &cookie_session);
+        let mut cookie_headers = browser_headers("https://admin.fiducia.cloud");
+        cookie_headers.insert(CSRF_HEADER, HeaderValue::from_str(&csrf).unwrap());
+        assert!(require_sync_write_security(&cookie_headers, &state, &cookie_session).is_ok());
+
+        cookie_headers.remove(CSRF_HEADER);
+        assert!(require_sync_write_security(&cookie_headers, &state, &cookie_session).is_err());
+
+        let bearer_session = Session::test_admin_bearer("operator-a", "bearer.jwt");
+        let mut bearer_headers = HeaderMap::new();
+        bearer_headers.insert("host", HeaderValue::from_static("admin.fiducia.cloud"));
+        assert!(require_sync_write_security(&bearer_headers, &state, &bearer_session).is_ok());
+
+        bearer_headers.insert(
+            "origin",
+            HeaderValue::from_static("https://app.fiducia.cloud"),
+        );
+        assert!(require_sync_write_security(&bearer_headers, &state, &bearer_session).is_err());
+    }
+
+    #[tokio::test]
+    async fn response_headers_deny_framing() {
+        let app = Router::new()
+            .route("/healthz", get(health))
+            .layer(middleware::from_fn(security_headers));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-frame-options")
+                .and_then(|value| value.to_str().ok()),
+            Some("DENY")
+        );
+        assert!(response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("frame-ancestors 'none'")));
+        // Health is deliberately cache-neutral; authenticated/dynamic routes
+        // are covered separately by the middleware's path classification.
+        assert!(response.headers().get("cache-control").is_none());
+    }
+
+    #[tokio::test]
+    async fn dynamic_responses_are_never_cached() {
+        let app = Router::new()
+            .route("/login", get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn(security_headers));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
     }
 }
 
@@ -1021,6 +1796,7 @@ mod db_tests {
             supabase_publishable_key: "test-publishable-key".into(),
             db: Some(db),
             stream_tx: broadcast::channel(4).0,
+            request_security: test_request_security(),
         }
     }
 
@@ -1047,27 +1823,75 @@ mod db_tests {
             .expect("apply admin.sql");
         let st = state_with(db.clone());
 
-        // --- Durable idempotency: claim -> in-flight -> record -> replay ---------
-        let key = format!("infra_operations:{}:upsert:7", Uuid::new_v4().simple());
+        // --- Durable idempotency: rollback -> commit -> exact replay ------------
+        let row_id = Uuid::new_v4();
+        let key = format!("admin-sync-{}", Uuid::new_v4().simple());
+        let request = SyncWriteRequest {
+            id: row_id.to_string(),
+            op: Some("upsert".into()),
+            payload: Some(json!({ "status": "applied" })),
+            base_version: Some(1),
+            key: Some(key.clone()),
+        };
+        let operator =
+            Session::test_admin_bearer("00000000-0000-0000-0000-000000000001", "verified.jwt");
+        let fingerprint = sync_write_fingerprint(&operator, "infra_operations", &request);
+
+        assert!(matches!(
+            sync_write_infra_operations(&st, &request, Some(&key), &fingerprint).await,
+            Err(SyncWriteError::NotFound)
+        ));
         assert!(
-            matches!(idempotency_begin(&st, &key).await, Ok(Idem::Proceed)),
-            "first claim owns it"
+            sync_idempotency_keys::Entity::find_by_id(&key)
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "a failed row mutation rolls its key claim back"
         );
-        assert!(
-            matches!(idempotency_begin(&st, &key).await, Ok(Idem::InFlight)),
-            "second sees in-flight"
-        );
-        idempotency_commit(&st, &key, 8).await.unwrap();
-        assert!(
-            matches!(idempotency_begin(&st, &key).await, Ok(Idem::Replay(8))),
-            "replays committed"
-        );
-        // Survives a "restart": a fresh AppState (empty in-process cache) still replays.
+
+        infra_operations::ActiveModel {
+            id: Set(row_id),
+            action: Set("scale".to_string()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let committed_version =
+            match sync_write_infra_operations(&st, &request, Some(&key), &fingerprint)
+                .await
+                .unwrap()
+            {
+                SyncWriteOutcome::Committed(row) => row.version,
+                SyncWriteOutcome::Replay(_) => panic!("first successful write must commit"),
+            };
+        let ledger = sync_idempotency_keys::Entity::find_by_id(&key)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.request_fingerprint.as_deref(), Some(&*fingerprint));
+        assert_eq!(ledger.committed_version, Some(committed_version));
+
+        // Survives a restart and replays only the exact original request.
         let fresh = state_with(db.clone());
-        assert!(
-            matches!(idempotency_begin(&fresh, &key).await, Ok(Idem::Replay(8))),
-            "durable across restart"
-        );
+        assert!(matches!(
+            sync_write_infra_operations(&fresh, &request, Some(&key), &fingerprint).await,
+            Ok(SyncWriteOutcome::Replay(version)) if version == committed_version
+        ));
+        let changed = SyncWriteRequest {
+            id: request.id.clone(),
+            op: request.op.clone(),
+            payload: Some(json!({ "status": "failed" })),
+            base_version: request.base_version,
+            key: request.key.clone(),
+        };
+        let changed_fingerprint = sync_write_fingerprint(&operator, "infra_operations", &changed);
+        assert!(matches!(
+            sync_write_infra_operations(&fresh, &changed, Some(&key), &changed_fingerprint).await,
+            Err(SyncWriteError::IdempotencyMismatch)
+        ));
 
         // --- Indexed catch-up: rows newer than the cursor, ordered by version ----
         let a = infra_operations::ActiveModel {

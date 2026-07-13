@@ -17,7 +17,16 @@ ordinary Supabase `authenticated` membership never grant admin access.
 
 The sign-in form exchanges operator credentials directly with Supabase Auth,
 then verifies the returned access token and trusted role through `fiducia-auth`
-before issuing `fiducia_admin_session` as `HttpOnly; SameSite=Strict; Secure`.
+before issuing a host-only session cookie as
+`HttpOnly; SameSite=Strict; Secure`. Release builds name it
+`__Host-fiducia_admin_session`, so browsers reject sibling-domain cookie
+collisions; debug builds retain the unprefixed name for explicit HTTP-local mode.
+
+Cookie-authenticated mutations use a credential-bound HMAC CSRF token and
+require the exact configured admin `Origin` and `Host`; same-site sibling
+subdomains are deliberately not trusted. Bearer-authenticated API requests are
+not ambient-cookie CSRF targets, but all authenticated routes still require the
+canonical `Host`, and writes reject a supplied non-admin `Origin`.
 
 ## Routes
 
@@ -43,8 +52,10 @@ before issuing `fiducia_admin_session` as `HttpOnly; SameSite=Strict; Secure`.
 
 ## Run locally
 
+After supplying the required service and database configuration below:
+
 ```bash
-FIDUCIA_ADMIN_DEV_SESSION=admin cargo run    # :8096, click through the UI without real auth
+FIDUCIA_ADMIN_DEV_SESSION=admin cargo run    # browse http://127.0.0.1:8096
 ```
 
 > **Security:** `FIDUCIA_ADMIN_DEV_SESSION` is a full auth bypass (any request
@@ -66,22 +77,22 @@ Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-tel
 | `FIDUCIA_INTERNAL_SECRET` | string | **yes** (secret) | Cluster trusted-hop secret sent to the brain. Required; never logged. | — (required) |
 | `SUPABASE_URL` | string | no | Supabase project URL used for operator sign-in. | — (required) |
 | `SUPABASE_PUBLISHABLE_KEY` | string | no | Browser-safe Supabase publishable key used by the server-mediated password exchange. | — (required) |
+| `FIDUCIA_ADMIN_ORIGIN` | origin | no | Exact public admin origin used for `Host`/`Origin` enforcement (scheme + authority only); release builds require HTTPS. | debug: `http://127.0.0.1:$PORT`; release: required |
+| `FIDUCIA_ADMIN_CSRF_SECRET` | string | **yes** | HMAC key for credential-bound CSRF tokens; at least 32 bytes. Required in release builds. | debug-only fixed key; release: required |
 | `PORT` | integer | no | Listen port. | `8096` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | string | no | OpenTelemetry collector endpoint (optional). | telemetry off |
 | `TEST_DATABASE_URL` | string | **yes** (creds) | Postgres URL for the DB-backed integration test only; unset → that test skips. | — (tests only) |
-| `FIDUCIA_ADMIN_DEV_SESSION` | bool | no | **INSECURE** — full auth bypass (`user`\|`admin` fabricated session); debug builds only, compiled out of release. | unset (secure) |
-| `FIDUCIA_INSECURE_COOKIES` | bool | no | **INSECURE** — drops `Secure` from the session cookie (plain-http dev). | off → cookie is `Secure` |
+| `FIDUCIA_ADMIN_DEV_SESSION` | `user`\|`admin` | no | **INSECURE** — full auth bypass with a fabricated session; debug builds only, compiled out of release. | unset (secure) |
+| `FIDUCIA_INSECURE_COOKIES` | bool | no | **INSECURE** — drops `Secure` from admin cookies for plain-HTTP development; debug builds only. | off → cookies are `Secure` |
 
 ### ⚠️ Insecure-mode flags — MUST be OFF/unset in production
 
 `FIDUCIA_ADMIN_DEV_SESSION` and `FIDUCIA_INSECURE_COOKIES` are
-local-development escape hatches. **Both are secure-by-default**:
-each activates only when explicitly set to a truthy value (`1`/`true`), and an
-unset variable always resolves to the safe behavior (no bypass, no all-admins,
-`Secure` cookies). The dev-session bypass is additionally **compiled out of
-release builds** — a release binary logs an error and ignores it, and there is
-no environment variable that re-enables it. **Never set either of these in
-production** — they disable authentication or transport protections.
+local-development escape hatches. **Both are secure-by-default**: the former
+requires the explicit value `user` or `admin`, while the latter requires `1` or
+`true`. The auth bypass is **compiled out of release builds**, and release
+binaries always emit `Secure` cookies even if the cookie escape variable is
+present. **Never set either variable in production.**
 
 ### Bridging CLI flags to env (flags-2-env)
 
@@ -93,30 +104,41 @@ pinned [`flags-2-env`](https://github.com/ORESoftware/flags-2-env) submodule
 scripts/with-flags2env.sh --port 8096 -- cargo run
 ```
 
-The schema is audited in CI (`.github/workflows/cli-flags.yml`). Build the pinned
-parser once with `make -C vendor/flags-2-env all`.
+The schema is audited by the CLI flag contract step in CI
+(`.github/workflows/ci.yml`). Build the pinned parser once with
+`make -C vendor/flags-2-env all`.
 
 ## Security
 
 Hardening in place (verified this audit):
 
-- **Secure-by-default flags.** All three insecure-mode toggles above default to
-  the safe value and cannot silently activate in production (see the callout).
-- **Transport / session.** The host-specific `fiducia_admin_session` cookie is
-  `HttpOnly; SameSite=Strict; Secure` by default. Admin authorization comes only
-  from the `fiducia-auth`-verified `admin` or `operator` role copied from trusted
-  Supabase `app_metadata`, plus the enabled subject-keyed operator registry.
+- **Secure-by-default flags.** Both insecure-mode toggles default to the safe
+  value and are ineffective in release binaries (see the callout).
+- **Transport / session.** The host-specific session cookie is
+  `HttpOnly; SameSite=Strict; Secure` by default and uses the browser-enforced
+  `__Host-` prefix in release builds. Admin authorization comes only from the
+  `fiducia-auth`-verified `admin` or `operator` role copied from trusted Supabase
+  `app_metadata`, plus the enabled subject-keyed operator registry.
+- **Origin / CSRF boundary.** Login, logout, infra mutations, browser sync
+  writes, and WebSocket handshakes reject sibling origins. Form and sync writes
+  additionally require a constant-time-verified HMAC token bound to the exact
+  verified credential; canonical-host checks also cover bearer API writes.
 - **Complete route gate.** Dashboard, infra, sync catch-up/write, and WebSocket
   handshake paths all enforce the operator role. Customer account/API-key routes
   are not compiled into this service.
 - **Templating.** All HTML is rendered with Maud, which HTML-escapes every
   dynamic interpolation by construction (stored-XSS defense, covered by tests).
 - **Persistence.** SeaORM owns the Postgres connection and all application CRUD
-  through typed admin-plane entities. Raw SQL is limited to applying the
-  canonical schema in the opt-in real-Postgres integration test.
-- **Request stack.** Body cap (64 KiB), 30 s request timeout, and a panic-catch
-  layer are applied to every route; the isolated admin Postgres plane is never
-  the customer DB.
+  through typed admin-plane entities. Sync keys are bound to a canonical request
+  fingerprint; key claim, row mutation, and committed version are one database
+  transaction, and realtime publication occurs only after commit. Historical
+  keys without a reconstructable fingerprint fail closed and must be retried
+  with a newly minted key. Raw SQL is limited to applying the canonical schema
+  in the opt-in real-Postgres test.
+- **Request stack.** Body cap (64 KiB), 30 s request timeout, panic catch, CSP
+  frame denial, `X-Frame-Options: DENY`, MIME-sniff prevention, and a no-referrer
+  policy apply across the service. Dynamic/login responses are `no-store`; the
+  isolated admin Postgres plane is never the customer DB.
 
 Accepted advisories (no clean in-semver fix; recorded in `.cargo/audit.toml`
 with rationale, `cargo audit` runs clean):

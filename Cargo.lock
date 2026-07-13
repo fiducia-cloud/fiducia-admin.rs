@@ -471,14 +471,17 @@ name = "fiducia-admin"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "fiducia-interfaces",
  "fiducia-sync-core",
  "fiducia-telemetry",
+ "hmac",
  "maud",
  "reqwest",
  "sea-orm",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower 0.5.3",
  "tower-http 0.5.2",

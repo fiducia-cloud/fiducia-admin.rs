@@ -1,11 +1,20 @@
-// Puppeteer browser E2E: boots the real axum admin server (dev session, no DB)
+// Puppeteer browser E2E: boots or reuses a fully configured axum admin server
 // and drives the isolated operator account and infra-scale HTMX flows.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import puppeteer from "puppeteer";
-import { chromeExecutablePath, startAdmin } from "./admin-browser-harness.mjs";
+import {
+  chromeExecutablePath,
+  startAdmin,
+  unavailableReason,
+} from "./admin-browser-harness.mjs";
 
 test("puppeteer drives the isolated admin dashboard and infra scale flow", async (t) => {
+  const unavailable = unavailableReason();
+  if (unavailable) {
+    t.skip(unavailable);
+    return;
+  }
   const server = await startAdmin();
   t.after(() => server.stop());
 
@@ -20,7 +29,7 @@ test("puppeteer drives the isolated admin dashboard and infra scale flow", async
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
 
-  // Dashboard renders under the dev-admin session (no DB required).
+  // Dashboard renders under the debug-only dev-admin session.
   await page.goto(`${server.url}/`, { waitUntil: "networkidle0" });
   assert.match(await pageText(page), /Dashboard/);
   assert.match(await pageText(page), /Welcome/);

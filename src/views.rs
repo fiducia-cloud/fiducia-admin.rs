@@ -44,13 +44,21 @@ fn ident(s: &Session) -> String {
 /// Wrap a page body in the shared layout + nav. Loads the vendored, same-origin
 /// htmx bundle (served by the app at `/assets/htmx.min.js` — no CDN, works
 /// offline in the E2E) so the `hx-*` attributes activate.
-pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
+pub fn page(
+    title: &str,
+    session: Option<&Session>,
+    csrf_token: Option<&str>,
+    body: Markup,
+) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width,initial-scale=1";
+                @if let Some(csrf_token) = csrf_token {
+                    meta name="fiducia-admin-csrf" content=(csrf_token);
+                }
                 title { (title) " · Fiducia Admin" }
                 style { (PreEscaped(CSS)) }
                 script src="/assets/htmx.min.js" defer {}
@@ -73,8 +81,11 @@ pub fn page(title: &str, session: Option<&Session>, body: Markup) -> Markup {
                             (ident(s))
                             " · operator"
                         }
-                        form method="post" action="/logout" style="margin:0" {
-                            button class="btn btn--ghost" type="submit" { "Sign out" }
+                        @if let Some(csrf_token) = csrf_token {
+                            form method="post" action="/logout" style="margin:0" {
+                                input type="hidden" name="csrf_token" value=(csrf_token);
+                                button class="btn btn--ghost" type="submit" { "Sign out" }
+                            }
                         }
                     }
                 }
@@ -102,17 +113,26 @@ window.addEventListener("DOMContentLoaded", function () {
     });
   });
   if (!tables.length) return;
-  window.FiduciaSyncAdmin.init({ tables: tables, htmx: window.htmx }).then(function (sync) {
+  var csrf = document.querySelector('meta[name="fiducia-admin-csrf"]');
+  window.FiduciaSyncAdmin.init({
+    tables: tables,
+    htmx: window.htmx,
+    csrfToken: csrf ? csrf.content : ""
+  }).then(function (sync) {
     window.__fiduciaSync = sync; // exposed for debugging / future optimistic writes
   }).catch(function (e) { console.error("fiducia-sync init failed", e); });
 });
 "#;
 
 /// 403 body for the admin gate (`require_admin`).
-pub fn forbidden(s: &Session) -> Markup {
+pub fn forbidden(s: &Session, csrf_token: Option<&str>) -> Markup {
+    // A failed login has a verified bearer identity but no browser session
+    // cookie, so it must not render a logout form that cannot authenticate.
+    let navigation_session = csrf_token.map(|_| s);
     page(
         "Forbidden",
-        Some(s),
+        navigation_session,
+        csrf_token,
         html! {
             h1 { "403" }
             p class="muted" { "Admin role required." }
@@ -120,9 +140,10 @@ pub fn forbidden(s: &Session) -> Markup {
     )
 }
 
-pub fn login(message: Option<&str>) -> Markup {
+pub fn login(message: Option<&str>, login_csrf_token: &str) -> Markup {
     page(
         "Sign in",
+        None,
         None,
         html! {
             h1 { "Sign in" }
@@ -132,6 +153,7 @@ pub fn login(message: Option<&str>) -> Markup {
                     " verifies the session and trusted operator role before an admin cookie is issued."
                 }
                 form method="post" action="/login" {
+                    input type="hidden" name="csrf_token" value=(login_csrf_token);
                     label { "Email" }
                     input name="email" type="email" autocomplete="username" required;
                     label { "Password" }
@@ -154,10 +176,11 @@ pub fn login(message: Option<&str>) -> Markup {
     )
 }
 
-pub fn dashboard(s: &Session) -> Markup {
+pub fn dashboard(s: &Session, csrf_token: &str) -> Markup {
     page(
         "Dashboard",
         Some(s),
+        Some(csrf_token),
         html! {
             h1 { "Dashboard" }
             div class="card" {
@@ -173,11 +196,12 @@ pub fn dashboard(s: &Session) -> Markup {
 
 // ---- Infra ------------------------------------------------------------------
 
-fn scale_form() -> Markup {
+fn scale_form(csrf_token: &str) -> Markup {
     html! {
         form method="post" action="/infra/scale"
             hx-post="/infra/scale" hx-target="#infra-panel" hx-swap="innerHTML"
             style="display:flex;gap:.6rem;align-items:center" {
+            input type="hidden" name="csrf_token" value=(csrf_token);
             label class="muted" { "Target nodes" }
             input name="target_nodes" type="number" min="3" value="9" style="width:6rem";
             button class="btn" type="submit" { "Apply" }
@@ -185,10 +209,17 @@ fn scale_form() -> Markup {
     }
 }
 
-pub fn infra(s: &Session, nodes: &[Value], placement: &[Value], recent: &[Value]) -> Markup {
+pub fn infra(
+    s: &Session,
+    csrf_token: &str,
+    nodes: &[Value],
+    placement: &[Value],
+    recent: &[Value],
+) -> Markup {
     page(
         "Infra",
         Some(s),
+        Some(csrf_token),
         // `data-fiducia-sync` opts this page into the local-first sync client:
         // infra_operations changes stream over /admin/ws into IndexedDB.
         html! {
@@ -196,7 +227,7 @@ pub fn infra(s: &Session, nodes: &[Value], placement: &[Value], recent: &[Value]
             h1 { "Cluster & infra" }
             div class="card" {
                 h2 { "Scale" }
-                (scale_form())
+                (scale_form(csrf_token))
                 p class="muted" {
                     "Drives " code { "fiducia-brain" } " " code { "POST /v1/scale" } " (admin only)."
                 }
@@ -264,17 +295,13 @@ mod tests {
     use serde_json::json;
 
     fn user() -> Session {
-        Session {
-            user_id: "u".into(),
-            email: Some("a@b.c".into()),
-            is_admin: true,
-        }
+        Session::test_admin("u")
     }
 
     #[test]
     fn dashboard_keeps_welcome_and_infra_link_for_admin() {
         let admin = user();
-        let html = dashboard(&admin).into_string();
+        let html = dashboard(&admin, "csrf-test-token").into_string();
         assert!(html.contains("Dashboard"));
         assert!(html.contains("Welcome"));
         assert!(html.contains(r#"href="/infra""#));
@@ -282,10 +309,12 @@ mod tests {
 
     #[test]
     fn login_collects_credentials_without_exposing_token_paste() {
-        let html = login(Some("Invalid email or password.")).into_string();
+        let html = login(Some("Invalid email or password."), "login-csrf-token").into_string();
         assert!(html.contains(r#"name="email""#));
         assert!(html.contains(r#"name="password""#));
         assert!(html.contains("Invalid email or password."));
+        assert!(html.contains(r#"name="csrf_token""#));
+        assert!(html.contains(r#"value="login-csrf-token""#));
         assert!(!html.contains(r#"name="token""#));
         assert!(!html.contains("access token"));
     }
@@ -300,10 +329,11 @@ mod tests {
             "version": 1,
             "created_at": "2026-07-08T00:00:00Z",
         })];
-        let html = infra(&admin, &[], &[], &recent).into_string();
+        let html = infra(&admin, "csrf-test-token", &[], &[], &recent).into_string();
         assert!(html.contains("Cluster &amp; infra"));
         assert!(html.contains("Scale"));
         assert!(html.contains(r#"name="target_nodes""#));
+        assert!(html.contains(r#"name="csrf_token""#));
         assert!(html.contains("Apply"));
         assert!(html.contains("Recent operations"));
         // Opts the page into the local-first sync client + loads the vendored bundle.

@@ -1,0 +1,42 @@
+# Non-secret command-line configuration for fiducia-admin. Sensitive values stay
+# environment-only so they do not leak through process listings or shell history.
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-admin.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+[env]
+ignore = ["DATABASE_URL", "FIDUCIA_INTERNAL_SECRET", "FIDUCIA_ADMIN_DEV_SESSION", "FIDUCIA_ALLOW_INSECURE_DEV_SESSION", "FIDUCIA_ADMIN_EMAILS", "FIDUCIA_ADMIN_USER_IDS", "OTEL_EXPORTER_OTLP_ENDPOINT"]
+
+[flags.port]
+env = "PORT"
+aliases = ["port"]
+short = "p"
+type = "integer"
+help = "HTTP listen port."
+
+[flags.auth-url]
+env = "FIDUCIA_AUTH_URL"
+aliases = ["auth-url"]
+type = "string"
+help = "Authentication service base URL."
+
+[flags.brain-url]
+env = "FIDUCIA_BRAIN_URL"
+aliases = ["brain-url"]
+type = "string"
+help = "Brain service base URL."
+
+[flags.insecure-cookies]
+env = "FIDUCIA_INSECURE_COOKIES"
+aliases = ["insecure-cookies"]
+type = "bool"
+help = "Allow plain-HTTP cookies for local development."
+
+[flags.log]
+env = "RUST_LOG"
+aliases = ["log"]
+type = "string"
+help = "Rust tracing filter."

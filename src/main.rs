@@ -2012,7 +2012,7 @@ mod auth_flow_tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    async fn spawn_mock(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+    pub(super) async fn spawn_mock(app: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {

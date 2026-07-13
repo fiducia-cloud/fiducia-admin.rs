@@ -48,8 +48,26 @@ type InsightResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 fn client(timeout_secs: u64) -> InsightResult<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
+        // A node/observability hop is a single in-cluster call; a redirect is
+        // never legitimate and must not carry the cluster secret to an
+        // upstream-chosen `Location` (reqwest resends custom headers across
+        // redirects). Surface a 3xx as an error instead of following it (H1).
+        .redirect(reqwest::redirect::Policy::none())
         .build()?)
 }
+
+/// The reachability class for a target admin refused to dial (H1). Kept in step
+/// with [`upstream::UpstreamError::UntrustedAddress`] so JSON and tooltips agree.
+const UNTRUSTED_ADDRESS: &str = "untrusted address";
+
+/// Hard cap on the fan-out target count (M3). A buggy or hostile brain returning
+/// a huge `/v1/nodes` must not make admin spawn unbounded concurrent tasks.
+pub const MAX_NODES: usize = 512;
+
+/// Default in-cluster DNS suffix a brain-discovered node address must carry
+/// before admin will dial it with the cluster secret (H1). Overridable via
+/// `FIDUCIA_NODE_HOST_SUFFIX` for clusters that heartbeat a different domain.
+pub const DEFAULT_NODE_HOST_SUFFIX: &str = ".svc.cluster.local";
 
 pub fn now_ms() -> i64 {
     SystemTime::now()

@@ -763,7 +763,7 @@ async fn prom_scrape(st: &AppState) -> cluster_insight::PromScrape {
                 .count(),
         },
         Err(err) => cluster_insight::PromScrape::Error {
-            error: err.to_string(),
+            error: upstream::error_class(&*err),
         },
     }
 }

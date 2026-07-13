@@ -1127,6 +1127,7 @@ mod tests {
             base_url: "http://node-c:8090".into(),
             shards: None,
             error: Some("timeout".into()),
+            untrusted: false,
         };
         let merged = merge_shards(&[healthy.clone(), follower_only.clone(), down.clone()]);
         let quorum = cluster_quorum(&[healthy, follower_only, down], &merged);

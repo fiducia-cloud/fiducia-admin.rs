@@ -2553,6 +2553,8 @@ mod cluster_tests {
         assert_eq!(overview.status(), StatusCode::OK);
         let overview = body_json(overview).await;
         assert_eq!(overview["cluster"]["cluster_id"], "fiducia-test");
+        assert_eq!(overview["config"]["shard_count"], 2);
+        assert_eq!(overview["policies"][0]["namespace"], "orders");
         let shards = overview["shards"].as_array().unwrap();
         assert_eq!(shards.len(), 2, "both shards merged from the healthy node");
         assert_eq!(shards[0]["shard_id"], 0);

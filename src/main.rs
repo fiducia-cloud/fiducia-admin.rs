@@ -2169,6 +2169,17 @@ mod auth_flow_tests {
     }
 
     #[test]
+    fn scale_target_rejects_below_floor_and_i32_overflow() {
+        assert!(!scale_target_is_valid(0));
+        assert!(!scale_target_is_valid(MIN_SCALE_TARGET_NODES - 1));
+        assert!(scale_target_is_valid(MIN_SCALE_TARGET_NODES));
+        assert!(scale_target_is_valid(i32::MAX as u32));
+        // Above i32::MAX would wrap negative in the audit record's i32 column.
+        assert!(!scale_target_is_valid(i32::MAX as u32 + 1));
+        assert!(!scale_target_is_valid(u32::MAX));
+    }
+
+    #[test]
     fn only_mutating_registry_roles_are_enabled() {
         for role in ["owner", "admin", "operator"] {
             assert!(operator_registry_role_allows_access(role), "role={role}");

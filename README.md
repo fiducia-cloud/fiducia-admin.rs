@@ -113,6 +113,36 @@ services, which is why their URLs are optional, operator-supplied
 configuration and their query results are rendered (HTML-escaped by Maud) but
 never executed or persisted.
 
+**Fan-out SSRF & resource hardening.** The node fan-out ships the cluster
+trusted-hop secret, so the target set is constrained before any request:
+
+- **Address allowlist (SSRF).** A brain-discovered `address` receives the secret
+  only when its host is loopback or ends in the in-cluster DNS suffix
+  (`FIDUCIA_NODE_HOST_SUFFIX`, default `.svc.cluster.local`); explicit
+  operator-provided `FIDUCIA_NODE_URLS` are trusted as-is. Hosts are parsed with
+  reqwest's own URL parser (no parser-differential), non-`http(s)` schemes are
+  rejected, and the suffix match is label-boundary anchored. A failing target is
+  never dialed — it renders as a distinct "untrusted address" state, so a
+  compromised or spoofed brain cannot harvest the secret to an arbitrary host.
+- **No redirects.** Both the node and brain HTTP clients set
+  `redirect::Policy::none()`. In-cluster hops are single calls; a `3xx` surfaces
+  as an error rather than being followed (reqwest resends custom headers such as
+  `x-fiducia-internal-auth` across redirects, so a cross-origin `Location` could
+  otherwise bounce the secret out).
+- **Body cap.** Every upstream body (node observe, brain status/config/policies,
+  Prometheus/Loki) is read through a running byte counter and aborted past
+  16 MiB, so an oversized response is an error observation, not an OOM — the
+  concurrent fan-out cannot be turned into a memory-exhaustion amplifier.
+- **Target cap.** The fan-out target list is truncated to 512 nodes (a
+  "targets truncated (showing 512 of N)" note is surfaced and logged), bounding
+  concurrency against a buggy or hostile membership snapshot.
+- **Error hygiene.** Upstream failures are normalized to a short class
+  (`timeout` / `unreachable` / `untrusted address` / `bad status: NNN` /
+  `oversized response`) before reaching `node_observations[].error` or a view
+  tooltip, so raw client errors never leak internal URLs. Split-brain
+  (two leaders for one shard) and a merely-unreachable leader are surfaced as
+  distinct signals rather than being masked by the shard merge.
+
 ## Run locally
 
 After supplying the required service and database configuration below:

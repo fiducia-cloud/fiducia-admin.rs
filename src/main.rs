@@ -204,6 +204,34 @@ fn optional_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Validate `FIDUCIA_GRAFANA_PUBLIC_URL` at startup (L8). The value becomes a
+/// clickable `href` on the cluster page, so it must be empty (feature off), an
+/// http(s):// URL, or a root-relative path (`/telemetry`) — never a
+/// `javascript:`/`data:` scheme or a protocol-relative `//host` that would
+/// navigate off-origin. A set-but-invalid value fails startup closed.
+fn validated_grafana_public_url() -> result::Result<Option<String>, io::Error> {
+    match optional_env("FIDUCIA_GRAFANA_PUBLIC_URL") {
+        None => Ok(None),
+        Some(value) if grafana_public_url_is_valid(&value) => Ok(Some(value)),
+        Some(value) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "FIDUCIA_GRAFANA_PUBLIC_URL must be an http(s):// URL or a root-relative \
+                 path starting with '/': got {value:?}"
+            ),
+        )),
+    }
+}
+
+fn grafana_public_url_is_valid(value: &str) -> bool {
+    let value = value.trim();
+    if value.starts_with("http://") || value.starts_with("https://") {
+        return true;
+    }
+    // Root-relative path only; reject protocol-relative `//host` (off-origin).
+    value.starts_with('/') && !value.starts_with("//")
+}
+
 /// Comma-separated optional list (`FIDUCIA_NODE_URLS`); blank entries dropped.
 fn csv_env(name: &str) -> Vec<String> {
     optional_env(name)

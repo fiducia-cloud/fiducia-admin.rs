@@ -14,6 +14,7 @@
 //! customer DB. That is a security boundary; this service never connects to the
 //! customer database, and startup fails closed when the admin DB is unavailable.
 
+mod cluster_insight;
 mod entity;
 mod request_security;
 mod session;

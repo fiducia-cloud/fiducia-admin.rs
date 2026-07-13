@@ -99,6 +99,9 @@ like the infra pattern). The same data is served as JSON under
 Node discovery: `FIDUCIA_NODE_URLS` (comma-separated base URLs) wins when set;
 otherwise targets come from the brain's `/v1/nodes` — each node's heartbeated
 `address` (`host:port`), normalized to `http://` when no scheme is given.
+Brain-discovered addresses are **trust-checked before the cluster secret is
+attached** (see below); an address that fails the check becomes a per-node
+"untrusted address" observation instead of a request.
 
 **Security posture:** every cluster page, fragment, and `/api/admin/cluster/*`
 route sits behind the same operator gate as the rest of the app

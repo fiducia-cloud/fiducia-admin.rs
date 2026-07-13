@@ -2180,6 +2180,30 @@ mod cluster_tests {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    /// A test AppState with the Cluster Insight upstreams under test control.
+    fn insight_state(
+        auth_url: String,
+        brain_url: String,
+        prometheus_url: Option<String>,
+        loki_url: Option<String>,
+        grafana_public_url: Option<String>,
+        node_urls: Vec<String>,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            auth_url,
+            brain_url,
+            supabase_url: "https://example.supabase.co".into(),
+            supabase_publishable_key: "test-publishable-key".into(),
+            db: None,
+            stream_tx: broadcast::channel(16).0,
+            request_security: test_request_security(),
+            prometheus_url,
+            loki_url,
+            grafana_public_url,
+            node_urls,
+        })
+    }
+
     #[tokio::test]
     async fn every_cluster_route_requires_a_session() {
         // Anonymous HTML routes redirect to the login page…

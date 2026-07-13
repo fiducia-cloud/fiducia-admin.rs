@@ -1011,18 +1011,30 @@ mod tests {
 
     // ---- discovery ----
 
+    fn test_policy() -> NodeHostPolicy {
+        NodeHostPolicy {
+            suffix: DEFAULT_NODE_HOST_SUFFIX.to_string(),
+        }
+    }
+
     #[test]
     fn explicit_node_urls_override_and_label_by_host() {
-        let targets = explicit_node_targets(&[
-            "http://fiducia-node-0.fiducia-node.fiducia.svc.cluster.local:8090/".to_string(),
-            "10.2.0.7:8090".to_string(),
-        ]);
+        let targets = explicit_node_targets(
+            &[
+                "http://fiducia-node-0.fiducia-node.fiducia.svc.cluster.local:8090/".to_string(),
+                "10.2.0.7:8090".to_string(),
+            ],
+            &test_policy(),
+        );
         assert_eq!(
             targets[0].base_url,
             "http://fiducia-node-0.fiducia-node.fiducia.svc.cluster.local:8090"
         );
         assert_eq!(targets[0].node_id, "fiducia-node-0");
         assert_eq!(targets[1].base_url, "http://10.2.0.7:8090");
+        // Explicit operator URLs are trusted as-is (H1): even the non-suffixed
+        // private-IP entry is dialable.
+        assert!(targets[0].trusted && targets[1].trusted);
     }
 
     #[test]
@@ -1032,11 +1044,14 @@ mod tests {
             json!({ "node_id": "node-b", "address": "", "health": "dead" }),
             json!({ "node_id": "node-c", "address": "https://node-c:8090" }),
         ];
-        let targets = targets_from_brain_nodes(&nodes);
+        let targets = targets_from_brain_nodes(&nodes, &test_policy());
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].node_id, "node-a");
         assert_eq!(targets[0].base_url, "http://10.0.0.1:8090");
         assert_eq!(targets[1].base_url, "https://node-c:8090");
+        // Neither discovered host is loopback or in-cluster-suffixed, so neither
+        // is trusted to receive the cluster secret (H1).
+        assert!(!targets[0].trusted && !targets[1].trusted);
     }
 
     // ---- merge ----

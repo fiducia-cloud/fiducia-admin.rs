@@ -370,6 +370,11 @@ pub struct NodeObservation {
     pub shards: Option<NodeShards>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// True when `error` is set because the address failed trust validation and
+    /// was never dialed (H1) — a distinct reachability state from unreachable.
+    /// Omitted from JSON in the common (trusted) case.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub untrusted: bool,
 }
 
 /// One node's `/v1/observe/metrics` fan-out outcome (per-op counters).

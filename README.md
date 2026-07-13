@@ -74,14 +74,14 @@ Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-tel
 
 ### ⚠️ Insecure-mode flags — MUST be OFF/unset in production
 
-`FIDUCIA_ADMIN_DEV_SESSION`, `FIDUCIA_ALLOW_INSECURE_DEV_SESSION`, and
-`FIDUCIA_INSECURE_COOKIES` are
-local-development escape hatches. **Every one of them is secure-by-default**:
+`FIDUCIA_ADMIN_DEV_SESSION` and `FIDUCIA_INSECURE_COOKIES` are
+local-development escape hatches. **Both are secure-by-default**:
 each activates only when explicitly set to a truthy value (`1`/`true`), and an
 unset variable always resolves to the safe behavior (no bypass, no all-admins,
-`Secure` cookies). The dev-session bypass is additionally ignored in release
-builds unless `FIDUCIA_ALLOW_INSECURE_DEV_SESSION=1` is set. **Never set any of
-these in production** — they disable authentication or transport protections.
+`Secure` cookies). The dev-session bypass is additionally **compiled out of
+release builds** — a release binary logs an error and ignores it, and there is
+no environment variable that re-enables it. **Never set either of these in
+production** — they disable authentication or transport protections.
 
 ### Bridging CLI flags to env (flags-2-env)
 

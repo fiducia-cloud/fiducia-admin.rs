@@ -884,6 +884,31 @@ mod tests {
         assert_eq!(merged[0].reported_by, "node-a");
     }
 
+    #[test]
+    fn cluster_quorum_folds_per_node_rollups_and_counts_failures() {
+        let mut healthy = observation("node-a", vec![shard_view(0, "leader", 3)]);
+        if let Some(shards) = &mut healthy.shards {
+            shards.quorum.at_risk_led_shards = vec![0];
+            shards.quorum.storage_faulted_shards = vec![2];
+            shards.quorum.unresponsive_shards = vec![1];
+        }
+        let follower_only = observation("node-b", vec![shard_view(1, "follower", 3)]);
+        let down = NodeObservation {
+            node_id: "node-c".into(),
+            base_url: "http://node-c:8090".into(),
+            shards: None,
+            error: Some("timeout".into()),
+        };
+        let merged = merge_shards(&[healthy.clone(), follower_only.clone(), down.clone()]);
+        let quorum = cluster_quorum(&[healthy, follower_only, down], &merged);
+        assert_eq!(quorum.nodes_reporting, 2);
+        assert_eq!(quorum.nodes_failed, 1);
+        assert_eq!(quorum.leaderless, vec![1], "no node leads shard 1");
+        assert_eq!(quorum.at_risk, vec![0]);
+        assert_eq!(quorum.storage_faulted, vec![2]);
+        assert_eq!(quorum.unresponsive, vec![1]);
+    }
+
     // ---- query construction ----
 
     #[test]

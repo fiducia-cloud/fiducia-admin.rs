@@ -531,6 +531,11 @@ pub struct MergedShard {
     /// True when `reported_by` leads the shard — the leader's view carries the
     /// authoritative quorum/replication columns.
     pub leader_view: bool,
+    /// True when two or more nodes each reported `role == leader` for this shard —
+    /// a split-brain signal (M4). The higher-term leader view is adopted, and this
+    /// flag records that the conflict happened so the merge does not silently mask
+    /// the exact incident this page exists to surface.
+    pub dual_leader: bool,
     #[serde(flatten)]
     pub view: ShardView,
 }
@@ -538,7 +543,9 @@ pub struct MergedShard {
 /// Merge every node's `/v1/observe/shards` into one row per shard. The leader's
 /// view wins (only the leader knows per-peer replication lag and quorum); when
 /// no reporting node leads a shard, keep the first follower/candidate view so a
-/// leaderless shard still renders with its last-known indices.
+/// leaderless shard still renders with its last-known indices. When a *second*
+/// node also claims leadership for the same shard, adopt the higher term and set
+/// `dual_leader` (M4) rather than dropping the conflicting leader unseen.
 pub fn merge_shards(observations: &[NodeObservation]) -> Vec<MergedShard> {
     let mut merged: std::collections::BTreeMap<u32, MergedShard> =
         std::collections::BTreeMap::new();
@@ -548,21 +555,37 @@ pub fn merge_shards(observations: &[NodeObservation]) -> Vec<MergedShard> {
         };
         for view in &shards.shards {
             let leader_view = view.role == "leader";
-            let row = || MergedShard {
+            let candidate = MergedShard {
                 shard_id: view.shard_id,
                 reported_by: observation.node_id.clone(),
                 leader_view,
+                dual_leader: false,
                 view: view.clone(),
             };
-            match merged.get(&view.shard_id) {
-                Some(existing) if existing.leader_view => {} // leader view already won
-                Some(_) if leader_view => {
-                    merged.insert(view.shard_id, row());
-                }
-                Some(_) => {}
+            match merged.get_mut(&view.shard_id) {
                 None => {
-                    merged.insert(view.shard_id, row());
+                    merged.insert(view.shard_id, candidate);
                 }
+                Some(existing) if leader_view && existing.leader_view => {
+                    // Two nodes both claim leadership: prefer the higher term
+                    // (tie keeps the incumbent), but flag the conflict either way.
+                    if view.term > existing.view.term {
+                        *existing = MergedShard {
+                            dual_leader: true,
+                            ..candidate
+                        };
+                    } else {
+                        existing.dual_leader = true;
+                    }
+                }
+                Some(existing) if leader_view => {
+                    // Leader view supersedes a follower/candidate view.
+                    *existing = MergedShard {
+                        dual_leader: existing.dual_leader,
+                        ..candidate
+                    };
+                }
+                Some(_) => {} // incumbent (leader, or first follower) kept
             }
         }
     }

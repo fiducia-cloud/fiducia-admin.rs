@@ -21,8 +21,8 @@ jobs:
         with:
           context: .
           build-args: |
-            INTERFACES_REF=5f2c5279ee19941024455b2843256872485bac82
-            SYNC_REF=a57112d41615f7d6783b3f617b013fe5dcbf1d63
+            INTERFACES_REF=487e470c45ab5851e8f6f3b1dc048fe067fbf408
+            SYNC_REF=b9545140932995f75af8b3c5514cb4379404264c
           push: true
           tags: |
             ghcr.io/fiducia-cloud/fiducia-admin:latest

@@ -2051,6 +2051,10 @@ mod auth_flow_tests {
             db: None,
             stream_tx: broadcast::channel(4).0,
             request_security: test_request_security(),
+            prometheus_url: None,
+            loki_url: None,
+            grafana_public_url: None,
+            node_urls: Vec::new(),
         });
         let login_nonce = "registry-test-login-nonce";
         let login_csrf = state

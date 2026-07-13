@@ -95,6 +95,14 @@ struct AppState {
     stream_tx: broadcast::Sender<String>,
     /// Exact canonical admin origin + credential-bound CSRF signer.
     request_security: RequestSecurity,
+    /// Cluster Insight observability plane — all optional. Unset URLs render as
+    /// "not configured" cards on `/cluster`, never as errors.
+    prometheus_url: Option<String>,
+    loki_url: Option<String>,
+    grafana_public_url: Option<String>,
+    /// Explicit fiducia-node client-plane base URLs. Empty → discover node
+    /// addresses from the brain's `/v1/nodes` membership snapshot.
+    node_urls: Vec<String>,
 }
 
 #[tokio::main]

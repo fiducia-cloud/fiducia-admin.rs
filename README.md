@@ -23,7 +23,7 @@ before issuing `fiducia_admin_session` as `HttpOnly; SameSite=Strict; Secure`.
 
 | Route | Purpose |
 |-------|---------|
-| `GET /login` | sign-in page (Supabase) |
+| `GET/POST /login` | server-mediated Supabase sign-in |
 | `POST /logout` | clear the admin-only session cookie |
 | `GET /` | operator dashboard |
 | `GET /infra` · `POST /infra/scale` | cluster operations |

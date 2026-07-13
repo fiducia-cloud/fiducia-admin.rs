@@ -897,6 +897,92 @@ mod sync_tests {
 }
 
 #[cfg(test)]
+mod auth_flow_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn spawn_mock(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn login_requires_the_operator_registry_after_trusted_auth() {
+        let supabase = Router::new().route(
+            "/auth/v1/token",
+            post(|| async { Json(json!({ "access_token": "verified.jwt" })) }),
+        );
+        let auth = Router::new().route(
+            "/v1/me",
+            get(|| async {
+                Json(json!({
+                    "user": {
+                        "user_id": "00000000-0000-0000-0000-000000000001",
+                        "email": "operator@example.com",
+                        "orgs": ["org_admin"],
+                        "roles": ["operator"]
+                    }
+                }))
+            }),
+        );
+        let (supabase_url, supabase_task) = spawn_mock(supabase).await;
+        let (auth_url, auth_task) = spawn_mock(auth).await;
+
+        let state = Arc::new(AppState {
+            auth_url,
+            brain_url: "http://localhost:8095".into(),
+            supabase_url,
+            supabase_publishable_key: "public-publishable-key".into(),
+            db: None,
+            stream_tx: broadcast::channel(4).0,
+        });
+        let app = Router::new()
+            .route("/login", post(login_submit))
+            .with_state(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/login")
+                    .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "email=operator%40example.com&password=correct-horse",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        supabase_task.abort();
+        auth_task.abort();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn logout_expires_only_the_admin_cookie() {
+        let response = logout().await;
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(cookie.starts_with("fiducia_admin_session="));
+        assert!(cookie.contains("Max-Age=0"));
+        assert!(!cookie.contains("fiducia_session="));
+    }
+}
+
+#[cfg(test)]
 mod interface_contract_tests {
     use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
 

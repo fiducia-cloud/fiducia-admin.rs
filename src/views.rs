@@ -277,6 +277,16 @@ mod tests {
     }
 
     #[test]
+    fn login_collects_credentials_without_exposing_token_paste() {
+        let html = login(Some("Invalid email or password.")).into_string();
+        assert!(html.contains(r#"name="email""#));
+        assert!(html.contains(r#"name="password""#));
+        assert!(html.contains("Invalid email or password."));
+        assert!(!html.contains(r#"name="token""#));
+        assert!(!html.contains("access token"));
+    }
+
+    #[test]
     fn infra_renders_scale_controls_and_recent_ops_when_present() {
         let admin = user();
         let recent = vec![json!({

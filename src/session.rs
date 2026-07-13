@@ -102,6 +102,9 @@ async fn current_from_auth(auth_url: &str, token: &str) -> Result<Session, reqwe
         .json::<MeResponse>()
         .await?
         .user;
+    // fiducia-auth derives these roles exclusively from trusted Supabase
+    // app_metadata. Neither email addresses nor caller-editable metadata are an
+    // authorization source for the operator plane.
     let is_admin = has_operator_role(&user.roles);
 
     Ok(Session {
@@ -218,6 +221,12 @@ mod tests {
             HeaderValue::from_static("fiducia_admin_session= ; theme=dark"),
         );
 
+        assert_eq!(session_cookie(&headers), None);
+    }
+
+    #[test]
+    fn session_cookie_ignores_customer_session_cookie() {
+        let headers = headers_with("cookie", "fiducia_session=customer.jwt");
         assert_eq!(session_cookie(&headers), None);
     }
 

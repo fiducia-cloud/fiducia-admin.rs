@@ -1054,6 +1054,115 @@ mod tests {
         assert!(!targets[0].trusted && !targets[1].trusted);
     }
 
+    // ---- H1: SSRF / secret-leak allowlist ----
+
+    #[test]
+    fn only_http_schemes_pass_validation() {
+        assert!(scheme_and_host("http://x.svc.cluster.local:8090").is_some());
+        assert!(scheme_and_host("https://node-a:8090").is_some());
+        // Non-http(s) schemes never get the cluster secret.
+        assert!(scheme_and_host("ftp://x.svc.cluster.local").is_none());
+        assert!(scheme_and_host("file:///etc/passwd").is_none());
+        assert!(scheme_and_host("gopher://x.svc.cluster.local").is_none());
+        assert!(scheme_and_host("javascript:alert(1)").is_none());
+        assert!(scheme_and_host("not a url").is_none());
+    }
+
+    #[test]
+    fn discovered_targets_are_trusted_only_when_loopback_or_suffixed() {
+        let nodes = vec![
+            json!({ "node_id": "loop", "address": "127.0.0.1:8090" }),
+            json!({ "node_id": "loop6", "address": "[::1]:8090" }),
+            json!({ "node_id": "svc", "address": "fiducia-node-0.fiducia-node.fiducia.svc.cluster.local:8090" }),
+            json!({ "node_id": "ext", "address": "attacker.example.com:8090" }),
+            // Suffix must sit on a label boundary — no `…local.evil.com` bypass.
+            json!({ "node_id": "sneaky", "address": "x.svc.cluster.local.evil.com:8090" }),
+            // userinfo must not smuggle a trusted-looking host past the real host.
+            json!({ "node_id": "userinfo", "address": "http://real.svc.cluster.local@evil.com:8090" }),
+        ];
+        let targets = targets_from_brain_nodes(&nodes, &test_policy());
+        let trust: std::collections::HashMap<&str, bool> = targets
+            .iter()
+            .map(|target| (target.node_id.as_str(), target.trusted))
+            .collect();
+        assert_eq!(trust["loop"], true, "IPv4 loopback is in-cluster");
+        assert_eq!(trust["loop6"], true, "IPv6 loopback is in-cluster");
+        assert_eq!(trust["svc"], true, "in-cluster suffix is trusted");
+        assert_eq!(trust["ext"], false, "public host is refused");
+        assert_eq!(trust["sneaky"], false, "suffix must be on a label boundary");
+        assert_eq!(
+            trust["userinfo"], false,
+            "the real host (evil.com) is checked, not the userinfo"
+        );
+    }
+
+    #[test]
+    fn explicit_targets_are_trusted_as_is_but_still_require_http_scheme() {
+        let targets = explicit_node_targets(
+            &[
+                "http://fiducia-node-0.internal:8090".to_string(), // operator-trusted
+                "javascript:alert(1)".to_string(),                 // not dialable
+            ],
+            &test_policy(),
+        );
+        assert!(
+            targets[0].trusted,
+            "an explicit operator URL is trusted even without the suffix"
+        );
+        assert!(
+            !targets[1].trusted,
+            "a non-http(s) explicit target is still refused"
+        );
+    }
+
+    #[test]
+    fn a_custom_suffix_overrides_the_default() {
+        let policy = NodeHostPolicy {
+            suffix: ".nodes.internal".to_string(),
+        };
+        let nodes = vec![
+            json!({ "node_id": "custom", "address": "n0.nodes.internal:8090" }),
+            json!({ "node_id": "default-suffix", "address": "n0.svc.cluster.local:8090" }),
+        ];
+        let targets = targets_from_brain_nodes(&nodes, &policy);
+        assert!(targets[0].trusted, "matches the configured suffix");
+        assert!(
+            !targets[1].trusted,
+            "the default suffix no longer applies once overridden"
+        );
+    }
+
+    #[test]
+    fn untrusted_address_class_matches_the_upstream_sentinel() {
+        // The string the fan-out stamps on a refused target must equal the shared
+        // upstream sentinel so JSON and tooltips agree (L7 / H1).
+        assert_eq!(
+            UNTRUSTED_ADDRESS,
+            crate::upstream::UpstreamError::UntrustedAddress.to_string()
+        );
+    }
+
+    // ---- M3: fan-out target cap ----
+
+    #[test]
+    fn fanout_targets_are_capped_at_max_nodes() {
+        let nodes: Vec<Value> = (0..(MAX_NODES as u64 + 40))
+            .map(|i| json!({ "node_id": format!("n{i}"), "address": format!("127.0.0.1:{}", 8000 + i) }))
+            .collect();
+        let mut targets = targets_from_brain_nodes(&nodes, &test_policy());
+        let total = targets.len();
+        assert_eq!(total, MAX_NODES + 40);
+        let truncated = truncate_targets(&mut targets);
+        assert_eq!(targets.len(), MAX_NODES, "target list is capped");
+        assert_eq!(truncated, Some(total), "original count reported for the note");
+        // Within the cap, nothing is dropped and no note is raised.
+        let mut small = targets_from_brain_nodes(
+            &[json!({ "node_id": "n", "address": "127.0.0.1:8090" })],
+            &test_policy(),
+        );
+        assert_eq!(truncate_targets(&mut small), None);
+    }
+
     // ---- merge ----
 
     fn shard_view(shard_id: u32, role: &str, term: u64) -> ShardView {

@@ -2672,7 +2672,11 @@ mod cluster_tests {
         );
         assert_eq!(overview["quorum"]["nodes_reporting"], 1);
         assert_eq!(overview["quorum"]["nodes_failed"], 1);
-        assert_eq!(overview["quorum"]["leaderless"], json!([1]));
+        // Shard 1's leader is the *down* node: its follower row still knows a
+        // leader_id, so it is "leader unreached", never miscounted as leaderless
+        // during a partial-visibility incident (M5).
+        assert_eq!(overview["quorum"]["leaderless"], json!([]));
+        assert_eq!(overview["quorum"]["leader_unreached"], json!([1]));
         assert_eq!(overview["prometheus"]["state"], "up");
         assert_eq!(
             overview["prometheus"]["targets"], 2,

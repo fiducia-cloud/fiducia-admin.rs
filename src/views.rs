@@ -141,9 +141,13 @@ pub fn login(message: Option<&str>) -> Markup {
                 @if let Some(message) = message {
                     p class="muted" role="alert" { (message) }
                 }
-                p class="muted" {
-                    "For local development, " code { "FIDUCIA_ADMIN_DEV_SESSION=admin" }
-                    " still enables the explicit dev bypass."
+                // The dev-bypass hint only exists where the bypass itself does:
+                // debug builds. Release builds render no trace of it.
+                @if cfg!(debug_assertions) {
+                    p class="muted" {
+                        "For local development, " code { "FIDUCIA_ADMIN_DEV_SESSION=admin" }
+                        " still enables the explicit dev bypass."
+                    }
                 }
             }
         },

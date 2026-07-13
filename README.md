@@ -55,6 +55,61 @@ canonical `Host`, and writes reject a supplied non-admin `Origin`.
 | `src/session.rs` | Supabase session + trusted-role resolution through `fiducia-auth` |
 | `src/upstream.rs` | operator-only HTTP calls to `fiducia-brain` |
 
+## Cluster insight
+
+`GET /cluster` is the read-only observability page for the coordination plane.
+It renders three panels that poll their own htmx fragment endpoints
+(`/cluster/shards` and `/cluster/nodes` every 5 s, `/cluster/events` every
+15 s; each fragment route serves the full page to non-htmx requests, exactly
+like the infra pattern). The same data is served as JSON under
+`/api/admin/cluster/*` for bearer/API callers.
+
+**Data sources** (all fetched per request; nothing is cached or persisted):
+
+- **fiducia-brain** — `GET /v1/status` feeds the summary cards (cluster id,
+  shard count × RF, placement generation, brain leader/HA/availability, node
+  counts by health, placement gaps); `GET /v1/nodes` feeds the node registry
+  table and, by default, node discovery. The overview API additionally returns
+  `/v1/config` and `/v1/policies`. All brain calls present the
+  `x-fiducia-internal-secret` trusted-hop header (`x-fiducia-internal-auth`).
+- **fiducia-node** — `GET /v1/observe/shards` and `GET /v1/observe/metrics`,
+  fanned out **concurrently to every node** with a 3 s per-node timeout. These
+  two paths are exempt from the node's org-scope middleware (they are node
+  introspection with no tenant state — see fiducia-node `org_scope::is_exempt`),
+  so the calls need only the internal-auth header, no `x-fiducia-org-id`.
+  A down node never breaks the page: its fetch error is carried per node into
+  the tables and the JSON (`node_observations[].error`). Per-shard rows are
+  merged across all nodes' reports with the **leader's view winning** per shard
+  (only the leader knows per-peer replication lag and quorum).
+- **Loki** (optional, `FIDUCIA_LOKI_URL`) — the events panel runs one
+  `query_range` over `{namespace="fiducia"}` with line filters, then parses
+  each JSON log line in Rust (fiducia-telemetry's tracing JSON layer flattens
+  event fields to the top level) and classifies raft leader transfers,
+  elections/step-downs, check-quorum step-downs, brain membership changes
+  (registered/draining/dead), and placement (re)assignments into typed events.
+  `?since_minutes=` is clamped to `[1, 1440]`, default 30.
+- **Prometheus** (optional, `FIDUCIA_PROMETHEUS_URL`) — the summary card runs
+  the instant query `up{namespace="fiducia"}` and counts up targets (an empty
+  result renders as a count of 0, since scrape config is deployment-specific);
+  the metrics API adds a 15-minute range of the same query.
+- **Grafana** (optional, `FIDUCIA_GRAFANA_PUBLIC_URL`) — when set, the events
+  panel and the Prometheus card render best-effort Grafana Explore deep links
+  with the exact LogQL/PromQL prefilled.
+
+Node discovery: `FIDUCIA_NODE_URLS` (comma-separated base URLs) wins when set;
+otherwise targets come from the brain's `/v1/nodes` — each node's heartbeated
+`address` (`host:port`), normalized to `http://` when no scheme is given.
+
+**Security posture:** every cluster page, fragment, and `/api/admin/cluster/*`
+route sits behind the same operator gate as the rest of the app
+(`require_admin` for HTML, `require_admin_api` for JSON: verified operator role
+**and** enabled operator registry row). All routes are read-only GETs — no
+mutation, no CSRF surface. The brain and node calls carry
+`FIDUCIA_INTERNAL_SECRET`; Prometheus and Loki are unauthenticated in-cluster
+services, which is why their URLs are optional, operator-supplied
+configuration and their query results are rendered (HTML-escaped by Maud) but
+never executed or persisted.
+
 ## Run locally
 
 After supplying the required service and database configuration below:

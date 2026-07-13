@@ -1,0 +1,57 @@
+# flags-2-env flag schema for the fiducia-admin service: maps command-line flags
+# to the FIDUCIA_*/PORT/TEST_DATABASE_URL env vars the binary reads. Consumed by
+# scripts/with-flags2env.sh and audited in CI (cli-flags.yml).
+[help]
+url = "https://github.com/fiducia-cloud/fiducia-admin.rs"
+columns = ["options", "env", "type", "description"]
+
+[parse]
+allow_unknown = false
+
+[flags.admin-emails]
+env = "FIDUCIA_ADMIN_EMAILS"
+aliases = ["admin-emails"]
+type = "string"
+help = "Comma/space-separated allowlist of emails granted the admin role. Empty means no admins."
+
+[flags.internal-secret]
+env = "FIDUCIA_INTERNAL_SECRET"
+aliases = ["internal-secret"]
+type = "string"
+help = "SECRET (sensitive): cluster trusted-hop secret sent to fiducia-brain. Required; do not log."
+
+[flags.test-database-url]
+env = "TEST_DATABASE_URL"
+aliases = ["test-database-url"]
+type = "string"
+help = "Sensitive (contains DB credentials): Postgres URL for the DB-backed integration tests only."
+
+[flags.port]
+env = "PORT"
+aliases = ["port"]
+type = "integer"
+help = "TCP port to listen on (default 8096)."
+
+[flags.admin-all-users]
+env = "FIDUCIA_ADMIN_ALL_USERS"
+aliases = ["admin-all-users"]
+type = "bool"
+help = "INSECURE: grants the admin role to EVERY authenticated user. MUST be OFF/unset in production."
+
+[flags.admin-dev-session]
+env = "FIDUCIA_ADMIN_DEV_SESSION"
+aliases = ["admin-dev-session"]
+type = "bool"
+help = "INSECURE: full auth bypass (user|admin dev session). Local dev only; MUST be unset in production."
+
+[flags.allow-insecure-dev-session]
+env = "FIDUCIA_ALLOW_INSECURE_DEV_SESSION"
+aliases = ["allow-insecure-dev-session"]
+type = "bool"
+help = "INSECURE: forces the dev auth bypass ON in release builds. MUST be OFF/unset in production."
+
+[flags.insecure-cookies]
+env = "FIDUCIA_INSECURE_COOKIES"
+aliases = ["insecure-cookies"]
+type = "bool"
+help = "INSECURE: drops the Secure attribute from the session cookie (plain-http dev). MUST be OFF/unset in production."

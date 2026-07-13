@@ -1,14 +1,15 @@
 # tests — browser end-to-end tests
 
 Node-driven browser E2E for the admin dashboard. Each spec reuses the URL in
-`FIDUCIA_ADMIN_TEST_URL`, or boots the real axum binary via `cargo run` when all
-required database/upstream environment variables are present. Missing external
-configuration produces an explicit skip: the app's fail-closed admin DB boundary
-is never weakened for a test. The specs drive the operator dashboard and
-infra-scale flows through headless Chrome, exercising HTMX swaps end to end.
+`FIDUCIA_ADMIN_TEST_URL`, or boots the real axum binary through the shared Cargo
+harness when all required database/upstream environment variables are present.
+Missing external configuration produces an explicit skip: the app's fail-closed
+admin DB boundary is never weakened for a test. The specs drive the operator
+dashboard and infra-scale flows through headless Chrome, exercising HTMX swaps
+end to end.
 
 - **`admin-browser-harness.mjs`** — the shared boot recipe: Chrome discovery and
-  the `cargo run` server lifecycle come from `@fiducia/test-config`; only the
+  the Cargo-driven server lifecycle come from `@fiducia/test-config`; only the
   admin-specific launch args and prerequisite check live here. Exports
   `startAdmin()` and `unavailableReason()`.
 - **`admin-playwright.test.mjs`** — the same flows driven with Playwright.

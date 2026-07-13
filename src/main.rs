@@ -2408,7 +2408,10 @@ mod cluster_tests {
             )
             .route(
                 "/v1/nodes",
-                get(move || async move {
+                get(move || {
+                    let ok_address = ok_address.clone();
+                    let down_address = down_address.clone();
+                    async move {
                     Json(json!({
                         "nodes": [
                             {

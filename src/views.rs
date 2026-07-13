@@ -593,18 +593,7 @@ pub fn cluster_nodes_panel(nodes: &[Value], observations: &[NodeObservation]) ->
                             }
                             td class="muted" title=(utc_timestamp(last_seen)) { (relative_age(last_seen, now)) }
                             td {
-                                @match observations.iter().find(|observation| observation.node_id == node_id) {
-                                    Some(observation) => @match (&observation.shards, &observation.error) {
-                                        (Some(shards), _) => {
-                                            span class="tag tag--ok" {
-                                                "ok · leads " (shards.leader_count) " of " (shards.shards.len())
-                                            }
-                                        }
-                                        (None, Some(error)) => span class="tag tag--bad" title=(error) { "unreachable" },
-                                        (None, None) => span class="tag" { "—" },
-                                    },
-                                    None => span class="tag" title="not in the observe target set" { "—" },
-                                }
+                                (observe_cell(observations.iter().find(|observation| observation.node_id == node_id)))
                             }
                         }
                     }

@@ -722,15 +722,19 @@ async fn cluster_data(st: &AppState) -> Result<ClusterData, Response> {
         .await
         .map_err(|err| upstream_error("brain_nodes_failed", "fiducia-brain", err))?;
     // Explicit FIDUCIA_NODE_URLS wins; otherwise dial the addresses the nodes
-    // heartbeat into the brain.
-    let targets = if st.node_urls.is_empty() {
-        cluster_insight::targets_from_brain_nodes(&nodes)
+    // heartbeat into the brain — trust-checked so a spoofed brain address can't
+    // harvest the cluster secret (H1) — and capped in count (M3).
+    let policy = cluster_insight::NodeHostPolicy::from_env();
+    let mut targets = if st.node_urls.is_empty() {
+        cluster_insight::targets_from_brain_nodes(&nodes, &policy)
     } else {
-        cluster_insight::explicit_node_targets(&st.node_urls)
+        cluster_insight::explicit_node_targets(&st.node_urls, &policy)
     };
+    let truncated_from = cluster_insight::truncate_targets(&mut targets);
     let observations = cluster_insight::observe_shards_fanout(&targets).await;
     let merged = cluster_insight::merge_shards(&observations);
-    let quorum = cluster_insight::cluster_quorum(&observations, &merged);
+    let mut quorum = cluster_insight::cluster_quorum(&observations, &merged);
+    quorum.targets_truncated_from = truncated_from;
     Ok(ClusterData {
         status,
         nodes,

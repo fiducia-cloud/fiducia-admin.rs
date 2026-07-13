@@ -1041,6 +1041,106 @@ mod auth_flow_tests {
 }
 
 #[cfg(test)]
+mod csrf_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn guarded_app() -> Router {
+        Router::new()
+            .route("/infra/scale", post(|| async { "reached-handler" }))
+            .route("/healthz", get(health))
+            .layer(middleware::from_fn(same_origin_guard))
+    }
+
+    async fn send(method: &str, uri: &str, headers: &[(&str, &str)]) -> axum::response::Response {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        guarded_app()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cross_site_and_same_site_sibling_posts_are_rejected() {
+        // A cross-site page forging an operator POST.
+        let cross_site = send(
+            "POST",
+            "/infra/scale",
+            &[("sec-fetch-site", "cross-site")],
+        )
+        .await;
+        assert_eq!(cross_site.status(), StatusCode::FORBIDDEN);
+
+        // A sibling origin on the same registrable domain (customer portal /
+        // marketing site) — SameSite=Strict alone would NOT block this.
+        let same_site = send("POST", "/infra/scale", &[("sec-fetch-site", "same-site")]).await;
+        assert_eq!(same_site.status(), StatusCode::FORBIDDEN);
+
+        // Older browser: no fetch metadata, mismatched Origin.
+        let bad_origin = send(
+            "POST",
+            "/infra/scale",
+            &[
+                ("origin", "https://evil.example"),
+                ("host", "admin.fiducia.cloud"),
+            ],
+        )
+        .await;
+        assert_eq!(bad_origin.status(), StatusCode::FORBIDDEN);
+
+        // Opaque origins are never ours.
+        let null_origin = send(
+            "POST",
+            "/infra/scale",
+            &[("origin", "null"), ("host", "admin.fiducia.cloud")],
+        )
+        .await;
+        assert_eq!(null_origin.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn same_origin_and_non_browser_posts_reach_the_handler() {
+        for headers in [
+            vec![("sec-fetch-site", "same-origin")],
+            vec![("sec-fetch-site", "none")], // address bar / bookmark
+            vec![
+                ("origin", "https://admin.fiducia.cloud"),
+                ("host", "admin.fiducia.cloud"),
+            ],
+            vec![], // curl / tests / bearer-token API callers: no ambient cookie to ride
+        ] {
+            let response = send("POST", "/infra/scale", &headers).await;
+            assert_eq!(response.status(), StatusCode::OK, "headers={headers:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_gets_pass_but_websocket_handshakes_are_origin_checked() {
+        let get = send("GET", "/healthz", &[("sec-fetch-site", "cross-site")]).await;
+        assert_eq!(get.status(), StatusCode::OK);
+
+        // A WebSocket handshake is a GET, but it authenticates with the admin
+        // cookie — a cross-origin page must not be able to open it.
+        let ws = send(
+            "GET",
+            "/healthz",
+            &[
+                ("upgrade", "websocket"),
+                ("origin", "https://evil.example"),
+                ("host", "admin.fiducia.cloud"),
+            ],
+        )
+        .await;
+        assert_eq!(ws.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
 mod interface_contract_tests {
     use fiducia_interfaces::{LockAcquireManyRequest, ProposeErrorReason};
 

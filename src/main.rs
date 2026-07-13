@@ -776,7 +776,7 @@ async fn loki_events(st: &AppState, since_minutes: i64) -> views::EventsPanel {
     };
     match cluster_insight::recent_cluster_events(url, since_minutes).await {
         Ok(events) => views::EventsPanel::Events(events),
-        Err(err) => views::EventsPanel::Error(err.to_string()),
+        Err(err) => views::EventsPanel::Error(upstream::error_class(&*err)),
     }
 }
 

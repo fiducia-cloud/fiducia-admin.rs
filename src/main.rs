@@ -72,6 +72,10 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_WRITE_KEY_BYTES: usize = 256;
 const DEFAULT_CATCHUP_PAGE_SIZE: u64 = 100;
 const MAX_CATCHUP_PAGE_SIZE: u64 = 500;
+/// Minimum node count a scale request may target — the multi-cloud replication
+/// baseline. Mirrors the `infra_operations` sync-write guard so both write paths
+/// enforce the same floor.
+const MIN_SCALE_TARGET_NODES: u32 = 3;
 const CSRF_HEADER: &str = "x-fiducia-csrf";
 
 /// The vendored htmx bundle, compiled into the binary and served same-origin at

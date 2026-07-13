@@ -736,4 +736,124 @@ mod tests {
         assert!(html.contains(r#"data-fiducia-sync="infra_operations""#));
         assert!(html.contains(r#"src="/assets/fiducia-sync.js""#));
     }
+
+    #[test]
+    fn cluster_page_polls_its_fragments_and_the_nav_links_it() {
+        let admin = user();
+        let html = cluster(&admin, "csrf-test-token", html! {}, html! {}, html! {}).into_string();
+        assert!(html.contains("Cluster insight"));
+        assert!(html.contains(r#"href="/cluster""#), "nav link");
+        assert!(html.contains(r#"hx-get="/cluster/shards""#));
+        assert!(html.contains(r#"hx-get="/cluster/nodes""#));
+        assert!(html.contains(r#"hx-get="/cluster/events""#));
+        assert!(html.contains(r#"hx-trigger="every 5s""#));
+    }
+
+    #[test]
+    fn cluster_status_panel_renders_cards_badges_and_shard_rows() {
+        let status = json!({
+            "cluster_id": "fiducia-test", "version": "0.1.0",
+            "shard_count": 2, "replication_factor": 3,
+            "topology": { "nodes_by_health": { "healthy": 2, "dead": 1 } },
+            "placement": {
+                "unplaced_shards": 0, "under_replicated_shards": 1,
+                "leaderless_shards": 0, "shards_with_unhealthy_replicas": 0
+            },
+            "brain_cluster": {
+                "placement_generation": 7, "is_leader": true, "leader": null,
+                "available": true, "ha_configured": true
+            }
+        });
+        let view: crate::cluster_insight::ShardView = serde_json::from_value(json!({
+            "shard_id": 0, "role": "leader", "term": 3, "leader_id": "node-a",
+            "commit_index": 42, "last_applied": 41, "storage_healthy": false,
+            "storage_error": "disk full", "healthy_replicas": 3, "has_quorum": true
+        }))
+        .unwrap();
+        let shards = vec![MergedShard {
+            shard_id: 0,
+            reported_by: "node-a".into(),
+            leader_view: true,
+            view,
+        }];
+        let quorum = ClusterQuorum {
+            leaderless: vec![],
+            at_risk: vec![0],
+            storage_faulted: vec![0],
+            unresponsive: vec![],
+            nodes_reporting: 2,
+            nodes_failed: 1,
+        };
+        let html = cluster_status_panel(
+            &status,
+            &shards,
+            &quorum,
+            &PromScrape::Up { targets: 2 },
+            Some("/telemetry"),
+        )
+        .into_string();
+        assert!(html.contains("fiducia-test"));
+        assert!(html.contains("placement generation"));
+        assert!(html.contains("2 healthy"));
+        assert!(html.contains("1 dead"));
+        assert!(html.contains("1 under-replicated"));
+        assert!(html.contains("1 at-risk"));
+        assert!(html.contains("2 of 3 nodes"), "fan-out coverage is shown");
+        assert!(html.contains(r#"id="shard-table""#));
+        assert!(html.contains("quorum (3)"));
+        assert!(html.contains("disk full"), "storage fault tooltip");
+        assert!(html.contains("/telemetry/explore?left="), "Grafana prom link");
+    }
+
+    #[test]
+    fn cluster_nodes_panel_badges_reachability_per_node() {
+        let nodes = vec![json!({
+            "node_id": "node-a", "address": "10.0.0.1:8090", "health": "healthy",
+            "failure_domain": "gcp/europe-west1", "last_seen_ms": 1_752_400_000_000i64,
+            "hosted_shards": [0, 1], "leading_shards": [0]
+        })];
+        let observations = vec![NodeObservation {
+            node_id: "node-a".into(),
+            base_url: "http://10.0.0.1:8090".into(),
+            shards: None,
+            error: Some("connect timeout".into()),
+        }];
+        let html = cluster_nodes_panel(&nodes, &observations).into_string();
+        assert!(html.contains(r#"id="node-table""#));
+        assert!(html.contains("node-a"));
+        assert!(html.contains("unreachable"));
+        assert!(html.contains("connect timeout"), "error carried in the tooltip");
+        assert!(html.contains("2 / 1"), "hosted / leading counts");
+    }
+
+    #[test]
+    fn cluster_events_panel_renders_all_three_states() {
+        let unconfigured =
+            cluster_events_panel(&EventsPanel::NotConfigured, 30, None).into_string();
+        assert!(unconfigured.contains("FIDUCIA_LOKI_URL"));
+
+        let failed =
+            cluster_events_panel(&EventsPanel::Error("boom".into()), 30, None).into_string();
+        assert!(failed.contains("Loki query failed: boom"));
+
+        let events = vec![ClusterEvent {
+            at_ms: 1_752_400_681_123,
+            kind: "leader_transfer",
+            shard: Some(3),
+            node: None,
+            from: Some("Follower".into()),
+            to: Some("Leader".into()),
+            reason: Some("became_leader".into()),
+            message: "observed raft leadership transition".into(),
+        }];
+        let rendered =
+            cluster_events_panel(&EventsPanel::Events(events), 30, Some("/telemetry"))
+                .into_string();
+        assert!(rendered.contains("leader_transfer"));
+        assert!(rendered.contains("Follower"));
+        assert!(rendered.contains("became_leader"));
+        assert!(rendered.contains("last 30m"));
+        assert!(rendered.contains("Open in Grafana"));
+        assert!(rendered.contains("/telemetry/explore?left="));
+    }
 }

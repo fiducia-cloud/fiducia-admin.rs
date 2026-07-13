@@ -848,6 +848,7 @@ mod tests {
             base_url: "http://10.0.0.1:8090".into(),
             shards: None,
             error: Some("connect timeout".into()),
+            untrusted: false,
         }];
         let html = cluster_nodes_panel(&nodes, &observations).into_string();
         assert!(html.contains(r#"id="node-table""#));

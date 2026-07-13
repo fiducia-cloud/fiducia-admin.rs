@@ -999,13 +999,14 @@ async fn cluster_metrics_api(State(st): State<Arc<AppState>>, headers: HeaderMap
             {
                 Ok(series) => json!(series),
                 // The optional plane degrades in place, like the per-node errors.
-                Err(err) => json!({ "error": err.to_string() }),
+                Err(err) => json!({ "error": upstream::error_class(&*err) }),
             }
         }
     };
     Json(json!({
         "nodes": nodes,
         "prometheus_up_range": prometheus_up_range,
+        "targets_truncated_from": targets_truncated_from,
         "generated_at_ms": cluster_insight::now_ms(),
     }))
     .into_response()

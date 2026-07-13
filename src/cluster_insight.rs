@@ -717,13 +717,10 @@ pub async fn prom_range_query(
     end: i64,
     step: u32,
 ) -> InsightResult<Vec<Value>> {
-    let value: Value = client(OBSERVABILITY_TIMEOUT_SECS)?
-        .get(prom_range_query_url(base_url, query, start, end, step))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let request =
+        client(OBSERVABILITY_TIMEOUT_SECS)?.get(prom_range_query_url(base_url, query, start, end, step));
+    let body = upstream::send_capped(request).await?;
+    let value: Value = serde_json::from_slice(&body)?;
     prom_result_vector(&value)
 }
 

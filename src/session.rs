@@ -135,7 +135,7 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Pull the bearer token from the `Authorization` header, else fall back to the
-/// `fiducia_session` cookie — so both browser (cookie) and API (header) callers
+/// `fiducia_admin_session` cookie — so both browser (cookie) and API (header) callers
 /// work, as the module contract promises.
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     if let Some(jwt) = headers

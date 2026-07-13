@@ -13,7 +13,7 @@ serde_json = "1"
 tower-http = { version = "0.5", features = ["trace", "timeout", "limit", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# HTTP client for calling fiducia-auth (sessions/keys) and fiducia-brain (infra).
+# HTTP client for verifying sessions with fiducia-auth and calling fiducia-brain.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Compile-checked, auto-escaping HTML templates (the MASH "M"). Replaces the
 # hand-rolled string templates + esc() in views.rs; the axum feature makes

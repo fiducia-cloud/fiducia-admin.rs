@@ -9,8 +9,10 @@ customer BFF.
 
 ## Operator boundary
 
-Every non-public route requires a verified `admin` or `operator` role from
-Supabase `app_metadata`, returned by `fiducia-auth /v1/me`. Email addresses and
+Every non-public route requires both a verified `admin` or `operator` role from
+Supabase `app_metadata` (returned by `fiducia-auth /v1/me`) and a matching,
+enabled operator record in the isolated admin database. The registry lookup uses
+the immutable Supabase user id, never an email allowlist. Email addresses and
 ordinary Supabase `authenticated` membership never grant admin access.
 
 The sign-in form exchanges operator credentials directly with Supabase Auth,
@@ -59,7 +61,7 @@ Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-tel
 | Var | Type | Secret? | Meaning | Secure default (unset) |
 |-----|------|---------|---------|------------------------|
 | `DATABASE_URL` | string | **yes** (creds) | Admin-plane Postgres (its OWN DB — a security boundary, never the customer DB). Required at startup. | — (required) |
-| `FIDUCIA_AUTH_URL` | string | no | Base URL of `fiducia-auth` (session verification, keys). Required. | — (required) |
+| `FIDUCIA_AUTH_URL` | string | no | Base URL of `fiducia-auth` for session verification. Required. | — (required) |
 | `FIDUCIA_BRAIN_URL` | string | no | Base URL of `fiducia-brain` (infra ops). Required. | — (required) |
 | `FIDUCIA_INTERNAL_SECRET` | string | **yes** (secret) | Cluster trusted-hop secret sent to the brain. Required; never logged. | — (required) |
 | `SUPABASE_URL` | string | no | Supabase project URL used for operator sign-in. | — (required) |
@@ -89,7 +91,7 @@ pinned [`flags-2-env`](https://github.com/ORESoftware/flags-2-env) submodule
 (`vendor/flags-2-env`) and the `.cli-flags.toml` schema, then execs the command:
 
 ```bash
-scripts/with-flags2env.sh --port 8096 --admin-emails you@acme.com -- cargo run
+scripts/with-flags2env.sh --port 8096 -- cargo run
 ```
 
 The schema is audited in CI (`.github/workflows/cli-flags.yml`). Build the pinned
@@ -104,7 +106,7 @@ Hardening in place (verified this audit):
 - **Transport / session.** The host-specific `fiducia_admin_session` cookie is
   `HttpOnly; SameSite=Strict; Secure` by default. Admin authorization comes only
   from the `fiducia-auth`-verified `admin` or `operator` role copied from trusted
-  Supabase `app_metadata`.
+  Supabase `app_metadata`, plus the enabled subject-keyed operator registry.
 - **Complete route gate.** Dashboard, infra, sync catch-up/write, and WebSocket
   handshake paths all enforce the operator role. Customer account/API-key routes
   are not compiled into this service.
@@ -125,6 +127,8 @@ with rationale, `cargo audit` runs clean):
   enables only PostgreSQL, so the RSA code is not compiled.
 - **`proc-macro-error` RUSTSEC-2024-0370** (unmaintained) — build-time only (via
   `maud_macros`), never linked into the running binary.
+- **`proc-macro-error2` RUSTSEC-2026-0173** (unmaintained) — build-time only (via
+  SeaORM's derive macros), never linked into the running binary.
 
 ## Related
 

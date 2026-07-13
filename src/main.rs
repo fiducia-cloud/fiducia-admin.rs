@@ -9,12 +9,10 @@
 //! authenticated app — distinct from `fiducia-backend`, which serves the public
 //! marketing site.
 //!
-//! ADMIN plane isolation: when `DATABASE_URL` is set it points at the admin app's
-//! OWN Postgres (operators, infra_operations, admin_audit_log) — a separate
-//! instance from the customer DB. That is a security boundary; this service never
-//! connects to the customer database. With no `DATABASE_URL` the app still renders
-//! fully (the infra audit list is simply empty), so it boots for local dev / E2E
-//! with just the `FIDUCIA_ADMIN_DEV_SESSION` bypass and no DB.
+//! ADMIN plane isolation: `DATABASE_URL` points at the admin app's OWN Postgres
+//! (operators, infra_operations, admin_audit_log) — a separate instance from the
+//! customer DB. That is a security boundary; this service never connects to the
+//! customer database, and startup fails closed when the admin DB is unavailable.
 
 mod entity;
 mod session;
@@ -41,7 +39,7 @@ use axum::{
 };
 use fiducia_sync_core::{ChangeEvent, ChangeOp, WriteAck};
 use maud::Markup;
-use sea_orm::sea_query::{Expr, ExprTrait, Func, OnConflict};
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, DatabaseConnection,
     DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
@@ -196,10 +194,13 @@ async fn require(headers: &HeaderMap, st: &AppState) -> Result<Session, Response
 /// Require the admin role, else 403.
 async fn require_admin(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {
     let s = require(headers, st).await?;
-    if s.is_admin {
-        Ok(s)
-    } else {
-        Err((StatusCode::FORBIDDEN, views::forbidden(&s)).into_response())
+    if !s.is_admin {
+        return Err((StatusCode::FORBIDDEN, views::forbidden(&s)).into_response());
+    }
+    match operator_is_enabled(st, &s).await {
+        Ok(true) => Ok(s),
+        Ok(false) => Err((StatusCode::FORBIDDEN, views::forbidden(&s)).into_response()),
+        Err(error) => Err(dependency_error("operator_registry_unavailable", error)),
     }
 }
 
@@ -208,7 +209,13 @@ async fn require_admin(headers: &HeaderMap, st: &AppState) -> Result<Session, Re
 /// readable 401/403. Guards the `/api/admin/sync/*` write endpoints.
 async fn require_admin_api(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {
     match require(headers, st).await {
-        Ok(s) if s.is_admin => Ok(s),
+        Ok(s) if s.is_admin => match operator_is_enabled(st, &s).await {
+            Ok(true) => Ok(s),
+            Ok(false) => {
+                Err((StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" }))).into_response())
+            }
+            Err(error) => Err(dependency_error("operator_registry_unavailable", error)),
+        },
         Ok(_) => {
             Err((StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" }))).into_response())
         }
@@ -218,6 +225,35 @@ async fn require_admin_api(headers: &HeaderMap, st: &AppState) -> Result<Session
         )
             .into_response()),
     }
+}
+
+async fn enabled_operator(
+    st: &AppState,
+    session: &Session,
+) -> Result<Option<operators::Model>, DbErr> {
+    if cfg!(debug_assertions) && session.user_id == "dev-admin" {
+        return Ok(None);
+    }
+    let Ok(subject) = Uuid::parse_str(&session.user_id) else {
+        return Ok(None);
+    };
+    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
+    let operator = operators::Entity::find()
+        .filter(operators::Column::SupabaseUserId.eq(subject))
+        .filter(operators::Column::Disabled.eq(false))
+        .one(db)
+        .await?;
+    Ok(
+        operator
+            .filter(|operator| matches!(operator.role.as_str(), "owner" | "admin" | "operator")),
+    )
+}
+
+async fn operator_is_enabled(st: &AppState, session: &Session) -> Result<bool, DbErr> {
+    if cfg!(debug_assertions) && session.user_id == "dev-admin" {
+        return Ok(true);
+    }
+    Ok(enabled_operator(st, session).await?.is_some())
 }
 
 async fn login() -> Markup {
@@ -275,6 +311,11 @@ async fn login_submit(State(st): State<Arc<AppState>>, Form(form): Form<LoginFor
     };
     if !session.is_admin {
         return (StatusCode::FORBIDDEN, views::forbidden(&session)).into_response();
+    }
+    match operator_is_enabled(&st, &session).await {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::FORBIDDEN, views::forbidden(&session)).into_response(),
+        Err(error) => return dependency_error("operator_registry_unavailable", error),
     }
 
     let cookie = make_session_cookie(&password_session.access_token);
@@ -402,7 +443,7 @@ async fn recent_ops(st: &AppState) -> Result<Vec<Value>, DbErr> {
 }
 
 /// Insert a `scale` row into infra_operations (status `requested`, operator
-/// resolved from the session email if a matching operator exists) and broadcast
+/// resolved from the verified Supabase subject) and broadcast
 /// it as a `fiducia:sync` change.
 async fn record_scale(
     st: &AppState,
@@ -410,14 +451,7 @@ async fn record_scale(
     target_nodes: u32,
 ) -> Result<InfraOperationsRow, DbErr> {
     let db = st.db.as_ref().ok_or_else(database_unavailable)?;
-    let operator_id: Option<Uuid> = match &s.email {
-        Some(email) => operators::Entity::find()
-            .filter(Func::lower(Expr::col(operators::Column::Email)).eq(email.to_lowercase()))
-            .one(db)
-            .await?
-            .map(|operator| operator.id),
-        None => None,
-    };
+    let operator_id = enabled_operator(st, s).await?.map(|operator| operator.id);
     let row = infra_operations::ActiveModel {
         operator_id: Set(operator_id),
         action: Set("scale".to_string()),

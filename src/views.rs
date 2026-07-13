@@ -81,6 +81,7 @@ pub fn page(
                     @if session.is_some() {
                         a href="/" { "Dashboard" }
                         a href="/infra" { "Infra" }
+                        a href="/cluster" { "Cluster" }
                     } @else {
                         a href="/login" { "Sign in" }
                     }

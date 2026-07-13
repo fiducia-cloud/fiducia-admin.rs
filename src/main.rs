@@ -186,6 +186,62 @@ fn is_htmx(headers: &HeaderMap) -> bool {
     headers.contains_key("hx-request")
 }
 
+/// CSRF guard: state-changing requests (and WebSocket upgrades, which browsers
+/// authenticate with the same session cookie) must originate from this app's own
+/// origin. `SameSite=Strict` on the cookie already blocks cross-SITE forgery,
+/// but sibling deployments on the same registrable domain (the customer portal,
+/// the marketing site) are same-SITE: without this check a compromised sibling
+/// origin could forge operator POSTs carrying the admin cookie. HTMX does not
+/// provide CSRF protection by itself.
+///
+/// Browser metadata is validated strongest-first: `Sec-Fetch-Site` when present
+/// (every current browser sends it), else `Origin` matched against `Host`.
+/// Requests with neither header — curl, tests, non-browser API callers using an
+/// `Authorization: Bearer` token — pass through: they carry no ambient cookie a
+/// cross-origin attacker could ride, so they are not CSRF-forgeable.
+async fn same_origin_guard(req: Request, next: Next) -> Response {
+    let is_ws_upgrade = req
+        .headers()
+        .get("upgrade")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    let state_changing = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    if (state_changing || is_ws_upgrade) && !same_origin(req.headers()) {
+        tracing::warn!(
+            method = %req.method(),
+            path = %req.uri().path(),
+            "rejected cross-origin state-changing request (CSRF guard)"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "cross_origin_request_rejected" })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// True when the browser-supplied request metadata proves same-origin — or when
+/// no browser metadata is present at all (non-browser caller).
+fn same_origin(headers: &HeaderMap) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        // `same-origin` is ours; `none` is user-initiated (address bar/bookmark).
+        // Everything else — including `same-site` siblings — is rejected.
+        return matches!(site, "same-origin" | "none");
+    }
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        // Compare the Origin authority to the Host header (scheme-agnostic: TLS
+        // terminates upstream). An opaque `Origin: null` never matches.
+        let origin_host = origin.split_once("://").map(|(_, authority)| authority);
+        let host = headers.get("host").and_then(|v| v.to_str().ok());
+        return match (origin_host, host) {
+            (Some(origin_host), Some(host)) => origin_host.eq_ignore_ascii_case(host),
+            _ => false,
+        };
+    }
+    true
+}
+
 /// Require any signed-in user, else redirect to /login.
 async fn require(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {
     session::current(headers, &st.auth_url)

@@ -5,7 +5,7 @@ The server-rendered, operator-only **admin dashboard** for
 with Maud, Axum, SeaORM, and HTMX. It has its own host-only session cookie,
 admin routes, database, realtime channel, and browser storage. Customer account
 and API-key workflows live exclusively in the separate Rust MASH customer app,
-`fiducia-backend.rs`. The static `fiducia-ui.web` repository is marketing only.
+`fiducia-customer.rs`. The static `fiducia-marketing.web` repository is marketing only.
 
 ## Operator boundary
 
@@ -171,4 +171,4 @@ with rationale, `cargo audit` runs clean):
 
 ## Related
 
-- [`fiducia-auth.rs`](https://github.com/fiducia-cloud/fiducia-auth.rs) · [`fiducia-brain.rs`](https://github.com/fiducia-cloud/fiducia-brain.rs) · [`fiducia-backend.rs`](https://github.com/fiducia-cloud/fiducia-backend.rs)
+- [`fiducia-auth.rs`](https://github.com/fiducia-cloud/fiducia-auth.rs) · [`fiducia-brain.rs`](https://github.com/fiducia-cloud/fiducia-brain.rs) · [`fiducia-customer.rs`](https://github.com/fiducia-cloud/fiducia-customer.rs)

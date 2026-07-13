@@ -4,8 +4,8 @@ FROM rust:1.97.0-slim-bookworm@sha256:cfbb0e0ef7a73e736386bfa346f1cb0503c6d16296
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
-ARG INTERFACES_REF=bbd8b52ce729ec34b0a9bff4dda6d0a448181797
-ARG SYNC_REF=5d3660511b3bfe951d0a66f9d7737497e0d1401f
+ARG INTERFACES_REF=5f2c5279ee19941024455b2843256872485bac82
+ARG SYNC_REF=a57112d41615f7d6783b3f617b013fe5dcbf1d63
 RUN test "${#INTERFACES_REF}" -eq 40 \
     && case "$INTERFACES_REF" in *[!0-9a-f]*) exit 1;; esac \
     && git init fiducia-interfaces \

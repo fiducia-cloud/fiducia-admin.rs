@@ -57,7 +57,9 @@ use tower_http::{
 };
 use uuid::Uuid;
 
-use entity::{admin_audit_log, infra_operations, operators, sync_idempotency_keys};
+use entity::{
+    admin_audit_log, admin_broadcast_notices, infra_operations, operators, sync_idempotency_keys,
+};
 use infra_operations::Model as InfraOperationsRow;
 use request_security::{RequestSecurity, RequestSecurityError};
 use session::{Session, ADMIN_SESSION_COOKIE, LOGIN_CSRF_COOKIE};
@@ -146,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/infra", get(infra_page))
         .route("/infra/scale", post(scale))
         .route("/audit", get(audit_page))
+        .route("/notices", get(notices_page).post(create_notice))
         // Cluster Insight (read-only): HTML page + polled htmx fragments behind
         // the operator gate, and JSON views of the same data for API callers.
         .route("/cluster", get(cluster_page))
@@ -738,6 +741,72 @@ async fn audit_api(
     }
 }
 
+async fn notices_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let session = match require_admin(&headers, &st).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let rows = match recent_notices(&st, 50).await {
+        Ok(rows) => rows,
+        Err(error) => return dependency_error("notices_read_failed", error),
+    };
+    views::notices(&session, &csrf_token(&st, &session), &rows, None).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct NoticeForm {
+    csrf_token: String,
+    severity: String,
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+const NOTICE_SEVERITIES: [&str; 3] = ["info", "warning", "critical"];
+const MAX_NOTICE_TITLE_CHARS: usize = 200;
+const MAX_NOTICE_BODY_CHARS: usize = 2000;
+
+async fn create_notice(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<NoticeForm>,
+) -> Response {
+    let session = match require_admin(&headers, &st).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_form_security(&headers, &st, &session, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    // Validate against the same bounds the schema enforces, before any write, so
+    // a bad request is a clean 400 rather than a database constraint error.
+    let title = form.title.trim();
+    let body = form.body.trim();
+    if !NOTICE_SEVERITIES.contains(&form.severity.as_str())
+        || title.is_empty()
+        || title.chars().count() > MAX_NOTICE_TITLE_CHARS
+        || body.chars().count() > MAX_NOTICE_BODY_CHARS
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_notice" })),
+        )
+            .into_response();
+    }
+    if let Err(error) = record_notice(&st, &session, &form.severity, title, body).await {
+        return dependency_error("notice_write_failed", error);
+    }
+    let rows = match recent_notices(&st, 50).await {
+        Ok(rows) => rows,
+        Err(error) => return dependency_error("notices_read_failed", error),
+    };
+    if is_htmx(&headers) {
+        views::notice_table(&rows, Some("Notice published.")).into_response()
+    } else {
+        redirect("/notices")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ScaleForm {
     csrf_token: String,
@@ -1141,6 +1210,63 @@ async fn recent_admin_audit(
         .limit(limit)
         .all(db)
         .await
+}
+
+async fn recent_notices(
+    st: &AppState,
+    limit: u64,
+) -> Result<Vec<admin_broadcast_notices::Model>, DbErr> {
+    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
+    admin_broadcast_notices::Entity::find()
+        .order_by_desc(admin_broadcast_notices::Column::StartsAt)
+        .limit(limit)
+        .all(db)
+        .await
+}
+
+/// Publish a broadcast notice and its operator audit record in one transaction,
+/// mirroring `record_scale`: an operator action is never durable without a
+/// matching audit row. `operator_id`/`actor` come from the authorized session.
+async fn record_notice(
+    st: &AppState,
+    s: &Session,
+    severity: &str,
+    title: &str,
+    body: &str,
+) -> Result<admin_broadcast_notices::Model, DbErr> {
+    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
+    let operator_id = match enabled_operator(st, s).await? {
+        Some(operator) => Some(operator.id),
+        None if cfg!(debug_assertions) && s.user_id == "dev-admin" => None,
+        None => {
+            return Err(DbErr::Custom(
+                "operator registry authorization changed before notice write".to_string(),
+            ))
+        }
+    };
+    let transaction = db.begin().await?;
+    let row = admin_broadcast_notices::ActiveModel {
+        operator_id: Set(operator_id),
+        severity: Set(severity.to_string()),
+        title: Set(title.to_string()),
+        body: Set(body.to_string()),
+        ..Default::default()
+    }
+    .insert(&transaction)
+    .await?;
+    admin_audit_log::ActiveModel {
+        actor_operator_id: Set(operator_id),
+        actor: Set(s.email.clone()),
+        action: Set("notice.published".to_string()),
+        target: Set(Some(row.id.to_string())),
+        request_id: Set(None),
+        meta: Set(json!({ "severity": severity, "notice_id": row.id })),
+        ..Default::default()
+    }
+    .insert(&transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(row)
 }
 
 /// A scale target must meet the replication floor and fit the audit record's
@@ -3321,6 +3447,20 @@ mod db_tests {
 
     const SCHEMA: &str = include_str!("../../fiducia-interfaces/sql/admin.sql");
 
+    // Multiple db_tests target one TEST_DATABASE_URL. `CREATE TABLE IF NOT
+    // EXISTS` is not safe against a *concurrent* create (both pass the existence
+    // check, then collide on pg_type), so apply the schema exactly once across
+    // the whole test binary rather than per-test.
+    static SCHEMA_READY: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
+
+    async fn prepare_schema(db: &DatabaseConnection) {
+        let mut ready = SCHEMA_READY.lock().await;
+        if !*ready {
+            db.execute_unprepared(SCHEMA).await.expect("apply admin.sql");
+            *ready = true;
+        }
+    }
+
     fn state_with(db: DatabaseConnection) -> AppState {
         AppState {
             auth_url: "x".into(),
@@ -3356,9 +3496,7 @@ mod db_tests {
         // Raw SQL here applies the canonical gated-test schema; behavioral CRUD
         // below uses SeaORM, while production catch-up owns one reviewed UNION so
         // live rows and tombstones are read in a single database snapshot.
-        db.execute_unprepared(SCHEMA)
-            .await
-            .expect("apply admin.sql");
+        prepare_schema(&db).await;
         let st = state_with(db.clone());
 
         // --- Durable idempotency: rollback -> commit -> exact replay ------------
@@ -3539,5 +3677,43 @@ mod db_tests {
                 .last()
                 .map_or(start_cursor, |change| change.sequence)
         );
+    }
+
+    #[tokio::test]
+    async fn publishing_a_notice_writes_audit_and_bumps_version() {
+        let Some(url) = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+        else {
+            eprintln!("skip publishing_a_notice...: TEST_DATABASE_URL unset");
+            return;
+        };
+        let mut options = ConnectOptions::new(url);
+        options.max_connections(4);
+        let db = Database::connect(options)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+        prepare_schema(&db).await;
+        let st = state_with(db.clone());
+
+        // dev-admin path: operator_id is None but the transaction still records
+        // both the notice and its audit row.
+        let session = Session::test_admin_bearer("dev-admin", "verified.jwt");
+        let before = recent_admin_audit(&st, 100).await.unwrap().len();
+        let notice = record_notice(&st, &session, "warning", "Maintenance 02:00 UTC", "Brief blip")
+            .await
+            .expect("publish notice");
+        // Trigger-assigned sync fields.
+        assert_eq!(notice.version, 1);
+        assert!(notice.sync_sequence > 0);
+        assert!(notice.active);
+
+        // The notice is listed and an audit row was written in the same commit.
+        let listed = recent_notices(&st, 50).await.unwrap();
+        assert!(listed.iter().any(|n| n.id == notice.id));
+        let after = recent_admin_audit(&st, 100).await.unwrap();
+        assert_eq!(after.len(), before + 1);
+        assert!(after.iter().any(|a| a.action == "notice.published"
+            && a.target.as_deref() == Some(notice.id.to_string().as_str())));
     }
 }

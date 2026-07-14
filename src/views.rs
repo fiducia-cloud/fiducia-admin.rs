@@ -21,7 +21,7 @@ use crate::cluster_insight::{
     utc_timestamp, ClusterEvent, ClusterQuorum, MergedShard, NodeObservation, PromScrape,
     PROM_FIDUCIA_UP_QUERY,
 };
-use crate::entity::admin_audit_log;
+use crate::entity::{admin_audit_log, admin_broadcast_notices};
 use crate::session::Session;
 
 const CSS: &str = r#"
@@ -83,6 +83,7 @@ pub fn page(
                         a href="/" { "Dashboard" }
                         a href="/infra" { "Infra" }
                         a href="/cluster" { "Cluster" }
+                        a href="/notices" { "Notices" }
                         a href="/audit" { "Audit" }
                     } @else {
                         a href="/login" { "Sign in" }
@@ -251,6 +252,95 @@ pub fn audit(s: &Session, csrf_token: &str, events: &[admin_audit_log::Model]) -
             }
         },
     )
+}
+
+/// Operator broadcast notices: the active/scheduled banner set plus a create
+/// form. Operator-gated; `record_notice` writes an audit row alongside every
+/// insert. Marked `data-fiducia-sync` so open consoles reconcile live.
+pub fn notices(
+    s: &Session,
+    csrf_token: &str,
+    notices: &[admin_broadcast_notices::Model],
+    message: Option<&str>,
+) -> Markup {
+    page(
+        "Notices",
+        Some(s),
+        Some(csrf_token),
+        html! {
+            h1 { "Broadcast notices" }
+            div class="card" {
+                p class="muted" {
+                    "Operator-authored announcements shown across the admin console. "
+                    "Every publish is recorded in the operator audit log."
+                }
+                (notice_form(csrf_token))
+            }
+            div id="notice-list" data-fiducia-sync="admin_broadcast_notices" {
+                (notice_table(notices, message))
+            }
+        },
+    )
+}
+
+fn notice_form(csrf_token: &str) -> Markup {
+    html! {
+        form method="post" action="/notices"
+            hx-post="/notices" hx-target="#notice-list" hx-swap="innerHTML"
+            style="display:grid;gap:.6rem;max-width:40rem;margin-top:.8rem" {
+            input type="hidden" name="csrf_token" value=(csrf_token);
+            label class="muted" for="notice-severity" { "Severity" }
+            select id="notice-severity" name="severity" {
+                option value="info" { "info" }
+                option value="warning" { "warning" }
+                option value="critical" { "critical" }
+            }
+            label class="muted" for="notice-title" { "Title" }
+            input id="notice-title" name="title" type="text" maxlength="200" required;
+            label class="muted" for="notice-body" { "Body" }
+            textarea id="notice-body" name="body" rows="3" maxlength="2000" {}
+            button class="btn" type="submit" { "Publish notice" }
+        }
+    }
+}
+
+/// Just the notice table — returned on its own from the HTMX create POST so the
+/// list re-renders in place.
+pub fn notice_table(notices: &[admin_broadcast_notices::Model], message: Option<&str>) -> Markup {
+    html! {
+        div class="card" {
+            @if let Some(message) = message {
+                p class="inline-message" role="status" { (message) }
+            }
+            table {
+                thead {
+                    tr {
+                        th { "Published" }
+                        th { "Severity" }
+                        th { "Title" }
+                        th { "State" }
+                    }
+                }
+                tbody {
+                    @if notices.is_empty() {
+                        tr { td colspan="4" class="muted" { "No notices published yet." } }
+                    } @else {
+                        @for notice in notices {
+                            tr {
+                                td { (notice.starts_at.to_rfc3339()) }
+                                td { code { (&notice.severity) } }
+                                td {
+                                    b { (&notice.title) }
+                                    @if !notice.body.is_empty() { div class="muted" { (&notice.body) } }
+                                }
+                                td { @if notice.active { "active" } @else { "inactive" } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---- Infra ------------------------------------------------------------------

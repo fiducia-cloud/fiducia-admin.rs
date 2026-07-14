@@ -738,6 +738,72 @@ async fn audit_api(
     }
 }
 
+async fn notices_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let session = match require_admin(&headers, &st).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let rows = match recent_notices(&st, 50).await {
+        Ok(rows) => rows,
+        Err(error) => return dependency_error("notices_read_failed", error),
+    };
+    views::notices(&session, &csrf_token(&st, &session), &rows, None).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct NoticeForm {
+    csrf_token: String,
+    severity: String,
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+const NOTICE_SEVERITIES: [&str; 3] = ["info", "warning", "critical"];
+const MAX_NOTICE_TITLE_CHARS: usize = 200;
+const MAX_NOTICE_BODY_CHARS: usize = 2000;
+
+async fn create_notice(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<NoticeForm>,
+) -> Response {
+    let session = match require_admin(&headers, &st).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_form_security(&headers, &st, &session, &form.csrf_token) {
+        return request_security_error(error);
+    }
+    // Validate against the same bounds the schema enforces, before any write, so
+    // a bad request is a clean 400 rather than a database constraint error.
+    let title = form.title.trim();
+    let body = form.body.trim();
+    if !NOTICE_SEVERITIES.contains(&form.severity.as_str())
+        || title.is_empty()
+        || title.chars().count() > MAX_NOTICE_TITLE_CHARS
+        || body.chars().count() > MAX_NOTICE_BODY_CHARS
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_notice" })),
+        )
+            .into_response();
+    }
+    if let Err(error) = record_notice(&st, &session, &form.severity, title, body).await {
+        return dependency_error("notice_write_failed", error);
+    }
+    let rows = match recent_notices(&st, 50).await {
+        Ok(rows) => rows,
+        Err(error) => return dependency_error("notices_read_failed", error),
+    };
+    if is_htmx(&headers) {
+        views::notice_table(&rows, Some("Notice published.")).into_response()
+    } else {
+        redirect("/notices")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ScaleForm {
     csrf_token: String,

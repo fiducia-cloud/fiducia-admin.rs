@@ -3666,4 +3666,42 @@ mod db_tests {
                 .map_or(start_cursor, |change| change.sequence)
         );
     }
+
+    #[tokio::test]
+    async fn publishing_a_notice_writes_audit_and_bumps_version() {
+        let Some(url) = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+        else {
+            eprintln!("skip publishing_a_notice...: TEST_DATABASE_URL unset");
+            return;
+        };
+        let mut options = ConnectOptions::new(url);
+        options.max_connections(4);
+        let db = Database::connect(options)
+            .await
+            .expect("connect TEST_DATABASE_URL");
+        db.execute_unprepared(SCHEMA).await.expect("apply admin.sql");
+        let st = state_with(db.clone());
+
+        // dev-admin path: operator_id is None but the transaction still records
+        // both the notice and its audit row.
+        let session = Session::test_admin_bearer("dev-admin", "verified.jwt");
+        let before = recent_admin_audit(&st, 100).await.unwrap().len();
+        let notice = record_notice(&st, &session, "warning", "Maintenance 02:00 UTC", "Brief blip")
+            .await
+            .expect("publish notice");
+        // Trigger-assigned sync fields.
+        assert_eq!(notice.version, 1);
+        assert!(notice.sync_sequence > 0);
+        assert!(notice.active);
+
+        // The notice is listed and an audit row was written in the same commit.
+        let listed = recent_notices(&st, 50).await.unwrap();
+        assert!(listed.iter().any(|n| n.id == notice.id));
+        let after = recent_admin_audit(&st, 100).await.unwrap();
+        assert_eq!(after.len(), before + 1);
+        assert!(after.iter().any(|a| a.action == "notice.published"
+            && a.target.as_deref() == Some(notice.id.to_string().as_str())));
+    }
 }

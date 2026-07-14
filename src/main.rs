@@ -3496,9 +3496,7 @@ mod db_tests {
         // Raw SQL here applies the canonical gated-test schema; behavioral CRUD
         // below uses SeaORM, while production catch-up owns one reviewed UNION so
         // live rows and tombstones are read in a single database snapshot.
-        db.execute_unprepared(SCHEMA)
-            .await
-            .expect("apply admin.sql");
+        prepare_schema(&db).await;
         let st = state_with(db.clone());
 
         // --- Durable idempotency: rollback -> commit -> exact replay ------------

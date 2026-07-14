@@ -352,9 +352,17 @@ async fn security_headers(request: Request, next: Next) -> Response {
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
     );
+    // `same-origin`, NOT `no-referrer`: under `no-referrer` browsers serialize
+    // the Origin of a form POST as `null` (Fetch spec, request-origin
+    // serialization follows the referrer policy), so `require_same_origin`
+    // would reject every real-browser login while hand-crafted clients that
+    // set Origin themselves sail through — the exact inversion of the intent.
+    // `same-origin` still never leaks the referrer cross-origin and keeps the
+    // Origin header intact for the CSRF origin gate. Proven by the real-
+    // Chromium journeys in fiducia-e2e (`npm run test:browser`).
     headers.insert(
         HeaderName::from_static("referrer-policy"),
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     response
 }

@@ -57,7 +57,7 @@ use tower_http::{
 };
 use uuid::Uuid;
 
-use entity::{infra_operations, operators, sync_idempotency_keys};
+use entity::{admin_audit_log, infra_operations, operators, sync_idempotency_keys};
 use infra_operations::Model as InfraOperationsRow;
 use request_security::{RequestSecurity, RequestSecurityError};
 use session::{Session, ADMIN_SESSION_COOKIE, LOGIN_CSRF_COOKIE};
@@ -145,6 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/", get(dashboard))
         .route("/infra", get(infra_page))
         .route("/infra/scale", post(scale))
+        .route("/audit", get(audit_page))
         // Cluster Insight (read-only): HTML page + polled htmx fragments behind
         // the operator gate, and JSON views of the same data for API callers.
         .route("/cluster", get(cluster_page))
@@ -155,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/admin/cluster/shards", get(cluster_shards_api))
         .route("/api/admin/cluster/events", get(cluster_events_api))
         .route("/api/admin/cluster/metrics", get(cluster_metrics_api))
+        .route("/api/admin/audit", get(audit_api))
         // Local-first sync write path (mirrors the customer plane): the sync
         // client POSTs a queued optimistic write; we persist via SeaORM and return
         // the committed row version, then broadcast the change to WS subscribers.
@@ -350,9 +352,17 @@ async fn security_headers(request: Request, next: Next) -> Response {
         HeaderName::from_static("x-content-type-options"),
         HeaderValue::from_static("nosniff"),
     );
+    // `same-origin`, NOT `no-referrer`: under `no-referrer` browsers serialize
+    // the Origin of a form POST as `null` (Fetch spec, request-origin
+    // serialization follows the referrer policy), so `require_same_origin`
+    // would reject every real-browser login while hand-crafted clients that
+    // set Origin themselves sail through — the exact inversion of the intent.
+    // `same-origin` still never leaks the referrer cross-origin and keeps the
+    // Origin header intact for the CSRF origin gate. Proven by the real-
+    // Chromium journeys in fiducia-e2e (`npm run test:browser`).
     headers.insert(
         HeaderName::from_static("referrer-policy"),
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     response
 }
@@ -663,6 +673,69 @@ async fn infra_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Resp
     };
     let csrf = csrf_token(&st, &s);
     views::infra(&s, &csrf, &nodes, &placement, &recent).into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AuditQuery {
+    limit: Option<u16>,
+}
+
+#[derive(Serialize)]
+struct AdminAuditEvent {
+    id: Uuid,
+    actor: Option<String>,
+    action: String,
+    target: Option<String>,
+    request_id: Option<String>,
+    created_at: String,
+}
+
+fn audit_limit(requested: Option<u16>) -> u64 {
+    requested.map(u64::from).unwrap_or(50).clamp(1, 100)
+}
+
+fn admin_audit_event(row: admin_audit_log::Model) -> AdminAuditEvent {
+    AdminAuditEvent {
+        id: row.id,
+        actor: row.actor,
+        action: row.action,
+        target: row.target,
+        request_id: row.request_id,
+        created_at: row.created_at.to_rfc3339(),
+    }
+}
+
+async fn audit_page(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuditQuery>,
+) -> Response {
+    let session = match require_admin(&headers, &st).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let rows = match recent_admin_audit(&st, audit_limit(query.limit)).await {
+        Ok(rows) => rows,
+        Err(error) => return dependency_error("admin_audit_read_failed", error),
+    };
+    views::audit(&session, &csrf_token(&st, &session), &rows).into_response()
+}
+
+async fn audit_api(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuditQuery>,
+) -> Response {
+    if let Err(response) = require_admin_api(&headers, &st).await {
+        return response;
+    }
+    match recent_admin_audit(&st, audit_limit(query.limit)).await {
+        Ok(rows) => Json(json!({
+            "events": rows.into_iter().map(admin_audit_event).collect::<Vec<_>>()
+        }))
+        .into_response(),
+        Err(error) => dependency_error("admin_audit_read_failed", error),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1056,15 +1129,29 @@ async fn recent_ops(st: &AppState) -> Result<Vec<Value>, DbErr> {
         .collect())
 }
 
+/// Read a bounded operator audit feed. The browser/API projection below never
+/// returns raw metadata, source IPs, or user agents from this security log.
+async fn recent_admin_audit(
+    st: &AppState,
+    limit: u64,
+) -> Result<Vec<admin_audit_log::Model>, DbErr> {
+    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
+    admin_audit_log::Entity::find()
+        .order_by_desc(admin_audit_log::Column::CreatedAt)
+        .limit(limit)
+        .all(db)
+        .await
+}
+
 /// A scale target must meet the replication floor and fit the audit record's
 /// `i32` column, so persistence can never silently wrap it.
 fn scale_target_is_valid(target_nodes: u32) -> bool {
     target_nodes >= MIN_SCALE_TARGET_NODES && i32::try_from(target_nodes).is_ok()
 }
 
-/// Insert a `scale` row into infra_operations (status `requested`, operator
-/// resolved from the verified Supabase subject) and broadcast
-/// it as a `fiducia:sync` change.
+/// Insert the control-plane intent and its operator audit record in one
+/// transaction. The brain call cannot happen unless both durable records exist;
+/// a websocket broadcast occurs only after the transaction commits.
 async fn record_scale(
     st: &AppState,
     s: &Session,
@@ -1080,6 +1167,7 @@ async fn record_scale(
             ))
         }
     };
+    let transaction = db.begin().await?;
     let row = infra_operations::ActiveModel {
         operator_id: Set(operator_id),
         action: Set("scale".to_string()),
@@ -1088,8 +1176,22 @@ async fn record_scale(
         params: Set(json!({ "target_nodes": target_nodes, "replication_factor": 3 })),
         ..Default::default()
     }
-    .insert(db)
+    .insert(&transaction)
     .await?;
+    admin_audit_log::ActiveModel {
+        actor_operator_id: Set(operator_id),
+        actor: Set(s.email.clone()),
+        action: Set("infra.scale.requested".to_string()),
+        target: Set(Some("fiducia-brain".to_string())),
+        request_id: Set(None),
+        // Keep the rich operational context in the append-only log while the
+        // page/API intentionally expose only the narrow event projection.
+        meta: Set(json!({ "target_nodes": target_nodes, "operation_id": row.id })),
+        ..Default::default()
+    }
+    .insert(&transaction)
+    .await?;
+    transaction.commit().await?;
     broadcast_infra_change(st, &row, None);
     Ok(row)
 }
@@ -2338,6 +2440,39 @@ mod cluster_tests {
             grafana_public_url,
             node_urls,
         })
+    }
+
+    #[tokio::test]
+    async fn audit_routes_require_an_operator_session_before_database_access() {
+        let app = Router::new()
+            .route("/audit", get(audit_page))
+            .route("/api/admin/audit", get(audit_api))
+            .with_state(sync_tests::test_state());
+
+        let page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/audit")
+                    .header("host", "admin.fiducia.cloud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::SEE_OTHER);
+
+        let api = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/audit")
+                    .header("host", "admin.fiducia.cloud")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

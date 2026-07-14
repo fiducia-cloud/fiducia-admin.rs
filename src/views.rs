@@ -83,6 +83,7 @@ pub fn page(
                         a href="/" { "Dashboard" }
                         a href="/infra" { "Infra" }
                         a href="/cluster" { "Cluster" }
+                        a href="/notices" { "Notices" }
                         a href="/audit" { "Audit" }
                     } @else {
                         a href="/login" { "Sign in" }

@@ -5,6 +5,7 @@
 //! access to the tables it owns.
 
 pub mod admin_audit_log;
+pub mod admin_broadcast_notices;
 pub mod infra_operations;
 pub mod operators;
 pub mod sync_idempotency_keys;

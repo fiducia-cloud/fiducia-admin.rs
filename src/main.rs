@@ -146,6 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/infra", get(infra_page))
         .route("/infra/scale", post(scale))
         .route("/audit", get(audit_page))
+        .route("/notices", get(notices_page).post(create_notice))
         // Cluster Insight (read-only): HTML page + polled htmx fragments behind
         // the operator gate, and JSON views of the same data for API callers.
         .route("/cluster", get(cluster_page))

@@ -3693,7 +3693,7 @@ mod db_tests {
         let db = Database::connect(options)
             .await
             .expect("connect TEST_DATABASE_URL");
-        db.execute_unprepared(SCHEMA).await.expect("apply admin.sql");
+        prepare_schema(&db).await;
         let st = state_with(db.clone());
 
         // dev-admin path: operator_id is None but the transaction still records

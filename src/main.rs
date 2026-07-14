@@ -1143,6 +1143,63 @@ async fn recent_admin_audit(
         .await
 }
 
+async fn recent_notices(
+    st: &AppState,
+    limit: u64,
+) -> Result<Vec<admin_broadcast_notices::Model>, DbErr> {
+    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
+    admin_broadcast_notices::Entity::find()
+        .order_by_desc(admin_broadcast_notices::Column::StartsAt)
+        .limit(limit)
+        .all(db)
+        .await
+}
+
+/// Publish a broadcast notice and its operator audit record in one transaction,
+/// mirroring `record_scale`: an operator action is never durable without a
+/// matching audit row. `operator_id`/`actor` come from the authorized session.
+async fn record_notice(
+    st: &AppState,
+    s: &Session,
+    severity: &str,
+    title: &str,
+    body: &str,
+) -> Result<admin_broadcast_notices::Model, DbErr> {
+    let db = st.db.as_ref().ok_or_else(database_unavailable)?;
+    let operator_id = match enabled_operator(st, s).await? {
+        Some(operator) => Some(operator.id),
+        None if cfg!(debug_assertions) && s.user_id == "dev-admin" => None,
+        None => {
+            return Err(DbErr::Custom(
+                "operator registry authorization changed before notice write".to_string(),
+            ))
+        }
+    };
+    let transaction = db.begin().await?;
+    let row = admin_broadcast_notices::ActiveModel {
+        operator_id: Set(operator_id),
+        severity: Set(severity.to_string()),
+        title: Set(title.to_string()),
+        body: Set(body.to_string()),
+        ..Default::default()
+    }
+    .insert(&transaction)
+    .await?;
+    admin_audit_log::ActiveModel {
+        actor_operator_id: Set(operator_id),
+        actor: Set(s.email.clone()),
+        action: Set("notice.published".to_string()),
+        target: Set(Some(row.id.to_string())),
+        request_id: Set(None),
+        meta: Set(json!({ "severity": severity, "notice_id": row.id })),
+        ..Default::default()
+    }
+    .insert(&transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(row)
+}
+
 /// A scale target must meet the replication floor and fit the audit record's
 /// `i32` column, so persistence can never silently wrap it.
 fn scale_target_is_valid(target_nodes: u32) -> bool {

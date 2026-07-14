@@ -21,7 +21,7 @@ use crate::cluster_insight::{
     utc_timestamp, ClusterEvent, ClusterQuorum, MergedShard, NodeObservation, PromScrape,
     PROM_FIDUCIA_UP_QUERY,
 };
-use crate::entity::admin_audit_log;
+use crate::entity::{admin_audit_log, admin_broadcast_notices};
 use crate::session::Session;
 
 const CSS: &str = r#"

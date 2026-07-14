@@ -3447,6 +3447,20 @@ mod db_tests {
 
     const SCHEMA: &str = include_str!("../../fiducia-interfaces/sql/admin.sql");
 
+    // Multiple db_tests target one TEST_DATABASE_URL. `CREATE TABLE IF NOT
+    // EXISTS` is not safe against a *concurrent* create (both pass the existence
+    // check, then collide on pg_type), so apply the schema exactly once across
+    // the whole test binary rather than per-test.
+    static SCHEMA_READY: tokio::sync::Mutex<bool> = tokio::sync::Mutex::const_new(false);
+
+    async fn prepare_schema(db: &DatabaseConnection) {
+        let mut ready = SCHEMA_READY.lock().await;
+        if !*ready {
+            db.execute_unprepared(SCHEMA).await.expect("apply admin.sql");
+            *ready = true;
+        }
+    }
+
     fn state_with(db: DatabaseConnection) -> AppState {
         AppState {
             auth_url: "x".into(),

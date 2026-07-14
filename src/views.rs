@@ -21,6 +21,7 @@ use crate::cluster_insight::{
     utc_timestamp, ClusterEvent, ClusterQuorum, MergedShard, NodeObservation, PromScrape,
     PROM_FIDUCIA_UP_QUERY,
 };
+use crate::entity::admin_audit_log;
 use crate::session::Session;
 
 const CSS: &str = r#"
@@ -82,6 +83,7 @@ pub fn page(
                         a href="/" { "Dashboard" }
                         a href="/infra" { "Infra" }
                         a href="/cluster" { "Cluster" }
+                        a href="/audit" { "Audit" }
                     } @else {
                         a href="/login" { "Sign in" }
                     }
@@ -199,6 +201,53 @@ pub fn dashboard(s: &Session, csrf_token: &str) -> Markup {
                     "Signed in as operator " b { (ident(s)) } "."
                 }
                 p { a href="/infra" { "Cluster & infra ops →" } }
+                p { a href="/audit" { "Operator audit →" } }
+            }
+        },
+    )
+}
+
+/// Minimal, read-only audit projection for an already-authorized operator.
+/// `admin_audit_log.meta`, source IP, and user-agent fields are deliberately
+/// omitted: detailed diagnostics stay in the database, not an HTML response.
+pub fn audit(s: &Session, csrf_token: &str, events: &[admin_audit_log::Model]) -> Markup {
+    page(
+        "Audit",
+        Some(s),
+        Some(csrf_token),
+        html! {
+            h1 { "Operator audit" }
+            div class="card" {
+                p class="muted" {
+                    "Read-only, append-only actions for the isolated admin plane. "
+                    "Sensitive diagnostic fields remain server-side."
+                }
+                table {
+                    thead {
+                        tr {
+                            th { "When" }
+                            th { "Actor" }
+                            th { "Action" }
+                            th { "Target" }
+                            th { "Request" }
+                        }
+                    }
+                    tbody {
+                        @if events.is_empty() {
+                            tr { td colspan="5" class="muted" { "No audit events recorded yet." } }
+                        } @else {
+                            @for event in events {
+                                tr {
+                                    td { (event.created_at.to_rfc3339()) }
+                                    td { (event.actor.as_deref().unwrap_or("system")) }
+                                    td { code { (&event.action) } }
+                                    td { (event.target.as_deref().unwrap_or("—")) }
+                                    td { code { (event.request_id.as_deref().unwrap_or("—")) } }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         },
     )

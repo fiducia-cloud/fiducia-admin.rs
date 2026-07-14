@@ -36,6 +36,7 @@ canonical `Host`, and writes reject a supplied non-admin `Origin`.
 | `POST /logout` | clear the admin-only session cookie |
 | `GET /` | operator dashboard |
 | `GET /infra` · `POST /infra/scale` | cluster operations |
+| `GET /audit` · `GET /api/admin/audit` | bounded, read-only operator audit feed |
 | `GET /cluster` | cluster insight page (summary, shards, nodes, events) |
 | `GET /cluster/{shards,nodes,events}` | polled htmx fragments (full page without `HX-Request`) |
 | `GET /api/admin/cluster/{overview,shards,events,metrics}` | cluster insight as JSON for bearer/API callers |
@@ -161,6 +162,31 @@ The canonical schema must be applied before serving traffic; missing audit, sync
 or idempotency relations fail closed when their routes use them. Upstream failures
 return an explicit dependency error rather than fabricated empty data.
 Telemetry via [`fiducia-telemetry`](https://github.com/fiducia-cloud/fiducia-telemetry.rs).
+
+### Declarative Supabase migrations
+
+[`scripts/dpm-schema.sh`](scripts/dpm-schema.sh) wraps
+[`dpm`](https://github.com/declarative-migrations/declarative-postgres-migrate.rs)
+around the canonical `fiducia-interfaces/sql/admin.sql` schema. It intentionally
+preserves the admin/customer database boundary: point `DATABASE_URL` only at the
+isolated admin database, and use a separate scratch-capable
+`SHADOW_DATABASE_URL`. Supabase direct connections (or the session pooler on
+port 5432) are required; DPM must not use the transaction pooler on port 6543.
+
+```sh
+cargo install --git https://github.com/declarative-migrations/declarative-postgres-migrate.rs --locked
+DATABASE_URL=postgres://admin-target \
+SHADOW_DATABASE_URL=postgres://scratch-admin \
+scripts/dpm-schema.sh diff
+
+DATABASE_URL=postgres://admin-target \
+SHADOW_DATABASE_URL=postgres://scratch-admin \
+scripts/dpm-schema.sh verify
+```
+
+`verify` rehearses the migration only on a shadow replica. `apply` requires the
+separate `DPM_APPLY_APPROVED=1` acknowledgement and does not opt into DPM's
+destructive-operation flags.
 
 ## Configuration (environment)
 

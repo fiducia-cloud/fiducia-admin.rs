@@ -1,5 +1,5 @@
-# Cargo configuration
+# .cargo
 
-Repository-local Cargo settings for the admin service. Keep toolchain or target
-options reproducible and non-secret; runtime configuration belongs in
-environment variables documented by the root README.
+Cargo configuration scoped to this crate. `audit.toml` is the `cargo audit`
+advisory policy CI enforces — any accepted/ignored advisory must be recorded
+here with a justification, so the dependency-audit gate stays reviewable.

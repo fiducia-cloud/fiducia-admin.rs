@@ -2057,7 +2057,12 @@ async fn admin_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<Stri
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // The client fell behind the broadcast buffer and lost
+                    // frames; without a log the missed updates are invisible.
+                    // The stream continues from the newest frame.
+                    tracing::warn!(skipped, "admin sync stream lagged; a slow client missed frames");
+                }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
             msg = socket.recv() => match msg {

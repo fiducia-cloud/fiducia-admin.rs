@@ -1,6 +1,5 @@
-# Database entities
+# entity
 
-SeaORM entity models used by the operator-only admin service. These types belong
-to the admin database boundary and must not be shared with the customer app.
-When generated from schema, review the diff and retain authorization-safe helper
-code outside generated files.
+SeaORM entity definitions for the admin plane's business tables. Same rule as
+every fiducia service: Postgres holds business/control-plane rows only —
+coordination state stays in the data plane's Raft groups.

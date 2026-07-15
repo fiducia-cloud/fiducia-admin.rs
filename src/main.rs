@@ -2057,7 +2057,12 @@ async fn admin_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<Stri
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // The client fell behind the broadcast buffer and lost
+                    // frames; without a log the missed updates are invisible.
+                    // The stream continues from the newest frame.
+                    tracing::warn!(skipped, "admin sync stream lagged; a slow client missed frames");
+                }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
             msg = socket.recv() => match msg {
@@ -3456,7 +3461,9 @@ mod db_tests {
     async fn prepare_schema(db: &DatabaseConnection) {
         let mut ready = SCHEMA_READY.lock().await;
         if !*ready {
-            db.execute_unprepared(SCHEMA).await.expect("apply admin.sql");
+            db.execute_unprepared(SCHEMA)
+                .await
+                .expect("apply admin.sql");
             *ready = true;
         }
     }
@@ -3700,9 +3707,15 @@ mod db_tests {
         // both the notice and its audit row.
         let session = Session::test_admin_bearer("dev-admin", "verified.jwt");
         let before = recent_admin_audit(&st, 100).await.unwrap().len();
-        let notice = record_notice(&st, &session, "warning", "Maintenance 02:00 UTC", "Brief blip")
-            .await
-            .expect("publish notice");
+        let notice = record_notice(
+            &st,
+            &session,
+            "warning",
+            "Maintenance 02:00 UTC",
+            "Brief blip",
+        )
+        .await
+        .expect("publish notice");
         // Trigger-assigned sync fields.
         assert_eq!(notice.version, 1);
         assert!(notice.sync_sequence > 0);

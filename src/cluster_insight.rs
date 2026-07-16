@@ -1101,6 +1101,76 @@ mod tests {
         assert_eq!(rollup.unresponsive, vec![9]);
     }
 
+    /// A dual-leader TERM TIE keeps the incumbent view but still flags
+    /// `dual_leader` (M4): equal-term conflicting leadership claims are the
+    /// sharpest split-brain evidence and must never be masked by the merge.
+    /// (The higher-term-wins half of the rule is pinned by
+    /// `merge_flags_dual_leadership_and_adopts_the_higher_term`.)
+    #[test]
+    fn dual_leader_term_tie_keeps_the_incumbent_and_still_flags() {
+        let leader_row = |node: &str| {
+            json!({
+                "node_id": node,
+                "shards": [{ "shard_id": 1, "role": "leader", "term": 5, "leader_id": node }],
+            })
+        };
+        let observations = vec![
+            degraded_observation("node-a", Some(leader_row("node-a"))),
+            degraded_observation("node-b", Some(leader_row("node-b"))),
+        ];
+
+        let merged = merge_shards(&observations);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].reported_by, "node-a",
+            "a term tie must keep the incumbent view"
+        );
+        assert_eq!(merged[0].view.term, 5);
+        assert!(merged[0].leader_view);
+        assert!(
+            merged[0].dual_leader,
+            "an equal-term dual claim is still split-brain and must be flagged"
+        );
+
+        // The rollup surfaces the tie exactly like a cross-term conflict.
+        let quorum = cluster_quorum(&observations, &merged);
+        assert_eq!(quorum.dual_leader, vec![1]);
+    }
+
+    /// The M3 cap boundary is exact: a list of EXACTLY MAX_NODES targets is
+    /// left intact with no truncation note, while one extra target trips
+    /// truncation and reports the original count. Guards the off-by-one that
+    /// would silently drop the 512th node or raise a false "showing N" note.
+    #[test]
+    fn fanout_target_cap_boundary_is_exact_at_max_nodes() {
+        let make = |count: usize| -> Vec<NodeTarget> {
+            (0..count)
+                .map(|i| NodeTarget {
+                    node_id: format!("node-{i}"),
+                    base_url: format!("http://node-{i}:8090"),
+                    trusted: true,
+                })
+                .collect()
+        };
+
+        let mut at_cap = make(MAX_NODES);
+        assert_eq!(
+            truncate_targets(&mut at_cap),
+            None,
+            "an at-cap list must not raise a truncation note"
+        );
+        assert_eq!(at_cap.len(), MAX_NODES, "an at-cap list is left intact");
+
+        let mut over_by_one = make(MAX_NODES + 1);
+        assert_eq!(truncate_targets(&mut over_by_one), Some(MAX_NODES + 1));
+        assert_eq!(over_by_one.len(), MAX_NODES);
+        assert_eq!(
+            over_by_one[MAX_NODES - 1].node_id,
+            format!("node-{}", MAX_NODES - 1),
+            "truncation must keep the leading targets in order"
+        );
+    }
+
     // ---- discovery ----
 
     fn test_policy() -> NodeHostPolicy {

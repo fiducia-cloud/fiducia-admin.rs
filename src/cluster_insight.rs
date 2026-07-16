@@ -1077,10 +1077,25 @@ mod tests {
         let rollup = cluster_quorum(&observations, &merged);
 
         assert_eq!(rollup.nodes_reporting, 2);
-        assert_eq!(rollup.nodes_failed, 1, "a silent node must be counted, not dropped");
-        assert_eq!(rollup.leader_unreached, vec![1], "known-but-unreached leader is M5, not leaderless");
-        assert_eq!(rollup.leaderless, vec![2], "no leader anywhere is genuinely leaderless");
-        assert_eq!(rollup.dual_leader, vec![3], "two claimed leaders must surface as split-brain");
+        assert_eq!(
+            rollup.nodes_failed, 1,
+            "a silent node must be counted, not dropped"
+        );
+        assert_eq!(
+            rollup.leader_unreached,
+            vec![1],
+            "known-but-unreached leader is M5, not leaderless"
+        );
+        assert_eq!(
+            rollup.leaderless,
+            vec![2],
+            "no leader anywhere is genuinely leaderless"
+        );
+        assert_eq!(
+            rollup.dual_leader,
+            vec![3],
+            "two claimed leaders must surface as split-brain"
+        );
         assert_eq!(rollup.at_risk, vec![7]);
         assert_eq!(rollup.storage_faulted, vec![4]);
         assert_eq!(rollup.unresponsive, vec![9]);

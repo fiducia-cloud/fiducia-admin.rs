@@ -296,6 +296,19 @@ async fn sync_js() -> impl IntoResponse {
     )
 }
 
+/// Serve the page stylesheet (same-origin, CSP-friendly).
+async fn admin_css() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "text/css; charset=utf-8")], ADMIN_CSS)
+}
+
+/// Serve the page bootstrap (same-origin, CSP-friendly).
+async fn admin_init_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        ADMIN_INIT_JS,
+    )
+}
+
 fn redirect(to: &str) -> Response {
     (StatusCode::SEE_OTHER, [(LOCATION, to)]).into_response()
 }

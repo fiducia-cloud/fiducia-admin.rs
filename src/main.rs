@@ -190,8 +190,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("{SERVICE} listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Resolve when the process is asked to stop, so in-flight requests can finish.
+///
+/// Every k8s rollout sends SIGTERM. Without this, `axum::serve` is aborted the
+/// instant the runtime unwinds, severing in-flight operator mutations —
+/// including the window between an `infra_operations` audit write and the brain
+/// call it authorizes — and cutting open `/admin/ws` sockets mid-frame. Waiting
+/// on both SIGTERM (k8s) and Ctrl-C (local) lets the connection drain first.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received; draining in-flight requests");
 }
 
 /// Connect to the isolated admin Postgres plane; missing/unreachable storage is

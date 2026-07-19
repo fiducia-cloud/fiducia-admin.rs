@@ -110,10 +110,6 @@ pub fn page(
                     }
                 }
                 div class="wrap" { (body) }
-                // Bring up admin-plane sync only on pages that declare synced
-                // tables via `data-fiducia-sync` (deferred scripts above have run
-                // by DOMContentLoaded, so window.FiduciaSyncAdmin + htmx exist).
-                script { (PreEscaped(SYNC_INIT_JS)) }
             }
         }
     }

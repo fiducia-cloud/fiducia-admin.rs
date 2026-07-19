@@ -381,10 +381,35 @@ async fn security_headers(request: Request, next: Next) -> Response {
             HeaderValue::from_static("no-store"),
         );
     }
+    // A real allowlist, not just framing/form controls. The previous policy set
+    // no `default-src` and no `script-src`, so script execution was entirely
+    // unrestricted — and every admin fragment is swapped into the DOM with
+    // htmx's `innerHTML`, so any HTML that reached a swap target could execute.
+    //
+    // Each source is load-bearing:
+    //   default-src 'self'      — deny by default; no third-party origin.
+    //   script-src  'self'      — only our vendored, same-origin bundles.
+    //   'wasm-unsafe-eval'      — `assets/fiducia-sync.js` inlines wasm and calls
+    //                             WebAssembly.instantiate; without this the sync
+    //                             client fails to boot. It permits wasm
+    //                             compilation ONLY, not JS eval()/new Function.
+    //   style-src   'self'      — the stylesheet is external and no `style=`
+    //                             attributes remain, so no 'unsafe-inline'.
+    //   connect-src 'self'      — same-origin XHR plus the /admin/ws WebSocket.
+    //   img-src 'self' data:    — inline data: badges/icons.
     headers.insert(
         HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static(
-            "frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'",
+            "default-src 'self'; \
+             script-src 'self' 'wasm-unsafe-eval'; \
+             style-src 'self'; \
+             img-src 'self' data:; \
+             connect-src 'self'; \
+             font-src 'self'; \
+             frame-ancestors 'none'; \
+             base-uri 'none'; \
+             form-action 'self'; \
+             object-src 'none'",
         ),
     );
     headers.insert(

@@ -152,6 +152,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(health))
         .route("/assets/htmx.min.js", get(htmx_js))
         .route("/assets/fiducia-sync.js", get(sync_js))
+        .route("/assets/admin.css", get(admin_css))
+        .route("/assets/admin-init.js", get(admin_init_js))
         .route("/login", get(login).post(login_submit))
         .route("/logout", post(logout))
         .route("/", get(dashboard))

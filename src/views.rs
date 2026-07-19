@@ -70,11 +70,18 @@ pub fn page(
                     meta name="fiducia-admin-csrf" content=(csrf_token);
                 }
                 title { (title) " · Fiducia Admin" }
-                style { (PreEscaped(CSS)) }
+                // External, same-origin stylesheet rather than an inline <style>:
+                // inline styles need style-src 'unsafe-inline', which would gut
+                // the CSP set in `security_headers`.
+                link rel="stylesheet" href="/assets/admin.css";
                 script src="/assets/htmx.min.js" defer {}
                 // Local-first sync client (@fiducia/sync), vendored self-contained
                 // (wasm inlined) and served same-origin — no CDN, no bundler.
                 script src="/assets/fiducia-sync.js" defer {}
+                // Hardens htmx config, then boots sync. `defer` keeps the original
+                // ordering guarantee: it runs after the two bundles above and
+                // before DOMContentLoaded, which is when the sync bring-up fires.
+                script src="/assets/admin-init.js" defer {}
             }
             body {
                 nav class="nav" {

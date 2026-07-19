@@ -2109,11 +2109,19 @@ async fn admin_ws(
     ws.on_upgrade(move |socket| admin_ws_stream(socket, rx))
 }
 
+/// Idle keepalive for the admin sync socket. Without a server-side ping an idle
+/// `/admin/ws` behind an LB/ingress is reaped after its idle timeout with no
+/// signal to either end; the tick also detects a half-open peer (the send fails)
+/// so the task exits instead of leaking. Mirrors the customer plane's cadence.
+const ADMIN_WS_HEARTBEAT_SECS: u64 = 15;
+
 async fn admin_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
     let hello = json!({ "event": "connected", "service": SERVICE }).to_string();
     if socket.send(Message::Text(hello)).await.is_err() {
         return;
     }
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(ADMIN_WS_HEARTBEAT_SECS));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             frame = rx.recv() => match frame {
@@ -2123,16 +2131,31 @@ async fn admin_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<Stri
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    // The client fell behind the broadcast buffer and lost
-                    // frames; without a log the missed updates are invisible.
-                    // The stream continues from the newest frame.
-                    tracing::warn!(skipped, "admin sync stream lagged; a slow client missed frames");
+                    // The client fell behind the bounded broadcast buffer and
+                    // permanently lost those `ChangeEvent` frames — its IndexedDB
+                    // mirror is now missing rows. Continuing silently from the
+                    // newest frame leaves it wrong with no signal. Tell it to
+                    // re-run its per-table catch-up (`/api/admin/sync/:table`)
+                    // instead; if we can't even deliver that, drop the socket so
+                    // the client reconnects and resyncs from scratch.
+                    tracing::warn!(skipped, "admin sync stream lagged; signalling client resync");
+                    let resync = json!({ "event": "fiducia:resync", "reason": "lagged" }).to_string();
+                    if socket.send(Message::Text(resync)).await.is_err() {
+                        return;
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
+            _ = heartbeat.tick() => {
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    return;
+                }
+            }
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Close(_))) | None => return,
                 Some(Err(_)) => return,
+                // Pong/Text/Binary from the client are ignored; the socket is
+                // server-push only. Receiving keeps the half-open detection live.
                 _ => {}
             }
         }

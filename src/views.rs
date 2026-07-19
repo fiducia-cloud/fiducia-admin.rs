@@ -13,7 +13,7 @@
 //! or one of the fragment helpers here (HTMX), depending on the `HX-Request`
 //! header — so the same routes serve both.
 
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use maud::{html, Markup, DOCTYPE};
 use serde_json::Value;
 
 use crate::cluster_insight::{

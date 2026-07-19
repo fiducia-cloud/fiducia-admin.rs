@@ -90,6 +90,16 @@ const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
 /// `fiducia-sync/sdk: npm run build:admin-bundle`. Single-binary, no CDN.
 const SYNC_JS: &str = include_str!("../assets/fiducia-sync.js");
 
+/// Page stylesheet, served at `/assets/admin.css`. Lives in a file rather than an
+/// inline `<style>` so the CSP in `security_headers` can omit
+/// `style-src 'unsafe-inline'`.
+const ADMIN_CSS: &str = include_str!("../assets/admin.css");
+
+/// Page bootstrap, served at `/assets/admin-init.js`: hardens the htmx config
+/// (disables `allowScriptTags`/`allowEval`) and boots the sync client. External
+/// for the same CSP reason as `ADMIN_CSS`.
+const ADMIN_INIT_JS: &str = include_str!("../assets/admin-init.js");
+
 struct AppState {
     auth_url: String,
     brain_url: String,

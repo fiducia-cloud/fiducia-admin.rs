@@ -1012,6 +1012,165 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // ---- degraded-fleet rollup ----
+
+    fn shard_row(shard_id: u32, role: &str, leader_id: Option<&str>) -> serde_json::Value {
+        json!({
+            "shard_id": shard_id, "role": role, "term": 3, "leader_id": leader_id,
+            "commit_index": 5, "last_applied": 5, "last_log_index": 5,
+            "storage_healthy": true, "healthy_replicas": 3, "has_quorum": true,
+        })
+    }
+
+    fn degraded_observation(node_id: &str, shards: Option<serde_json::Value>) -> NodeObservation {
+        NodeObservation {
+            node_id: node_id.to_string(),
+            base_url: format!("http://{node_id}:8090"),
+            shards: shards.map(|value| serde_json::from_value(value).expect("NodeShards fixture")),
+            error: None,
+            untrusted: false,
+        }
+    }
+
+    /// The admin overview must never present a DEGRADED fleet view as healthy:
+    /// a node that failed to answer is counted (not dropped), a shard whose
+    /// known leader was unreachable is `leader_unreached` (partial visibility,
+    /// M5), a shard with no leader anywhere is `leaderless`, and two claimed
+    /// leaders roll up as `dual_leader` split-brain. Drives the REAL
+    /// parse→merge→rollup path with mixed good/degraded inputs.
+    #[test]
+    fn rollup_classifies_partial_and_conflicting_node_reports() {
+        let node_a = json!({
+            "node_id": "node-a",
+            "quorum": {
+                "leaderless_shards": [], "at_risk_led_shards": [7],
+                "all_led_shards_have_quorum": false,
+                "storage_faulted_shards": [4], "unresponsive_shards": [],
+                "status_complete": true
+            },
+            "shards": [
+                shard_row(0, "leader", Some("node-a")),   // healthy, leader view merged
+                shard_row(1, "follower", Some("node-b")), // leader known but node-b never reported
+                shard_row(2, "follower", None),            // nobody knows a leader
+                shard_row(3, "leader", Some("node-a")),   // dual-leader half
+            ],
+        });
+        let node_c = json!({
+            "node_id": "node-c",
+            "quorum": {
+                "leaderless_shards": [], "at_risk_led_shards": [],
+                "all_led_shards_have_quorum": true,
+                "storage_faulted_shards": [], "unresponsive_shards": [9],
+                "status_complete": false
+            },
+            "shards": [
+                shard_row(3, "leader", Some("node-c")),   // dual-leader other half
+            ],
+        });
+        let observations = vec![
+            degraded_observation("node-a", Some(node_a)),
+            degraded_observation("node-b", None), // fan-out target that failed to answer
+            degraded_observation("node-c", Some(node_c)),
+        ];
+
+        let merged = merge_shards(&observations);
+        let rollup = cluster_quorum(&observations, &merged);
+
+        assert_eq!(rollup.nodes_reporting, 2);
+        assert_eq!(
+            rollup.nodes_failed, 1,
+            "a silent node must be counted, not dropped"
+        );
+        assert_eq!(
+            rollup.leader_unreached,
+            vec![1],
+            "known-but-unreached leader is M5, not leaderless"
+        );
+        assert_eq!(
+            rollup.leaderless,
+            vec![2],
+            "no leader anywhere is genuinely leaderless"
+        );
+        assert_eq!(
+            rollup.dual_leader,
+            vec![3],
+            "two claimed leaders must surface as split-brain"
+        );
+        assert_eq!(rollup.at_risk, vec![7]);
+        assert_eq!(rollup.storage_faulted, vec![4]);
+        assert_eq!(rollup.unresponsive, vec![9]);
+    }
+
+    /// A dual-leader TERM TIE keeps the incumbent view but still flags
+    /// `dual_leader` (M4): equal-term conflicting leadership claims are the
+    /// sharpest split-brain evidence and must never be masked by the merge.
+    /// (The higher-term-wins half of the rule is pinned by
+    /// `merge_flags_dual_leadership_and_adopts_the_higher_term`.)
+    #[test]
+    fn dual_leader_term_tie_keeps_the_incumbent_and_still_flags() {
+        let leader_row = |node: &str| {
+            json!({
+                "node_id": node,
+                "shards": [{ "shard_id": 1, "role": "leader", "term": 5, "leader_id": node }],
+            })
+        };
+        let observations = vec![
+            degraded_observation("node-a", Some(leader_row("node-a"))),
+            degraded_observation("node-b", Some(leader_row("node-b"))),
+        ];
+
+        let merged = merge_shards(&observations);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].reported_by, "node-a",
+            "a term tie must keep the incumbent view"
+        );
+        assert_eq!(merged[0].view.term, 5);
+        assert!(merged[0].leader_view);
+        assert!(
+            merged[0].dual_leader,
+            "an equal-term dual claim is still split-brain and must be flagged"
+        );
+
+        // The rollup surfaces the tie exactly like a cross-term conflict.
+        let quorum = cluster_quorum(&observations, &merged);
+        assert_eq!(quorum.dual_leader, vec![1]);
+    }
+
+    /// The M3 cap boundary is exact: a list of EXACTLY MAX_NODES targets is
+    /// left intact with no truncation note, while one extra target trips
+    /// truncation and reports the original count. Guards the off-by-one that
+    /// would silently drop the 512th node or raise a false "showing N" note.
+    #[test]
+    fn fanout_target_cap_boundary_is_exact_at_max_nodes() {
+        let make = |count: usize| -> Vec<NodeTarget> {
+            (0..count)
+                .map(|i| NodeTarget {
+                    node_id: format!("node-{i}"),
+                    base_url: format!("http://node-{i}:8090"),
+                    trusted: true,
+                })
+                .collect()
+        };
+
+        let mut at_cap = make(MAX_NODES);
+        assert_eq!(
+            truncate_targets(&mut at_cap),
+            None,
+            "an at-cap list must not raise a truncation note"
+        );
+        assert_eq!(at_cap.len(), MAX_NODES, "an at-cap list is left intact");
+
+        let mut over_by_one = make(MAX_NODES + 1);
+        assert_eq!(truncate_targets(&mut over_by_one), Some(MAX_NODES + 1));
+        assert_eq!(over_by_one.len(), MAX_NODES);
+        assert_eq!(
+            over_by_one[MAX_NODES - 1].node_id,
+            format!("node-{}", MAX_NODES - 1),
+            "truncation must keep the leading targets in order"
+        );
+    }
+
     // ---- discovery ----
 
     fn test_policy() -> NodeHostPolicy {

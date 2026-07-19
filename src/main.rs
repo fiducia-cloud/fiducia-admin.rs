@@ -187,7 +187,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn connect_admin_db() -> Result<DatabaseConnection, Box<dyn std::error::Error>> {
     let url = required_env("DATABASE_URL")?;
     let mut options = ConnectOptions::new(url);
-    options.max_connections(5);
+    options
+        .max_connections(5)
+        // SeaORM defaults `sqlx_logging` to ON at INFO, which emits every
+        // statement *with its bound values* into the tracing pipeline that
+        // `fiducia_telemetry::init` ships off-box. On this plane those values are
+        // operator emails, broadcast notice bodies, and audit rows — none of
+        // which belong in a log sink. The customer plane already disables this.
+        .sqlx_logging(false)
+        // Bound the failure modes a single `max_connections` cannot: without an
+        // acquire timeout a slow-query storm queues requests until the outer
+        // layer fires, and without `max_lifetime` an RDS/pgbouncer failover
+        // hands out dead connections indefinitely.
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(5))
+        .idle_timeout(Duration::from_secs(600))
+        .max_lifetime(Duration::from_secs(1800));
     let db = Database::connect(options).await?;
     db.ping().await?;
     tracing::info!("admin DB connected — infra_operations audit is live");
@@ -2057,7 +2072,12 @@ async fn admin_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<Stri
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // The client fell behind the broadcast buffer and lost
+                    // frames; without a log the missed updates are invisible.
+                    // The stream continues from the newest frame.
+                    tracing::warn!(skipped, "admin sync stream lagged; a slow client missed frames");
+                }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
             msg = socket.recv() => match msg {
@@ -3424,12 +3444,20 @@ mod interface_contract_tests {
     fn generated_interfaces_are_importable() {
         let request = LockAcquireManyRequest {
             keys: vec!["orders/42".to_string(), "inventory/sku-7".to_string()],
-            holder: Some("worker-a".to_string()),
+            holder: "worker-a".to_string(),
+            request_id: Some("interface-contract-attempt".to_string()),
             ttl_ms: Some(30_000),
-            wait: Some(false),
+            wait: Some(true),
+            wait_timeout_ms: Some(5_000),
         };
 
         assert_eq!(request.keys.len(), 2);
+        assert_eq!(request.holder, "worker-a");
+        assert_eq!(
+            request.request_id.as_deref(),
+            Some("interface-contract-attempt")
+        );
+        assert_eq!(request.wait_timeout_ms, Some(5_000));
         assert!(matches!(
             ProposeErrorReason::NotLeader,
             ProposeErrorReason::NotLeader
@@ -3456,7 +3484,9 @@ mod db_tests {
     async fn prepare_schema(db: &DatabaseConnection) {
         let mut ready = SCHEMA_READY.lock().await;
         if !*ready {
-            db.execute_unprepared(SCHEMA).await.expect("apply admin.sql");
+            db.execute_unprepared(SCHEMA)
+                .await
+                .expect("apply admin.sql");
             *ready = true;
         }
     }
@@ -3700,9 +3730,15 @@ mod db_tests {
         // both the notice and its audit row.
         let session = Session::test_admin_bearer("dev-admin", "verified.jwt");
         let before = recent_admin_audit(&st, 100).await.unwrap().len();
-        let notice = record_notice(&st, &session, "warning", "Maintenance 02:00 UTC", "Brief blip")
-            .await
-            .expect("publish notice");
+        let notice = record_notice(
+            &st,
+            &session,
+            "warning",
+            "Maintenance 02:00 UTC",
+            "Brief blip",
+        )
+        .await
+        .expect("publish notice");
         // Trigger-assigned sync fields.
         assert_eq!(notice.version, 1);
         assert!(notice.sync_sequence > 0);

@@ -90,6 +90,16 @@ const HTMX_JS: &str = include_str!("../assets/htmx.min.js");
 /// `fiducia-sync/sdk: npm run build:admin-bundle`. Single-binary, no CDN.
 const SYNC_JS: &str = include_str!("../assets/fiducia-sync.js");
 
+/// Page stylesheet, served at `/assets/admin.css`. Lives in a file rather than an
+/// inline `<style>` so the CSP in `security_headers` can omit
+/// `style-src 'unsafe-inline'`.
+const ADMIN_CSS: &str = include_str!("../assets/admin.css");
+
+/// Page bootstrap, served at `/assets/admin-init.js`: hardens the htmx config
+/// (disables `allowScriptTags`/`allowEval`) and boots the sync client. External
+/// for the same CSP reason as `ADMIN_CSS`.
+const ADMIN_INIT_JS: &str = include_str!("../assets/admin-init.js");
+
 struct AppState {
     auth_url: String,
     brain_url: String,
@@ -142,6 +152,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/healthz", get(health))
         .route("/assets/htmx.min.js", get(htmx_js))
         .route("/assets/fiducia-sync.js", get(sync_js))
+        .route("/assets/admin.css", get(admin_css))
+        .route("/assets/admin-init.js", get(admin_init_js))
         .route("/login", get(login).post(login_submit))
         .route("/logout", post(logout))
         .route("/", get(dashboard))
@@ -178,8 +190,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!("{SERVICE} listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Resolve when the process is asked to stop, so in-flight requests can finish.
+///
+/// Every k8s rollout sends SIGTERM. Without this, `axum::serve` is aborted the
+/// instant the runtime unwinds, severing in-flight operator mutations —
+/// including the window between an `infra_operations` audit write and the brain
+/// call it authorizes — and cutting open `/admin/ws` sockets mid-frame. Waiting
+/// on both SIGTERM (k8s) and Ctrl-C (local) lets the connection drain first.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received; draining in-flight requests");
 }
 
 /// Connect to the isolated admin Postgres plane; missing/unreachable storage is
@@ -187,7 +234,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn connect_admin_db() -> Result<DatabaseConnection, Box<dyn std::error::Error>> {
     let url = required_env("DATABASE_URL")?;
     let mut options = ConnectOptions::new(url);
-    options.max_connections(5);
+    options
+        .max_connections(5)
+        // SeaORM defaults `sqlx_logging` to ON at INFO, which emits every
+        // statement *with its bound values* into the tracing pipeline that
+        // `fiducia_telemetry::init` ships off-box. On this plane those values are
+        // operator emails, broadcast notice bodies, and audit rows — none of
+        // which belong in a log sink. The customer plane already disables this.
+        .sqlx_logging(false)
+        // Bound the failure modes a single `max_connections` cannot: without an
+        // acquire timeout a slow-query storm queues requests until the outer
+        // layer fires, and without `max_lifetime` an RDS/pgbouncer failover
+        // hands out dead connections indefinitely.
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(5))
+        .idle_timeout(Duration::from_secs(600))
+        .max_lifetime(Duration::from_secs(1800));
     let db = Database::connect(options).await?;
     db.ping().await?;
     tracing::info!("admin DB connected — infra_operations audit is live");
@@ -271,6 +333,19 @@ async fn sync_js() -> impl IntoResponse {
     )
 }
 
+/// Serve the page stylesheet (same-origin, CSP-friendly).
+async fn admin_css() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "text/css; charset=utf-8")], ADMIN_CSS)
+}
+
+/// Serve the page bootstrap (same-origin, CSP-friendly).
+async fn admin_init_js() -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        ADMIN_INIT_JS,
+    )
+}
+
 fn redirect(to: &str) -> Response {
     (StatusCode::SEE_OTHER, [(LOCATION, to)]).into_response()
 }
@@ -341,10 +416,35 @@ async fn security_headers(request: Request, next: Next) -> Response {
             HeaderValue::from_static("no-store"),
         );
     }
+    // A real allowlist, not just framing/form controls. The previous policy set
+    // no `default-src` and no `script-src`, so script execution was entirely
+    // unrestricted — and every admin fragment is swapped into the DOM with
+    // htmx's `innerHTML`, so any HTML that reached a swap target could execute.
+    //
+    // Each source is load-bearing:
+    //   default-src 'self'      — deny by default; no third-party origin.
+    //   script-src  'self'      — only our vendored, same-origin bundles.
+    //   'wasm-unsafe-eval'      — `assets/fiducia-sync.js` inlines wasm and calls
+    //                             WebAssembly.instantiate; without this the sync
+    //                             client fails to boot. It permits wasm
+    //                             compilation ONLY, not JS eval()/new Function.
+    //   style-src   'self'      — the stylesheet is external and no `style=`
+    //                             attributes remain, so no 'unsafe-inline'.
+    //   connect-src 'self'      — same-origin XHR plus the /admin/ws WebSocket.
+    //   img-src 'self' data:    — inline data: badges/icons.
     headers.insert(
         HeaderName::from_static("content-security-policy"),
         HeaderValue::from_static(
-            "frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'",
+            "default-src 'self'; \
+             script-src 'self' 'wasm-unsafe-eval'; \
+             style-src 'self'; \
+             img-src 'self' data:; \
+             connect-src 'self'; \
+             font-src 'self'; \
+             frame-ancestors 'none'; \
+             base-uri 'none'; \
+             form-action 'self'; \
+             object-src 'none'",
         ),
     );
     headers.insert(
@@ -2044,11 +2144,19 @@ async fn admin_ws(
     ws.on_upgrade(move |socket| admin_ws_stream(socket, rx))
 }
 
+/// Idle keepalive for the admin sync socket. Without a server-side ping an idle
+/// `/admin/ws` behind an LB/ingress is reaped after its idle timeout with no
+/// signal to either end; the tick also detects a half-open peer (the send fails)
+/// so the task exits instead of leaking. Mirrors the customer plane's cadence.
+const ADMIN_WS_HEARTBEAT_SECS: u64 = 15;
+
 async fn admin_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
     let hello = json!({ "event": "connected", "service": SERVICE }).to_string();
     if socket.send(Message::Text(hello)).await.is_err() {
         return;
     }
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(ADMIN_WS_HEARTBEAT_SECS));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             frame = rx.recv() => match frame {
@@ -2058,16 +2166,31 @@ async fn admin_ws_stream(mut socket: WebSocket, mut rx: broadcast::Receiver<Stri
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    // The client fell behind the broadcast buffer and lost
-                    // frames; without a log the missed updates are invisible.
-                    // The stream continues from the newest frame.
-                    tracing::warn!(skipped, "admin sync stream lagged; a slow client missed frames");
+                    // The client fell behind the bounded broadcast buffer and
+                    // permanently lost those `ChangeEvent` frames — its IndexedDB
+                    // mirror is now missing rows. Continuing silently from the
+                    // newest frame leaves it wrong with no signal. Tell it to
+                    // re-run its per-table catch-up (`/api/admin/sync/:table`)
+                    // instead; if we can't even deliver that, drop the socket so
+                    // the client reconnects and resyncs from scratch.
+                    tracing::warn!(skipped, "admin sync stream lagged; signalling client resync");
+                    let resync = json!({ "event": "fiducia:resync", "reason": "lagged" }).to_string();
+                    if socket.send(Message::Text(resync)).await.is_err() {
+                        return;
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
             },
+            _ = heartbeat.tick() => {
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    return;
+                }
+            }
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Close(_))) | None => return,
                 Some(Err(_)) => return,
+                // Pong/Text/Binary from the client are ignored; the socket is
+                // server-push only. Receiving keeps the half-open detection live.
                 _ => {}
             }
         }

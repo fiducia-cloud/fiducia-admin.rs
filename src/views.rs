@@ -13,7 +13,7 @@
 //! or one of the fragment helpers here (HTMX), depending on the `HX-Request`
 //! header — so the same routes serve both.
 
-use maud::{html, Markup, PreEscaped, DOCTYPE};
+use maud::{html, Markup, DOCTYPE};
 use serde_json::Value;
 
 use crate::cluster_insight::{
@@ -23,28 +23,6 @@ use crate::cluster_insight::{
 };
 use crate::entity::{admin_audit_log, admin_broadcast_notices};
 use crate::session::Session;
-
-const CSS: &str = r#"
-:root{--bg:#0a1024;--panel:#121a36;--line:#243066;--ink:#e9ecf8;--dim:#9aa3c7;--grad:linear-gradient(135deg,#c084fc,#6366f1)}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,sans-serif}
-a{color:#c4b5fd;text-decoration:none}a:hover{text-decoration:underline}
-.nav{display:flex;gap:1.2rem;align-items:center;padding:.9rem 1.4rem;border-bottom:1px solid var(--line);background:rgba(18,26,54,.6)}
-.brand{font-weight:700}.brand b{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
-.nav .sp{flex:1}.nav .who{color:var(--dim);font-size:.9rem}
-.wrap{max-width:980px;margin:0 auto;padding:1.6rem 1.4rem}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:1.2rem 1.4rem;margin:1rem 0}
-h1{font-size:1.5rem;margin:.2rem 0 1rem}h2{font-size:1.1rem;margin:.2rem 0 .8rem}
-table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:.5rem .6rem;border-bottom:1px solid var(--line)}
-th{color:var(--dim);font-weight:600;font-size:.85rem}
-.btn{display:inline-block;background:var(--grad);color:#fff;border:0;border-radius:9px;padding:.5rem .9rem;font:inherit;cursor:pointer}
-.btn--ghost{background:transparent;border:1px solid var(--line);color:var(--ink)}
-input,select{background:#0c1330;border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:.5rem .6rem;font:inherit}
-.muted{color:var(--dim)}.tag{font-size:.75rem;color:var(--dim);border:1px solid var(--line);border-radius:6px;padding:.05rem .4rem}
-.tag--ok{color:#6ee7b7;border-color:#166534}.tag--warn{color:#fcd34d;border-color:#854d0e}.tag--bad{color:#fca5a5;border-color:#991b1b}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:.8rem;margin:1rem 0}
-.stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:.8rem 1rem}
-.stat .n{font-size:1.35rem;font-weight:700}.stat .l{color:var(--dim);font-size:.8rem}
-"#;
 
 /// The signed-in identity label (email, else the user id).
 fn ident(s: &Session) -> String {
@@ -70,11 +48,18 @@ pub fn page(
                     meta name="fiducia-admin-csrf" content=(csrf_token);
                 }
                 title { (title) " · Fiducia Admin" }
-                style { (PreEscaped(CSS)) }
+                // External, same-origin stylesheet rather than an inline <style>:
+                // inline styles need style-src 'unsafe-inline', which would gut
+                // the CSP set in `security_headers`.
+                link rel="stylesheet" href="/assets/admin.css";
                 script src="/assets/htmx.min.js" defer {}
                 // Local-first sync client (@fiducia/sync), vendored self-contained
                 // (wasm inlined) and served same-origin — no CDN, no bundler.
                 script src="/assets/fiducia-sync.js" defer {}
+                // Hardens htmx config, then boots sync. `defer` keeps the original
+                // ordering guarantee: it runs after the two bundles above and
+                // before DOMContentLoaded, which is when the sync bring-up fires.
+                script src="/assets/admin-init.js" defer {}
             }
             body {
                 nav class="nav" {
@@ -95,7 +80,7 @@ pub fn page(
                             " · operator"
                         }
                         @if let Some(csrf_token) = csrf_token {
-                            form method="post" action="/logout" style="margin:0" {
+                            form method="post" action="/logout" class="nav-logout" {
                                 input type="hidden" name="csrf_token" value=(csrf_token);
                                 button class="btn btn--ghost" type="submit" { "Sign out" }
                             }
@@ -103,39 +88,10 @@ pub fn page(
                     }
                 }
                 div class="wrap" { (body) }
-                // Bring up admin-plane sync only on pages that declare synced
-                // tables via `data-fiducia-sync` (deferred scripts above have run
-                // by DOMContentLoaded, so window.FiduciaSyncAdmin + htmx exist).
-                script { (PreEscaped(SYNC_INIT_JS)) }
             }
         }
     }
 }
-
-/// Gated bring-up: reads `data-fiducia-sync="table[,table]"` markers on the page
-/// and, if any, boots the vendored @fiducia/sync admin client for those tables
-/// (opening IndexedDB, subscribing /admin/ws, registering the htmx-optimistic ext).
-const SYNC_INIT_JS: &str = r#"
-window.addEventListener("DOMContentLoaded", function () {
-  var nodes = document.querySelectorAll("[data-fiducia-sync]");
-  if (!nodes.length || !window.FiduciaSyncAdmin) return;
-  var tables = [];
-  nodes.forEach(function (n) {
-    (n.getAttribute("data-fiducia-sync") || "").split(",").forEach(function (t) {
-      t = t.trim(); if (t && tables.indexOf(t) === -1) tables.push(t);
-    });
-  });
-  if (!tables.length) return;
-  var csrf = document.querySelector('meta[name="fiducia-admin-csrf"]');
-  window.FiduciaSyncAdmin.init({
-    tables: tables,
-    htmx: window.htmx,
-    csrfToken: csrf ? csrf.content : ""
-  }).then(function (sync) {
-    window.__fiduciaSync = sync; // exposed for debugging / future optimistic writes
-  }).catch(function (e) { console.error("fiducia-sync init failed", e); });
-});
-"#;
 
 /// 403 body for the admin gate (`require_admin`).
 pub fn forbidden(s: &Session, csrf_token: Option<&str>) -> Markup {
@@ -287,7 +243,7 @@ fn notice_form(csrf_token: &str) -> Markup {
     html! {
         form method="post" action="/notices"
             hx-post="/notices" hx-target="#notice-list" hx-swap="innerHTML"
-            style="display:grid;gap:.6rem;max-width:40rem;margin-top:.8rem" {
+            class="form-grid" {
             input type="hidden" name="csrf_token" value=(csrf_token);
             label class="muted" for="notice-severity" { "Severity" }
             select id="notice-severity" name="severity" {
@@ -349,10 +305,10 @@ fn scale_form(csrf_token: &str) -> Markup {
     html! {
         form method="post" action="/infra/scale"
             hx-post="/infra/scale" hx-target="#infra-panel" hx-swap="innerHTML"
-            style="display:flex;gap:.6rem;align-items:center" {
+            class="form-row" {
             input type="hidden" name="csrf_token" value=(csrf_token);
             label class="muted" { "Target nodes" }
-            input name="target_nodes" type="number" min="3" value="9" style="width:6rem";
+            input name="target_nodes" type="number" min="3" value="9" class="input-narrow";
             button class="btn" type="submit" { "Apply" }
         }
     }

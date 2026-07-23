@@ -123,7 +123,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    fiducia_telemetry::init(SERVICE);
+    let _telemetry = fiducia_telemetry::init(SERVICE);
 
     let port: u16 = std::env::var("PORT")
         .ok()

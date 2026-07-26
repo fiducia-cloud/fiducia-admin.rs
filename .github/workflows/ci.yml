@@ -33,13 +33,13 @@ jobs:
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-interfaces
-          ref: 487e470c45ab5851e8f6f3b1dc048fe067fbf408
+          ref: 2c5c806174e067fbe83ad48b724366323ba390a2
           path: fiducia-interfaces
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-sync
-          ref: b9545140932995f75af8b3c5514cb4379404264c
+          ref: 6de4f016769960023f8e5a7cfb8a989d7fb2b302
           path: fiducia-sync
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:

@@ -3,15 +3,28 @@
 //! Operators log in through Supabase Auth; the Supabase access token rides in a
 //! host-only admin cookie (`__Host-fiducia_admin_session` in release builds) or
 //! an `Authorization: Bearer` header. On each request we verify it via
-//! `fiducia-auth`'s `GET /v1/me` (which
-//! already does offline Supabase JWT verification) and require an `admin` or
-//! `operator` role copied from trusted Supabase `app_metadata`.
+//! `fiducia-auth`'s `GET /v1/me` and require the versioned `fiducia-admin`
+//! authorization context derived there from trusted Supabase `app_metadata`.
+//! Raw role strings, browser headers, customer audiences, and user-editable
+//! metadata are never sufficient to create an operator session.
 
 use axum::http::HeaderMap;
 use std::fmt;
 use std::time::Duration;
 
 use serde::Deserialize;
+
+const AUTHORIZATION_CONTEXT_VERSION: u16 = 1;
+const ADMIN_SURFACE_AUDIENCE: &str = "fiducia-admin";
+const CUSTOMER_SURFACE_AUDIENCE: &str = "fiducia-customer";
+const KNOWN_SURFACE_AUDIENCES: &[&str] = &[ADMIN_SURFACE_AUDIENCE, CUSTOMER_SURFACE_AUDIENCE];
+const KNOWN_ROLES: &[&str] = &["admin", "operator", "customer"];
+const KNOWN_CAPABILITIES: &[&str] = &[
+    "admin:read",
+    "admin:operate",
+    "admin:write",
+    "customer:self-service",
+];
 
 const fn admin_session_cookie_name(release_hardened: bool) -> &'static str {
     if release_hardened {
@@ -103,8 +116,8 @@ impl fmt::Debug for Session {
 /// Resolve the session for a request, or `None` if not signed in.
 ///
 /// Tries real auth first — the bearer from the `Authorization` header or the
-/// canonical admin session cookie, verified with `fiducia-auth` `GET /v1/me` — and only
-/// then falls back to the debug-build-only dev bypass.
+/// canonical admin session cookie, verified with `fiducia-auth` `GET /v1/me` —
+/// and only then falls back to the debug-build-only dev bypass.
 pub async fn current(headers: &HeaderMap, auth_url: &str) -> Option<Session> {
     if let Some(token) = authorization_token(headers) {
         // An explicitly selected bearer credential never silently downgrades to
@@ -178,8 +191,22 @@ struct MeResponse {
 struct AuthUser {
     user_id: String,
     email: Option<String>,
+    /// Retained only for wire compatibility and diagnostics. Authorization must
+    /// use the normalized versioned context below, never these raw strings.
+    #[serde(default, rename = "roles")]
+    _raw_roles: Vec<String>,
+    authorization: AuthorizationContext,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthorizationContext {
+    version: u16,
+    #[serde(default)]
+    surface_audiences: Vec<String>,
     #[serde(default)]
     roles: Vec<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 pub async fn from_bearer(auth_url: &str, token: &str) -> Option<Session> {
@@ -188,7 +215,16 @@ pub async fn from_bearer(auth_url: &str, token: &str) -> Option<Session> {
 
 async fn from_token(auth_url: &str, token: &str, cookie_authenticated: bool) -> Option<Session> {
     match current_from_auth(auth_url, token).await {
-        Ok(user) => Some(session_from_user(user, token, cookie_authenticated)),
+        Ok(user) => match session_from_user(user, token, cookie_authenticated) {
+            Some(session) => Some(session),
+            None => {
+                tracing::debug!(
+                    policy = "admin_authorization_context_v1",
+                    "fiducia-auth identity was not authorized for the admin surface"
+                );
+                None
+            }
+        },
         Err(error) => {
             tracing::debug!(error = %error, "fiducia-auth rejected admin session");
             None
@@ -212,30 +248,62 @@ async fn current_from_auth(auth_url: &str, token: &str) -> Result<AuthUser, reqw
     Ok(user)
 }
 
-fn session_from_user(user: AuthUser, token: &str, cookie_authenticated: bool) -> Session {
-    // fiducia-auth derives these roles exclusively from trusted Supabase
-    // app_metadata. Neither email addresses nor caller-editable metadata are an
-    // authorization source for the operator plane.
-    let is_admin = has_operator_role(&user.roles);
+fn session_from_user(
+    user: AuthUser,
+    token: &str,
+    cookie_authenticated: bool,
+) -> Option<Session> {
+    if !authorization_allows_admin(&user.authorization) {
+        return None;
+    }
 
     let credential_kind = if cookie_authenticated {
         "cookie"
     } else {
         "authorization"
     };
-    Session {
+    Some(Session {
         user_id: user.user_id,
         email: user.email,
-        is_admin,
+        is_admin: true,
         credential_binding: format!("{credential_kind}\0{token}"),
         cookie_authenticated,
-    }
+    })
 }
 
-fn has_operator_role(roles: &[String]) -> bool {
-    roles
-        .iter()
-        .any(|role| matches!(role.as_str(), "admin" | "operator"))
+fn authorization_allows_admin(authorization: &AuthorizationContext) -> bool {
+    if authorization.version != AUTHORIZATION_CONTEXT_VERSION
+        || !unique_known_values(
+            &authorization.surface_audiences,
+            KNOWN_SURFACE_AUDIENCES,
+        )
+        || !unique_known_values(&authorization.roles, KNOWN_ROLES)
+        || !unique_known_values(&authorization.capabilities, KNOWN_CAPABILITIES)
+        || !contains(&authorization.surface_audiences, ADMIN_SURFACE_AUDIENCE)
+    {
+        return false;
+    }
+
+    let is_admin = contains(&authorization.roles, "admin");
+    let is_operator = contains(&authorization.roles, "operator");
+    if !is_admin && !is_operator {
+        return false;
+    }
+
+    let has_read = contains(&authorization.capabilities, "admin:read");
+    let has_operate = contains(&authorization.capabilities, "admin:operate");
+    let has_write = contains(&authorization.capabilities, "admin:write");
+    has_read && has_operate && (!is_admin || has_write)
+}
+
+fn unique_known_values(values: &[String], known: &[&str]) -> bool {
+    values.iter().enumerate().all(|(index, value)| {
+        known.contains(&value.as_str()) && !values[..index].iter().any(|seen| seen == value)
+    })
+}
+
+fn contains(values: &[String], expected: &str) -> bool {
+    values.iter().any(|value| value == expected)
 }
 
 pub(crate) fn cookie_value(headers: &HeaderMap, expected_name: &str) -> Option<String> {
@@ -296,20 +364,53 @@ fn authorization_token(headers: &HeaderMap) -> Option<String> {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use serde_json::json;
 
     fn headers_with(name: &str, value: &str) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert(
+        let mut headers = HeaderMap::new();
+        headers.insert(
             axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
             value.parse().unwrap(),
         );
-        h
+        headers
+    }
+
+    fn authorization(
+        version: u16,
+        audiences: &[&str],
+        roles: &[&str],
+        capabilities: &[&str],
+    ) -> AuthorizationContext {
+        AuthorizationContext {
+            version,
+            surface_audiences: audiences
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            roles: roles.iter().map(|value| (*value).to_string()).collect(),
+            capabilities: capabilities
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+        }
+    }
+
+    fn auth_user(raw_roles: &[&str], authorization: AuthorizationContext) -> AuthUser {
+        AuthUser {
+            user_id: "user_1".to_string(),
+            email: Some("operator@example.com".to_string()),
+            _raw_roles: raw_roles
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            authorization,
+        }
     }
 
     #[test]
     fn authorization_token_reads_bearer_header() {
-        let h = headers_with("authorization", "Bearer abc.def");
-        assert_eq!(authorization_token(&h).as_deref(), Some("abc.def"));
+        let headers = headers_with("authorization", "Bearer abc.def");
+        assert_eq!(authorization_token(&headers).as_deref(), Some("abc.def"));
     }
 
     #[test]
@@ -328,29 +429,127 @@ mod tests {
 
     #[test]
     fn session_cookie_is_separate_from_authorization_header() {
-        let h = headers_with(
+        let headers = headers_with(
             "cookie",
             &format!("other=1; {ADMIN_SESSION_COOKIE}=xyz; more=2"),
         );
-        assert_eq!(session_cookie(&h).as_deref(), Some("xyz"));
-        assert_eq!(authorization_token(&h), None);
+        assert_eq!(session_cookie(&headers).as_deref(), Some("xyz"));
+        assert_eq!(authorization_token(&headers), None);
     }
 
     #[test]
     fn tokens_absent_when_no_credential() {
-        let h = headers_with("cookie", "other=1");
-        assert!(authorization_token(&h).is_none());
-        assert!(session_cookie(&h).is_none());
+        let headers = headers_with("cookie", "other=1");
+        assert!(authorization_token(&headers).is_none());
+        assert!(session_cookie(&headers).is_none());
     }
 
     #[test]
-    fn only_trusted_operator_roles_authorize_admin() {
-        assert!(has_operator_role(&["admin".into()]));
-        assert!(has_operator_role(&["operator".into()]));
-        assert!(!has_operator_role(&[
-            "authenticated".into(),
-            "customer".into()
-        ]));
+    fn versioned_admin_and_operator_contexts_authorize() {
+        assert!(authorization_allows_admin(&authorization(
+            1,
+            &["fiducia-admin"],
+            &["admin"],
+            &["admin:read", "admin:operate", "admin:write"],
+        )));
+        assert!(authorization_allows_admin(&authorization(
+            1,
+            &["fiducia-admin"],
+            &["operator"],
+            &["admin:read", "admin:operate"],
+        )));
+        assert!(authorization_allows_admin(&authorization(
+            1,
+            &["fiducia-admin", "fiducia-customer"],
+            &["operator", "customer"],
+            &["admin:read", "admin:operate", "customer:self-service"],
+        )));
+    }
+
+    #[test]
+    fn customer_or_raw_role_only_contexts_cannot_create_admin_sessions() {
+        let customer = auth_user(
+            &["admin"],
+            authorization(
+                1,
+                &["fiducia-customer"],
+                &["customer"],
+                &["customer:self-service"],
+            ),
+        );
+        assert!(session_from_user(customer, "token", false).is_none());
+
+        let no_trusted_context = auth_user(
+            &["admin", "operator"],
+            authorization(1, &[], &[], &[]),
+        );
+        assert!(session_from_user(no_trusted_context, "token", false).is_none());
+    }
+
+    #[test]
+    fn unknown_version_role_audience_capability_and_duplicates_fail_closed() {
+        for context in [
+            authorization(
+                2,
+                &["fiducia-admin"],
+                &["admin"],
+                &["admin:read", "admin:operate", "admin:write"],
+            ),
+            authorization(
+                1,
+                &["fiducia-admin", "future-surface"],
+                &["admin"],
+                &["admin:read", "admin:operate", "admin:write"],
+            ),
+            authorization(
+                1,
+                &["fiducia-admin"],
+                &["superadmin"],
+                &["admin:read", "admin:operate", "admin:write"],
+            ),
+            authorization(
+                1,
+                &["fiducia-admin"],
+                &["admin"],
+                &["admin:read", "admin:operate", "admin:write", "future:power"],
+            ),
+            authorization(
+                1,
+                &["fiducia-admin", "fiducia-admin"],
+                &["admin"],
+                &["admin:read", "admin:operate", "admin:write"],
+            ),
+        ] {
+            assert!(!authorization_allows_admin(&context));
+        }
+    }
+
+    #[test]
+    fn admin_and_operator_capability_sets_are_not_interchangeable() {
+        assert!(!authorization_allows_admin(&authorization(
+            1,
+            &["fiducia-admin"],
+            &["admin"],
+            &["admin:read", "admin:operate"],
+        )));
+        assert!(!authorization_allows_admin(&authorization(
+            1,
+            &["fiducia-admin"],
+            &["operator"],
+            &["admin:read"],
+        )));
+    }
+
+    #[test]
+    fn missing_authorization_context_is_a_wire_contract_failure() {
+        let legacy = json!({
+            "user": {
+                "user_id": "user_1",
+                "email": "operator@example.com",
+                "roles": ["admin"]
+            }
+        });
+        assert!(serde_json::from_value::<MeResponse>(legacy).is_err());
     }
 
     #[test]

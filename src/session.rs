@@ -276,6 +276,7 @@ fn session_from_user(user: AuthUser, token: &str, cookie_authenticated: bool) ->
     })
 }
 
+#[cfg(test)]
 fn authorization_allows_admin(authorization: &AuthorizationContext) -> bool {
     matches!(
         admin_authorization_decision(authorization),

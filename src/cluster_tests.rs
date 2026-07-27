@@ -149,7 +149,13 @@ async fn cluster_routes_reject_a_verified_non_operator_session() {
                 "user": {
                     "user_id": "00000000-0000-0000-0000-000000000002",
                     "email": "customer@example.com",
-                    "roles": ["customer"]
+                    "roles": ["customer"],
+                    "authorization": {
+                        "version": 1,
+                        "surface_audiences": ["fiducia-customer"],
+                        "roles": ["customer"],
+                        "capabilities": ["customer:self-service"]
+                    }
                 }
             }))
         }),
@@ -287,7 +293,17 @@ async fn overview_merges_all_planes_and_tolerates_a_down_node() {
             // `dev-admin` exercises the debug-build registry shortcut, so this
             // test (db: None) covers the full handler path after auth.
             Json(json!({
-                "user": { "user_id": "dev-admin", "email": "op@example.com", "roles": ["admin"] }
+                "user": {
+                    "user_id": "dev-admin",
+                    "email": "op@example.com",
+                    "roles": ["admin"],
+                    "authorization": {
+                        "version": 1,
+                        "surface_audiences": ["fiducia-admin"],
+                        "roles": ["admin"],
+                        "capabilities": ["admin:read", "admin:operate", "admin:write"]
+                    }
+                }
             }))
         }),
     );
@@ -560,7 +576,17 @@ async fn unconfigured_observability_renders_as_not_configured() {
         "/v1/me",
         get(|| async {
             Json(json!({
-                "user": { "user_id": "dev-admin", "email": "op@example.com", "roles": ["admin"] }
+                "user": {
+                    "user_id": "dev-admin",
+                    "email": "op@example.com",
+                    "roles": ["admin"],
+                    "authorization": {
+                        "version": 1,
+                        "surface_audiences": ["fiducia-admin"],
+                        "roles": ["admin"],
+                        "capabilities": ["admin:read", "admin:operate", "admin:write"]
+                    }
+                }
             }))
         }),
     );
@@ -614,7 +640,17 @@ async fn node_fanout_refuses_untrusted_addresses_and_never_follows_redirects() {
         "/v1/me",
         get(|| async {
             Json(json!({
-                "user": { "user_id": "dev-admin", "email": "op@example.com", "roles": ["admin"] }
+                "user": {
+                    "user_id": "dev-admin",
+                    "email": "op@example.com",
+                    "roles": ["admin"],
+                    "authorization": {
+                        "version": 1,
+                        "surface_audiences": ["fiducia-admin"],
+                        "roles": ["admin"],
+                        "capabilities": ["admin:read", "admin:operate", "admin:write"]
+                    }
+                }
             }))
         }),
     );

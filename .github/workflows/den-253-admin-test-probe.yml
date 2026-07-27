@@ -1,4 +1,4 @@
-name: DEN-253 one-shot admin test probe
+name: DEN-253 one-shot admin auth fixture migration
 
 on:
   push:
@@ -14,49 +14,62 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  capture-test-diagnostic:
+  migrate-fixture:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: true
           ref: agent/den-253-require-admin-authorization-context
-          path: repo
-          submodules: recursive
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          repository: fiducia-cloud/fiducia-interfaces
-          ref: 2c5c806174e067fbe83ad48b724366323ba390a2
-          path: fiducia-interfaces
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          repository: fiducia-cloud/fiducia-sync
-          ref: 6de4f016769960023f8e5a7cfb8a989d7fb2b302
-          path: fiducia-sync
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: "1.95.0"
-      - name: Capture final test output once
-        working-directory: repo
+          components: rustfmt
+      - name: Add the trusted admin context to the legacy auth fixture once
         shell: bash
         run: |
           set -euo pipefail
-          diagnostic=docs/den-253-admin-test-diagnostics.txt
-          if [[ -f "$diagnostic" ]]; then
-            echo 'diagnostic already captured'
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/auth_flow_tests.rs')
+          source = path.read_text()
+          marker = '"surface_audiences": ["fiducia-admin"]'
+          if marker in source:
+              print('admin authorization fixture already migrated')
+              raise SystemExit(0)
+
+          old = '''                    "user_id": "00000000-0000-0000-0000-000000000001",
+                              "email": "operator@example.com",
+                              "orgs": ["org_admin"],
+                              "roles": ["operator"]'''
+          new = '''                    "user_id": "00000000-0000-0000-0000-000000000001",
+                              "email": "operator@example.com",
+                              "orgs": ["org_admin"],
+                              "roles": ["operator"],
+                              "authorization": {
+                                  "version": 1,
+                                  "surface_audiences": ["fiducia-admin"],
+                                  "roles": ["operator"],
+                                  "capabilities": ["admin:read", "admin:operate"]
+                              }'''
+          if source.count(old) != 1:
+              raise SystemExit('expected operator auth fixture anchor exactly once')
+          path.write_text(source.replace(old, new))
+          PY
+          rustfmt --edition 2021 src/auth_flow_tests.rs
+          if git diff --quiet -- src/auth_flow_tests.rs; then
+            echo 'no fixture migration required'
             exit 0
           fi
-          set +e
-          cargo test --locked --all-targets --all-features -- --nocapture > /tmp/test.log 2>&1
-          status=$?
-          set -e
-          tail -n 300 /tmp/test.log > "$diagnostic"
-          printf '\nexit_status=%s\n' "$status" >> "$diagnostic"
+          if ! git diff --quiet -- . ':(exclude)src/auth_flow_tests.rs'; then
+            echo 'fixture migration changed an unexpected path' >&2
+            git --no-pager diff -- . ':(exclude)src/auth_flow_tests.rs'
+            exit 1
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add "$diagnostic"
-          git commit -m 'DEN-253 capture concise admin test diagnostic'
+          git add src/auth_flow_tests.rs
+          git commit -m 'DEN-253 migrate admin auth test fixture'
           git push origin HEAD:agent/den-253-require-admin-authorization-context

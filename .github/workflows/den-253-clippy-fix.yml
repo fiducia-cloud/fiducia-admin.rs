@@ -30,6 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The workflow exists before this trigger commit.
           python3 - <<'PY'
           from pathlib import Path
           path = Path('src/session.rs')

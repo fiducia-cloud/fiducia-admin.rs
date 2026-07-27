@@ -30,6 +30,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The workflow exists before this trigger commit, so the branch push runs it.
           python3 .github/scripts/den-253-auth-decision.py
           rustfmt --edition 2021 src/session.rs
           if git diff --quiet -- src/session.rs; then

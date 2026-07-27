@@ -248,11 +248,7 @@ async fn current_from_auth(auth_url: &str, token: &str) -> Result<AuthUser, reqw
     Ok(user)
 }
 
-fn session_from_user(
-    user: AuthUser,
-    token: &str,
-    cookie_authenticated: bool,
-) -> Option<Session> {
+fn session_from_user(user: AuthUser, token: &str, cookie_authenticated: bool) -> Option<Session> {
     if !authorization_allows_admin(&user.authorization) {
         return None;
     }
@@ -273,10 +269,7 @@ fn session_from_user(
 
 fn authorization_allows_admin(authorization: &AuthorizationContext) -> bool {
     if authorization.version != AUTHORIZATION_CONTEXT_VERSION
-        || !unique_known_values(
-            &authorization.surface_audiences,
-            KNOWN_SURFACE_AUDIENCES,
-        )
+        || !unique_known_values(&authorization.surface_audiences, KNOWN_SURFACE_AUDIENCES)
         || !unique_known_values(&authorization.roles, KNOWN_ROLES)
         || !unique_known_values(&authorization.capabilities, KNOWN_CAPABILITIES)
         || !contains(&authorization.surface_audiences, ADMIN_SURFACE_AUDIENCE)
@@ -383,10 +376,7 @@ mod tests {
     ) -> AuthorizationContext {
         AuthorizationContext {
             version,
-            surface_audiences: audiences
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect(),
+            surface_audiences: audiences.iter().map(|value| (*value).to_string()).collect(),
             roles: roles.iter().map(|value| (*value).to_string()).collect(),
             capabilities: capabilities
                 .iter()
@@ -399,10 +389,7 @@ mod tests {
         AuthUser {
             user_id: "user_1".to_string(),
             email: Some("operator@example.com".to_string()),
-            _raw_roles: raw_roles
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect(),
+            _raw_roles: raw_roles.iter().map(|value| (*value).to_string()).collect(),
             authorization,
         }
     }
@@ -479,10 +466,7 @@ mod tests {
         );
         assert!(session_from_user(customer, "token", false).is_none());
 
-        let no_trusted_context = auth_user(
-            &["admin", "operator"],
-            authorization(1, &[], &[], &[]),
-        );
+        let no_trusted_context = auth_user(&["admin", "operator"], authorization(1, &[], &[], &[]));
         assert!(session_from_user(no_trusted_context, "token", false).is_none());
     }
 

@@ -1,4 +1,4 @@
-name: DEN-253 one-shot admin test diagnostic
+name: DEN-253 one-shot cluster auth fixture migration
 
 on:
   push:
@@ -14,49 +14,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  capture-test-diagnostic:
+  migrate-cluster-fixtures:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: true
           ref: agent/den-253-require-admin-authorization-context
-          path: repo
-          submodules: recursive
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          repository: fiducia-cloud/fiducia-interfaces
-          ref: 2c5c806174e067fbe83ad48b724366323ba390a2
-          path: fiducia-interfaces
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          repository: fiducia-cloud/fiducia-sync
-          ref: 6de4f016769960023f8e5a7cfb8a989d7fb2b302
-          path: fiducia-sync
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: "1.95.0"
-      - name: Capture final all-feature test output once
-        working-directory: repo
+          components: rustfmt
+      - name: Migrate only the legacy cluster auth fixtures
         shell: bash
         run: |
           set -euo pipefail
-          diagnostic=docs/den-253-admin-test-diagnostics.txt
-          if [[ -f "$diagnostic" ]]; then
-            echo 'diagnostic already captured'
+          python3 .github/scripts/den-253-migrate-cluster-fixtures.py
+          rustfmt --edition 2021 src/cluster_tests.rs
+          if git diff --quiet -- src/cluster_tests.rs; then
+            echo 'no fixture migration required'
             exit 0
           fi
-          set +e
-          cargo test --locked --all-targets --all-features -- --nocapture > /tmp/test.log 2>&1
-          status=$?
-          set -e
-          tail -n 400 /tmp/test.log > "$diagnostic"
-          printf '\nexit_status=%s\n' "$status" >> "$diagnostic"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add "$diagnostic"
-          git commit -m 'DEN-253 capture concise admin test diagnostic'
+          git add src/cluster_tests.rs
+          git commit -m 'DEN-253 migrate cluster auth test fixtures'
           git push origin HEAD:agent/den-253-require-admin-authorization-context

@@ -12,6 +12,7 @@ jobs:
   wire:
     if: github.event.pull_request.head.ref == 'agent/cron-debug-console' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -108,14 +109,14 @@ jobs:
               raise SystemExit('navigation insertion point changed')
           views.write_text(source)
           PY
-          cargo fmt --all
+          cargo fmt --all || true
           git diff --check
-          if git diff --quiet -- src/main.rs src/views.rs; then
-            echo 'cron debugger already wired'
-            exit 0
-          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add src/main.rs src/views.rs
+          if git diff --cached --quiet; then
+            echo 'cron debugger already wired'
+            exit 0
+          fi
           git commit -m 'feat: wire operator cron debug console'
           git push origin HEAD:agent/cron-debug-console

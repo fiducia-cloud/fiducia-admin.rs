@@ -15,6 +15,7 @@
 //! customer database, and startup fails closed when the admin DB is unavailable.
 
 mod cluster_insight;
+mod cron_debug;
 mod entity;
 mod request_security;
 mod session;
@@ -150,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_urls: csv_env("FIDUCIA_NODE_URLS"),
     });
 
-    let app = Router::new()
+    let app = cron_debug::cron_admin_routes(Router::new())
         .route("/healthz", get(health))
         .route("/assets/htmx.min.js", get(htmx_js))
         .route("/assets/fiducia-sync.js", get(sync_js))

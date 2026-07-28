@@ -29,7 +29,13 @@ async fn login_requires_the_operator_registry_after_trusted_auth() {
                     "user_id": "00000000-0000-0000-0000-000000000001",
                     "email": "operator@example.com",
                     "orgs": ["org_admin"],
-                    "roles": ["operator"]
+                    "roles": ["operator"],
+                    "authorization": {
+                        "version": 1,
+                        "surface_audiences": ["fiducia-admin"],
+                        "roles": ["operator"],
+                        "capabilities": ["admin:read", "admin:operate"]
+                    }
                 }
             }))
         }),

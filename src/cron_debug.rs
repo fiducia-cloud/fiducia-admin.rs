@@ -458,6 +458,8 @@ fn redact_function_value(mut value: Value) -> Value {
     value
 }
 
+#[allow(clippy::too_many_arguments)]
+// Keep the trusted client, tenant, auth, trace, method, path, and body explicit at this boundary.
 async fn upstream_json(
     _st: &AppState,
     incoming: &HeaderMap,

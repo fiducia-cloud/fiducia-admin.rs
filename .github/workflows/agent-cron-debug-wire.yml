@@ -1,16 +1,16 @@
 name: wire cron debug console
 
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, reopened, synchronize]
+  push:
+    branches:
+      - agent/cron-debug-console
 
 permissions:
   contents: write
 
 jobs:
   wire:
-    if: github.event.pull_request.head.ref == 'agent/cron-debug-console' && github.actor != 'github-actions[bot]'
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +19,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
-          toolchain: "1.97.0"
+          toolchain: "1.95.0"
           components: rustfmt
       - name: Wire routes, state, and navigation
         shell: bash
@@ -31,7 +31,8 @@ jobs:
           main = Path('src/main.rs')
           source = main.read_text()
 
-          source = source.replace('mod cluster_insight;\n', 'mod cluster_insight;\nmod cron_debug;\n', 1) if 'mod cron_debug;' not in source else source
+          if 'mod cron_debug;' not in source:
+              source = source.replace('mod cluster_insight;\n', 'mod cluster_insight;\nmod cron_debug;\n', 1)
 
           old = '''    /// Explicit fiducia-node client-plane base URLs. Empty → discover node
     /// addresses from the brain's `/v1/nodes` membership snapshot.

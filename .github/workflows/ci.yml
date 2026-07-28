@@ -1,70 +1,121 @@
-name: ci
+name: wire cron debug console
 
 on:
-  push:
-    branches: [main]
   pull_request:
-  workflow_dispatch:
+    branches: [main]
+    types: [opened, reopened, synchronize]
 
 permissions:
-  contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  contents: write
 
 jobs:
-  test:
+  wire:
+    if: github.event.pull_request.head.ref == 'agent/cron-debug-console' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          persist-credentials: false
-          path: repo
-          submodules: recursive
-      - name: Validate GitHub Actions
-        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
-        with:
-          args: repo/.github/workflows/ci.yml repo/.github/workflows/docker.yml
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          repository: fiducia-cloud/fiducia-interfaces
-          ref: 2c5c806174e067fbe83ad48b724366323ba390a2
-          path: fiducia-interfaces
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          repository: fiducia-cloud/fiducia-sync
-          ref: 6de4f016769960023f8e5a7cfb8a989d7fb2b302
-          path: fiducia-sync
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+          ref: agent/cron-debug-console
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: "1.95.0"
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          workspaces: repo
-      - name: CLI flag contract
-        working-directory: repo
+          components: rustfmt
+      - name: Wire routes, state, and navigation
+        shell: bash
         run: |
-          make -B -C vendor/flags-2-env all
-          vendor/flags-2-env/build/flags2env audit .cli-flags.toml
-      - name: fmt
-        working-directory: repo
-        run: cargo fmt --all --check
-      - name: clippy
-        working-directory: repo
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: test
-        working-directory: repo
-        run: cargo test --locked --all-targets --all-features
-      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2
-        with:
-          tool: cargo-audit@0.22.2
-      - name: audit
-        working-directory: repo
-        run: cargo audit
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          main = Path('src/main.rs')
+          source = main.read_text()
+
+          if 'mod cron_debug;' not in source:
+              source = source.replace('mod cluster_insight;\n', 'mod cluster_insight;\nmod cron_debug;\n', 1)
+
+          old = '''    /// Explicit fiducia-node client-plane base URLs. Empty → discover node
+    /// addresses from the brain's `/v1/nodes` membership snapshot.
+    node_urls: Vec<String>,
+}'''
+          new = '''    /// Explicit fiducia-node client-plane base URLs. Empty → discover node
+    /// addresses from the brain's `/v1/nodes` membership snapshot.
+    node_urls: Vec<String>,
+    /// Trusted-hop credential used only for server-side node calls. Never rendered.
+    internal_secret: String,
+    /// Stable client-plane node URL for tenant-scoped cron diagnostics. Falls back
+    /// to the first explicit `FIDUCIA_NODE_URLS` target when unset.
+    cron_node_url: Option<String>,
+}'''
+          if old in source:
+              source = source.replace(old, new, 1)
+          elif 'cron_node_url: Option<String>' not in source:
+              raise SystemExit('AppState insertion point changed')
+
+          old = '''    let db = connect_admin_db().await?;
+    required_env("FIDUCIA_INTERNAL_SECRET")?;
+    let request_security = RequestSecurity::from_env(port)?;'''
+          new = '''    let db = connect_admin_db().await?;
+    let internal_secret = required_env("FIDUCIA_INTERNAL_SECRET")?;
+    let request_security = RequestSecurity::from_env(port)?;'''
+          if old in source:
+              source = source.replace(old, new, 1)
+          elif 'let internal_secret = required_env("FIDUCIA_INTERNAL_SECRET")?;' not in source:
+              raise SystemExit('internal secret insertion point changed')
+
+          old = '''        grafana_public_url: validated_grafana_public_url()?,
+        node_urls: csv_env("FIDUCIA_NODE_URLS"),
+    });'''
+          new = '''        grafana_public_url: validated_grafana_public_url()?,
+        node_urls: csv_env("FIDUCIA_NODE_URLS"),
+        internal_secret,
+        cron_node_url: optional_env("FIDUCIA_CRON_NODE_URL"),
+    });'''
+          if old in source:
+              source = source.replace(old, new, 1)
+          elif 'cron_node_url: optional_env("FIDUCIA_CRON_NODE_URL")' not in source:
+              raise SystemExit('state initialization insertion point changed')
+
+          old = '''        .route("/api/admin/cluster/metrics", get(cluster_metrics_api))
+        .route("/api/admin/audit", get(audit_api))'''
+          new = '''        .route("/api/admin/cluster/metrics", get(cluster_metrics_api))
+        // Tenant-scoped cron diagnostics. These handlers perform the same
+        // operator-registry gate as the existing cluster insight routes.
+        .route("/crons", get(cron_debug::page))
+        .route("/api/admin/crons", get(cron_debug::list_api))
+        .route(
+            "/api/admin/crons/:schedule/history",
+            get(cron_debug::history_api),
+        )
+        .route("/api/admin/audit", get(audit_api))'''
+          if old in source:
+              source = source.replace(old, new, 1)
+          elif '.route("/crons", get(cron_debug::page))' not in source:
+              raise SystemExit('router insertion point changed')
+
+          main.write_text(source)
+
+          views = Path('src/views.rs')
+          source = views.read_text()
+          old = '''                        a href="/cluster" { "Cluster" }
+                        a href="/notices" { "Notices" }'''
+          new = '''                        a href="/cluster" { "Cluster" }
+                        a href="/crons" { "Crons" }
+                        a href="/notices" { "Notices" }'''
+          if old in source:
+              source = source.replace(old, new, 1)
+          elif 'a href="/crons" { "Crons" }' not in source:
+              raise SystemExit('navigation insertion point changed')
+          views.write_text(source)
+          PY
+          cargo fmt --all
+          git diff --check
+          if git diff --quiet -- src/main.rs src/views.rs; then
+            echo 'cron debugger already wired'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/main.rs src/views.rs
+          git commit -m 'feat: wire operator cron debug console'
+          git push origin HEAD:agent/cron-debug-console

@@ -68,6 +68,7 @@ pub fn page(
                         a href="/" { "Dashboard" }
                         a href="/infra" { "Infra" }
                         a href="/cluster" { "Cluster" }
+                        a href="/crons" { "Crons" }
                         a href="/notices" { "Notices" }
                         a href="/audit" { "Audit" }
                     } @else {
@@ -158,6 +159,7 @@ pub fn dashboard(s: &Session, csrf_token: &str) -> Markup {
                     "Signed in as operator " b { (ident(s)) } "."
                 }
                 p { a href="/infra" { "Cluster & infra ops →" } }
+                p { a href="/crons" { "Cron debugger →" } }
                 p { a href="/audit" { "Operator audit →" } }
             }
         },

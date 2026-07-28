@@ -1,15 +1,16 @@
 name: diagnose admin cron Clippy
 
 on:
-  push:
-    branches:
-      - agent/cron-admin-debugger
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: read
 
 jobs:
   diagnose:
+    if: github.event.pull_request.head.ref == 'agent/cron-admin-debugger'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

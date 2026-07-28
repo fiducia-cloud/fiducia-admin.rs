@@ -11,6 +11,12 @@ an operator, the BFF builds a new request containing only:
 - the canonical `x-fiducia-org-id` selected by the operator;
 - valid W3C `traceparent` and `tracestate` headers.
 
+Trace forwarding accepts only a version `00` `traceparent` with its exact wire
+length, lowercase hexadecimal fields, and non-zero trace and parent IDs.
+`tracestate` is forwarded only with a valid `traceparent`, must be non-empty
+printable ASCII, and is capped at 512 bytes. Invalid browser trace context is
+dropped rather than propagated across the trusted-hop boundary.
+
 `Cookie` and browser `Authorization` are never forwarded. Redirects are disabled,
 requests time out after five seconds, and response bodies are streamed under a
 two-MiB cap.
@@ -29,7 +35,10 @@ to Tempo and to a matching Loki query.
 
 Function source, environment values, entry commands, container settings,
 invocation requests, and payloads are recursively removed from the admin
-response. Webhook targets show only the parsed host.
+response. Schedule projections rebuild each target from its safe kind; only a
+function UUID may remain for function targets. Webhook and gRPC destinations,
+headers, bodies, requests, and payloads are removed before HTML or JSON
+serialization.
 
 ## Mutations
 

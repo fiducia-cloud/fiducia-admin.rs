@@ -23,6 +23,7 @@ const MAX_SEARCH_BYTES: usize = 128;
 const MAX_RESULTS: usize = 100;
 const MAX_WINDOW_MS: u64 = 31 * 24 * 60 * 60 * 1000;
 const ORG_HEADER: &str = "x-fiducia-org-id";
+const MAX_TRACESTATE_BYTES: usize = 512;
 
 #[derive(Clone)]
 pub(crate) struct CronAdminServices {
@@ -258,11 +259,14 @@ async fn load_snapshot(
         None,
     )
     .await?;
-    let mut schedules = schedules_body
+    let mut schedules: Vec<Value> = schedules_body
         .get("schedules")
         .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
         .cloned()
-        .unwrap_or_default();
+        .map(redact_schedule_value)
+        .collect();
     if let Some(function_id) = query.function_id.as_deref() {
         schedules.retain(|schedule| schedule_function_id(schedule) == Some(function_id));
     }
@@ -282,7 +286,7 @@ async fn load_snapshot(
             None,
         )
         .await?;
-        selected_schedule = body.get("schedule").cloned();
+        selected_schedule = body.get("schedule").cloned().map(redact_schedule_value);
         let history = upstream_json(
             st,
             incoming,
@@ -432,6 +436,99 @@ fn value_as_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
+fn valid_traceparent(value: &HeaderValue) -> bool {
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let bytes = value.as_bytes();
+    if bytes.len() != 55
+        || &bytes[0..2] != b"00"
+        || bytes[2] != b'-'
+        || bytes[35] != b'-'
+        || bytes[52] != b'-'
+    {
+        return false;
+    }
+    let lower_hex = |byte: &u8| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase();
+    if !bytes[3..35].iter().all(lower_hex)
+        || !bytes[36..52].iter().all(lower_hex)
+        || !bytes[53..55].iter().all(lower_hex)
+    {
+        return false;
+    }
+    bytes[3..35].iter().any(|byte| *byte != b'0') && bytes[36..52].iter().any(|byte| *byte != b'0')
+}
+
+fn valid_tracestate(value: &HeaderValue) -> bool {
+    value.to_str().is_ok_and(|value| {
+        !value.is_empty()
+            && value.len() <= MAX_TRACESTATE_BYTES
+            && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+    })
+}
+
+fn insert_valid_trace_context(incoming: &HeaderMap, outgoing: &mut HeaderMap) {
+    let traceparent = HeaderName::from_static("traceparent");
+    let tracestate = HeaderName::from_static("tracestate");
+    let Some(value) = incoming
+        .get(&traceparent)
+        .filter(|value| valid_traceparent(value))
+    else {
+        return;
+    };
+    outgoing.insert(traceparent, value.clone());
+    if let Some(value) = incoming
+        .get(&tracestate)
+        .filter(|value| valid_tracestate(value))
+    {
+        outgoing.insert(tracestate, value.clone());
+    }
+}
+
+fn redact_schedule_value(mut value: Value) -> Value {
+    fn redact_schedule_object(object: &mut Map<String, Value>) {
+        for key in [
+            "headers",
+            "body",
+            "payload",
+            "request",
+            "webhook_url",
+            "grpc_endpoint",
+        ] {
+            object.remove(key);
+        }
+        let Some(target) = object.get_mut("target").and_then(Value::as_object_mut) else {
+            return;
+        };
+        let kind = target
+            .get("kind")
+            .or_else(|| target.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let function_id = target
+            .get("function_id")
+            .or_else(|| target.get("functionId"))
+            .cloned();
+        target.clear();
+        target.insert("kind".to_string(), Value::String(kind.clone()));
+        if kind == "function" {
+            if let Some(function_id) = function_id {
+                target.insert("function_id".to_string(), function_id);
+            }
+        } else {
+            target.insert("destination_redacted".to_string(), Value::Bool(true));
+        }
+    }
+    if let Some(object) = value.as_object_mut() {
+        if let Some(schedule) = object.get_mut("schedule").and_then(Value::as_object_mut) {
+            redact_schedule_object(schedule);
+        }
+        redact_schedule_object(object);
+    }
+    value
+}
+
 fn redact_function_value(mut value: Value) -> Value {
     fn redact_object(object: &mut Map<String, Value>) {
         for key in [
@@ -558,12 +655,7 @@ fn outbound_headers(
         HeaderName::from_static(ORG_HEADER),
         HeaderValue::from_str(org_id).map_err(|_| CronDebugError::BadRequest("invalid_org_id"))?,
     );
-    for name in ["traceparent", "tracestate"] {
-        let header = HeaderName::from_static(name);
-        if let Some(value) = incoming.get(&header) {
-            headers.insert(header, value.clone());
-        }
-    }
+    insert_valid_trace_context(incoming, &mut headers);
     debug_assert!(headers.get(COOKIE).is_none());
     debug_assert!(headers.get(AUTHORIZATION).is_none());
     Ok(headers)
@@ -1044,6 +1136,41 @@ mod tests {
         assert_eq!(headers.get(ORG_HEADER).unwrap(), "acme");
         assert_eq!(headers.get("x-fiducia-internal-auth").unwrap(), "secret");
         assert!(headers.get("traceparent").is_some());
+    }
+
+    #[test]
+    fn outbound_headers_drop_invalid_browser_trace_context() {
+        let mut incoming = HeaderMap::new();
+        incoming.insert(
+            "traceparent",
+            HeaderValue::from_static("00-00000000000000000000000000000000-0123456789abcdef-01"),
+        );
+        incoming.insert("tracestate", HeaderValue::from_static("vendor=value"));
+        let headers = outbound_headers(&service(), "acme", &incoming).unwrap();
+        assert!(headers.get("traceparent").is_none());
+        assert!(headers.get("tracestate").is_none());
+    }
+
+    #[test]
+    fn schedule_destinations_and_payloads_are_redacted() {
+        let redacted = redact_schedule_value(
+            json!({"name":"billing","target":{"kind":"webhook","url":"https://secret.example/internal","headers":{"authorization":"secret"},"payload":{"token":"secret"}}}),
+        );
+        let target = redacted.get("target").and_then(Value::as_object).unwrap();
+        assert_eq!(
+            target.get("kind"),
+            Some(&Value::String("webhook".to_string()))
+        );
+        assert_eq!(target.get("destination_redacted"), Some(&Value::Bool(true)));
+        assert!(target.get("url").is_none());
+        assert!(target.get("headers").is_none());
+        assert!(target.get("payload").is_none());
+        let function =
+            redact_schedule_value(json!({"target":{"kind":"function","function_id":Uuid::nil()}}));
+        assert_eq!(
+            function.pointer("/target/function_id"),
+            Some(&Value::String(Uuid::nil().to_string()))
+        );
     }
 
     #[test]

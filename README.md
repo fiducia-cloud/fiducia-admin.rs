@@ -237,7 +237,7 @@ The schema is audited by the CLI flag contract step in CI
 ### Reproducible container inputs
 
 The container build fetches `fiducia-interfaces` at
-`2c5c806174e067fbe83ad48b724366323ba390a2` and `fiducia-sync` at
+`bd718cd72d72aa330534f3688f8fb1ce90c19d10` and `fiducia-sync` at
 `6de4f016769960023f8e5a7cfb8a989d7fb2b302`. Both build arguments must be
 40-character lowercase commit ids; the Dockerfile checks out each commit in
 detached mode and verifies `HEAD` before compiling with

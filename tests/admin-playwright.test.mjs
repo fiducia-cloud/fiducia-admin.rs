@@ -1,5 +1,5 @@
-// Playwright browser E2E: boots or reuses a fully configured axum admin server
-// and drives the isolated operator account and infra-scale HTMX flows.
+// Playwright browser E2E: boots a fully isolated axum admin server and
+// drives the operator-only dashboard and infra-scale HTMX flow.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { chromium } from "playwright";
@@ -28,13 +28,43 @@ test("playwright drives the isolated admin dashboard and infra scale flow", asyn
   const pageErrors = [];
   page.on("pageerror", (error) => pageErrors.push(error.message));
 
-  // Dashboard renders under the debug-only dev-admin session.
-  await page.goto(`${server.url}/`, { waitUntil: "networkidle" });
+  // Dashboard renders under the debug-only dev-admin session and carries the
+  // production response hardening even on the local HTTP harness.
+  const dashboardResponse = await page.goto(`${server.url}/`, {
+    waitUntil: "networkidle",
+  });
+  assert.ok(dashboardResponse, "dashboard navigation must return an HTTP response");
+  const dashboardHeaders = dashboardResponse.headers();
+  assert.equal(dashboardHeaders["cache-control"], "no-store");
+  assert.equal(dashboardHeaders["x-content-type-options"], "nosniff");
+  assert.equal(dashboardHeaders["x-frame-options"], "DENY");
+  assert.equal(dashboardHeaders["referrer-policy"], "same-origin");
+  const csp = dashboardHeaders["content-security-policy"] ?? "";
+  assert.match(csp, /default-src 'self'/);
+  assert.match(csp, /script-src 'self' 'wasm-unsafe-eval'/);
+  assert.match(csp, /frame-ancestors 'none'/);
+  assert.match(csp, /base-uri 'none'/);
+  assert.match(csp, /form-action 'self'/);
+  assert.match(csp, /object-src 'none'/);
+  assert.doesNotMatch(csp, /'unsafe-inline'/);
+  assert.doesNotMatch(csp, /script-src[^;]*'unsafe-eval'/);
+
   await assertVisibleText(page, "Dashboard");
   await assertVisibleText(page, "Welcome");
 
   assert.equal(await page.locator('nav a[href="/keys"]').count(), 0);
   assert.equal(await page.locator('nav a[href="/account"]').count(), 0);
+
+  // A context-sharing request proves that the dev-admin browser session is not
+  // enough to authorize a mutation from a foreign Origin. The control-plane
+  // stub must remain untouched by the rejected request.
+  const crossOrigin = await page.request.post(`${server.url}/infra/scale`, {
+    headers: { origin: "https://attacker.example" },
+    form: { csrf_token: "forged", target_nodes: "9" },
+  });
+  assert.equal(crossOrigin.status(), 403);
+  assert.equal((await crossOrigin.json()).error, "admin_request_rejected");
+  assert.equal(server.brainRequests.length, 0);
 
   // Infra: set target_nodes, Apply — htmx swaps the infra panel in place.
   await page.locator('nav a[href="/infra"]').click();
@@ -43,6 +73,32 @@ test("playwright drives the isolated admin dashboard and infra scale flow", asyn
   await page.fill("input[name='target_nodes']", "7");
   await page.getByRole("button", { name: "Apply" }).click();
   await assertVisibleText(page, "Scale to 7 nodes requested.");
+
+  const scaleRequests = server.brainRequests.filter(
+    (request) => request.method === "POST" && request.path === "/v1/scale",
+  );
+  assert.equal(scaleRequests.length, 1);
+  assert.equal(scaleRequests[0].authorized, true);
+  assert.deepEqual(scaleRequests[0].body, {
+    target_nodes: 7,
+    replication_factor: 3,
+  });
+  assert.ok(
+    server.brainRequests
+      .filter((request) => request.path.startsWith("/v1/"))
+      .every((request) => request.authorized),
+    "every admin-to-brain request must carry the trusted-hop credential",
+  );
+  assert.ok(
+    server.brainRequests.some(
+      (request) => request.method === "GET" && request.path === "/v1/nodes",
+    ),
+  );
+  assert.ok(
+    server.brainRequests.some(
+      (request) => request.method === "GET" && request.path === "/v1/placement",
+    ),
+  );
 
   assert.deepEqual(pageErrors, []);
 });

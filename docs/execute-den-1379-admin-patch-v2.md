@@ -1,0 +1,1 @@
+This non-executable temporary PR is created after the exact ordinary pull-request helper exists on `main`. Its `opened` event applies the hardcoded patch to admin PR #23 and generates the exact Cargo lockfile.

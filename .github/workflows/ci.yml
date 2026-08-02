@@ -14,6 +14,176 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  apply-den-1379:
+    if: github.event_name == 'push' && github.event.head_commit.message == 'ci(auth): execute exact admin cutover patch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: agent/den-1379-shared-auth-cutover
+          path: repo
+          persist-credentials: true
+          submodules: recursive
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: 0ad257b6708117dcc3643a9fd15b0f92ca394c1f
+          path: fiducia-interfaces
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: fiducia-cloud/fiducia-sync
+          ref: e4cb47c9582e11de62c0f19ce3511d3b7c1cce04
+          path: fiducia-sync
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt
+      - name: Apply exact cutover patch
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          git fetch origin 0aa7da78e3ddd0e32467e1f0ec55c5fa4c64e180 --depth=1
+          git show 0aa7da78e3ddd0e32467e1f0ec55c5fa4c64e180:.github/workflows/ci.yml > .github/workflows/ci.yml
+          rm -f .github/workflows/apply-den-1379-admin-cutover.yml
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          main = Path("src/main.rs")
+          text = main.read_text()
+          old_state = '''    let state = Arc::new(AppState {
+        auth_url: required_env("FIDUCIA_AUTH_URL")?,
+        brain_url: required_env("FIDUCIA_BRAIN_URL")?,
+        supabase_url: required_env("SUPABASE_URL")?,
+        supabase_publishable_key: required_env("SUPABASE_PUBLISHABLE_KEY")?,
+        db: Some(db),
+'''
+          new_state = '''    let auth_url = required_env("SHARED_AUTH_URL")?;
+    session::initialize(&auth_url).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid Shared Auth configuration: {error}"),
+        )
+    })?;
+    let supabase_url = required_env("SUPABASE_URL")?;
+    let supabase_publishable_key = required_env("SUPABASE_PUBLISHABLE_KEY")?;
+
+    let state = Arc::new(AppState {
+        auth_url,
+        brain_url: required_env("FIDUCIA_BRAIN_URL")?,
+        supabase_url,
+        supabase_publishable_key,
+        db: Some(db),
+'''
+          if old_state not in text:
+              raise SystemExit("admin state initialization block did not match")
+          text = text.replace(old_state, new_state, 1)
+
+          old_login = '''    let Some(session) = session::from_bearer(&st.auth_url, &password_session.access_token).await
+    else {
+        return login_page(&st, Some("The identity could not be verified."));
+    };
+    if !session.is_admin {
+        return (StatusCode::FORBIDDEN, views::forbidden(&session, None)).into_response();
+    }
+    match operator_is_enabled(&st, &session).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (StatusCode::FORBIDDEN, views::forbidden(&session, None)).into_response()
+        }
+        Err(error) => return dependency_error("operator_registry_unavailable", error),
+    }
+
+    let mut response = redirect("/");
+    append_set_cookie(
+        &mut response,
+        &make_session_cookie(&password_session.access_token),
+    );
+'''
+          new_login = '''    let Some(verified) =
+        session::from_bearer(&st.auth_url, &password_session.access_token).await
+    else {
+        return login_page(
+            &st,
+            Some("Shared Auth could not authorize this admin identity."),
+        );
+    };
+    let session = verified.session;
+    let Some(session_upgrade) = verified.session_upgrade else {
+        return dependency_error(
+            "shared_auth_session_upgrade_missing",
+            "Shared Auth authorized the provider token without issuing a reusable session",
+        );
+    };
+    if !session.is_admin {
+        return (StatusCode::FORBIDDEN, views::forbidden(&session, None)).into_response();
+    }
+    match operator_is_enabled(&st, &session).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (StatusCode::FORBIDDEN, views::forbidden(&session, None)).into_response()
+        }
+        Err(error) => return dependency_error("operator_registry_unavailable", error),
+    }
+
+    let mut response = redirect("/");
+    append_set_cookie(
+        &mut response,
+        &make_session_cookie(session_upgrade.access_token()),
+    );
+'''
+          if old_login not in text:
+              raise SystemExit("admin login verification block did not match")
+          main.write_text(text.replace(old_login, new_login, 1))
+
+          harness = Path("tests/admin-browser-harness.mjs")
+          value = harness.read_text()
+          old = '        FIDUCIA_AUTH_URL: controlPlane.url,\n'
+          new = '''        SHARED_AUTH_URL: controlPlane.url,
+        SHARED_AUTH_ISSUER: "https://auth.fiducia.invalid",
+        SHARED_AUTH_AUDIENCE: "fiducia-admin",
+        SHARED_AUTH_INTROSPECT_SECRET: TEST_INTERNAL_SECRET,
+'''
+          if old not in value:
+              raise SystemExit("admin browser auth environment did not match")
+          harness.write_text(value.replace(old, new, 1))
+
+          old_pin = "6081bc3f3b7cbe0312870968b61acc38ca91c66a"
+          new_pin = "0ad257b6708117dcc3643a9fd15b0f92ca394c1f"
+          for path in [
+              Path("Dockerfile"),
+              Path(".github/workflows/ci.yml"),
+              Path(".github/workflows/docker.yml"),
+              Path("scripts/check-sibling-pins.py"),
+          ]:
+              if path.exists():
+                  path.write_text(path.read_text().replace(old_pin, new_pin))
+          leftovers = []
+          for path in Path(".").rglob("*"):
+              if not path.is_file() or ".git" in path.parts:
+                  continue
+              try:
+                  if old_pin in path.read_text():
+                      leftovers.append(str(path))
+              except UnicodeDecodeError:
+                  pass
+          if leftovers:
+              raise SystemExit(f"stale interfaces pin remains in: {leftovers}")
+          PY
+
+          cargo generate-lockfile
+          cargo fmt --all
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(auth): complete admin Shared Auth cutover"
+          git push origin HEAD:agent/den-1379-shared-auth-cutover
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45

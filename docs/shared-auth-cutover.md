@@ -29,3 +29,5 @@ A Shared Auth role is necessary but not sufficient. The Supabase subject must al
 4. Verify login rotates the provider token to a Shared Auth cookie.
 5. Verify customer-project and disabled-operator negative cases.
 6. Remove `FIDUCIA_AUTH_URL` from the admin deployment after rollback observation completes.
+
+The pull request's generated lockfile and formatting are produced from the exact pinned sibling graph before review.

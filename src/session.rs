@@ -1,6 +1,6 @@
 //! Dashboard session handling through the Fiducia Shared Auth dual-provider guard.
 //!
-//! The login form still starts with the ADMIN Supabase project. The guard then
+//! The login form starts with the ADMIN Supabase project. The process-wide guard
 //! exchanges and introspects that provider token through Shared Auth, pins the
 //! `fiducia-admin` project, requires an `admin` or `operator` role signed by
 //! Shared Auth, and returns the short-lived Shared Auth token for the host-only
@@ -8,9 +8,11 @@
 //! adapter, but it can never manufacture an admin role or a session upgrade.
 
 use std::fmt;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use axum::http::HeaderMap;
-use fiducia_shared_auth_guard::{Guard, Identity, Outcome, SessionUpgrade};
+use fiducia_shared_auth_guard::{Config, Guard, Identity, Outcome, SessionUpgrade};
 
 const fn admin_session_cookie_name(release_hardened: bool) -> &'static str {
     if release_hardened {
@@ -30,6 +32,62 @@ const fn login_csrf_cookie_name(release_hardened: bool) -> &'static str {
 
 pub(crate) const ADMIN_SESSION_COOKIE: &str = admin_session_cookie_name(!cfg!(debug_assertions));
 pub(crate) const LOGIN_CSRF_COOKIE: &str = login_csrf_cookie_name(!cfg!(debug_assertions));
+
+struct ConfiguredGuard {
+    shared_auth_base: String,
+    guard: Guard,
+}
+
+static ADMIN_GUARD: OnceLock<Result<ConfiguredGuard, String>> = OnceLock::new();
+
+/// Validate all Shared Auth and ADMIN Supabase configuration at startup. The
+/// same cached guard is then reused for local JWKS verification and provider
+/// races on every request.
+pub fn initialize(shared_auth_base: &str) -> Result<(), String> {
+    configured_guard(shared_auth_base).map(|_| ())
+}
+
+fn configured_guard(shared_auth_base: &str) -> Result<&'static Guard, String> {
+    let configured = ADMIN_GUARD.get_or_init(|| build_guard(shared_auth_base));
+    let configured = configured.as_ref().map_err(Clone::clone)?;
+    if configured.shared_auth_base != shared_auth_base.trim_end_matches('/') {
+        return Err("Shared Auth base URL changed after guard initialization".to_string());
+    }
+    Ok(&configured.guard)
+}
+
+fn build_guard(shared_auth_base: &str) -> Result<ConfiguredGuard, String> {
+    let shared_auth_base = shared_auth_base.trim_end_matches('/').to_string();
+    if shared_auth_base.is_empty() {
+        return Err("SHARED_AUTH_URL must be set".to_string());
+    }
+    let guard = Guard::new(Config {
+        shared_auth_base: shared_auth_base.clone(),
+        issuer: required_env("SHARED_AUTH_ISSUER")?,
+        audience: required_env("SHARED_AUTH_AUDIENCE")?,
+        supabase_url: required_env("SUPABASE_URL")?,
+        supabase_api_key: required_env("SUPABASE_PUBLISHABLE_KEY")?,
+        project: "fiducia-admin".to_string(),
+        introspect_secret: required_env("SHARED_AUTH_INTROSPECT_SECRET")?,
+        required_roles: vec!["admin".to_string(), "operator".to_string()],
+        arm_timeout: Duration::from_secs(10),
+        race_deadline: Duration::from_secs(12),
+        jwks_ttl: Duration::from_secs(300),
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(ConfiguredGuard {
+        shared_auth_base,
+        guard,
+    })
+}
+
+fn required_env(name: &str) -> Result<String, String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{name} must be set"))
+}
 
 #[derive(Clone)]
 pub struct Session {
@@ -110,7 +168,14 @@ pub struct VerifiedSession {
 /// Duplicate/malformed credentials fail closed. Existing Shared Auth cookies are
 /// verified locally; legacy provider cookies may complete the dual race but are
 /// never silently rewritten in a response-less request path.
-pub async fn current(headers: &HeaderMap, guard: &Guard) -> Option<Session> {
+pub async fn current(headers: &HeaderMap, shared_auth_base: &str) -> Option<Session> {
+    let guard = match configured_guard(shared_auth_base) {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::error!(%error, "admin Shared Auth guard is unavailable");
+            return None;
+        }
+    };
     if let Some(token) = authorization_token(headers) {
         return from_token(guard, &token, false)
             .await
@@ -132,7 +197,8 @@ pub async fn current(headers: &HeaderMap, guard: &Guard) -> Option<Session> {
 
 /// Verify a login-time provider bearer and retain a successful Shared Auth
 /// session upgrade. The caller must refuse login when the upgrade is absent.
-pub async fn from_bearer(guard: &Guard, token: &str) -> Option<VerifiedSession> {
+pub async fn from_bearer(shared_auth_base: &str, token: &str) -> Option<VerifiedSession> {
+    let guard = configured_guard(shared_auth_base).ok()?;
     from_token(guard, token, false).await
 }
 

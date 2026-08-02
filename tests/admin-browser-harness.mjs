@@ -152,6 +152,7 @@ export async function startAdmin() {
   if (process.env.FIDUCIA_ADMIN_TEST_URL) {
     return {
       url: process.env.FIDUCIA_ADMIN_TEST_URL.replace(/\/$/, ""),
+      ownsControlPlane: false,
       brainRequests: [],
       stop: async () => {},
     };
@@ -207,6 +208,7 @@ export async function startAdmin() {
 
   return {
     url: server.url,
+    ownsControlPlane: true,
     brainRequests: controlPlane.requests,
     stop,
   };

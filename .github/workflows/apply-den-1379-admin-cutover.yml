@@ -5,13 +5,15 @@ on:
     branches: [agent/den-1379-shared-auth-cutover]
     paths:
       - ".github/workflows/apply-den-1379-admin-cutover.yml"
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: github.actor != 'github-actions[bot]'
+    if: github.actor != 'github-actions[bot]' && (github.event_name == 'push' || github.head_ref == 'agent/den-1379-shared-auth-cutover')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

@@ -1,1 +1,1 @@
-apply admin DEN-1379 cutover patch once
+execute admin DEN-1379 cutover patch now

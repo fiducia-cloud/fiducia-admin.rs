@@ -1,0 +1,1 @@
+This temporary pull request now includes the enabled ordinary pull-request helper from current `main`. Its synchronize event applies the hardcoded patch to admin PR #23 and generates the exact Cargo lockfile.

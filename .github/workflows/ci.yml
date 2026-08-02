@@ -29,17 +29,20 @@ jobs:
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
         with:
           args: repo/.github/workflows/ci.yml repo/.github/workflows/docker.yml
+      - name: Sibling dependency pins stay synchronized
+        working-directory: repo
+        run: python3 scripts/check-sibling-pins.py
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-interfaces
-          ref: bd718cd72d72aa330534f3688f8fb1ce90c19d10
+          ref: 6081bc3f3b7cbe0312870968b61acc38ca91c66a
           path: fiducia-interfaces
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-sync
-          ref: 6de4f016769960023f8e5a7cfb8a989d7fb2b302
+          ref: e4cb47c9582e11de62c0f19ce3511d3b7c1cce04
           path: fiducia-sync
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
@@ -68,3 +71,22 @@ jobs:
       - name: audit
         working-directory: repo
         run: cargo audit
+
+  container-build:
+    name: production container graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Sibling dependency pins stay synchronized
+        run: python3 scripts/check-sibling-pins.py
+      - name: Build the non-publishing production image
+        run: |
+          docker build \
+            --build-arg INTERFACES_REF=6081bc3f3b7cbe0312870968b61acc38ca91c66a \
+            --build-arg SYNC_REF=e4cb47c9582e11de62c0f19ce3511d3b7c1cce04 \
+            --tag fiducia-admin:pr .

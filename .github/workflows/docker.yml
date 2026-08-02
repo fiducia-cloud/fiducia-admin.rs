@@ -32,8 +32,8 @@ jobs:
         with:
           context: .
           build-args: |
-            INTERFACES_REF=bd718cd72d72aa330534f3688f8fb1ce90c19d10
-            SYNC_REF=6de4f016769960023f8e5a7cfb8a989d7fb2b302
+            INTERFACES_REF=6081bc3f3b7cbe0312870968b61acc38ca91c66a
+            SYNC_REF=e4cb47c9582e11de62c0f19ce3511d3b7c1cce04
           push: true
           pull: true
           provenance: mode=max

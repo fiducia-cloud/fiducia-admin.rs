@@ -56,15 +56,17 @@ test("playwright drives the isolated admin dashboard and infra scale flow", asyn
   assert.equal(await page.locator('nav a[href="/account"]').count(), 0);
 
   // A context-sharing request proves that the dev-admin browser session is not
-  // enough to authorize a mutation from a foreign Origin. The control-plane
-  // stub must remain untouched by the rejected request.
+  // enough to authorize a mutation from a foreign Origin. When this harness owns
+  // the strict control-plane stub, the rejected request must not reach it.
   const crossOrigin = await page.request.post(`${server.url}/infra/scale`, {
     headers: { origin: "https://attacker.example" },
     form: { csrf_token: "forged", target_nodes: "9" },
   });
   assert.equal(crossOrigin.status(), 403);
   assert.equal((await crossOrigin.json()).error, "admin_request_rejected");
-  assert.equal(server.brainRequests.length, 0);
+  if (server.ownsControlPlane) {
+    assert.equal(server.brainRequests.length, 0);
+  }
 
   // Infra: set target_nodes, Apply — htmx swaps the infra panel in place.
   await page.locator('nav a[href="/infra"]').click();
@@ -74,31 +76,37 @@ test("playwright drives the isolated admin dashboard and infra scale flow", asyn
   await page.getByRole("button", { name: "Apply" }).click();
   await assertVisibleText(page, "Scale to 7 nodes requested.");
 
-  const scaleRequests = server.brainRequests.filter(
-    (request) => request.method === "POST" && request.path === "/v1/scale",
-  );
-  assert.equal(scaleRequests.length, 1);
-  assert.equal(scaleRequests[0].authorized, true);
-  assert.deepEqual(scaleRequests[0].body, {
-    target_nodes: 7,
-    replication_factor: 3,
-  });
-  assert.ok(
-    server.brainRequests
-      .filter((request) => request.path.startsWith("/v1/"))
-      .every((request) => request.authorized),
-    "every admin-to-brain request must carry the trusted-hop credential",
-  );
-  assert.ok(
-    server.brainRequests.some(
-      (request) => request.method === "GET" && request.path === "/v1/nodes",
-    ),
-  );
-  assert.ok(
-    server.brainRequests.some(
-      (request) => request.method === "GET" && request.path === "/v1/placement",
-    ),
-  );
+  // The owned stub turns the browser journey into a contract test: every
+  // admin-to-brain request carries the trusted-hop secret, and scale preserves
+  // the replication baseline. External-server smoke runs still validate the UI
+  // and browser boundary without pretending they can inspect another process.
+  if (server.ownsControlPlane) {
+    const scaleRequests = server.brainRequests.filter(
+      (request) => request.method === "POST" && request.path === "/v1/scale",
+    );
+    assert.equal(scaleRequests.length, 1);
+    assert.equal(scaleRequests[0].authorized, true);
+    assert.deepEqual(scaleRequests[0].body, {
+      target_nodes: 7,
+      replication_factor: 3,
+    });
+    assert.ok(
+      server.brainRequests
+        .filter((request) => request.path.startsWith("/v1/"))
+        .every((request) => request.authorized),
+      "every admin-to-brain request must carry the trusted-hop credential",
+    );
+    assert.ok(
+      server.brainRequests.some(
+        (request) => request.method === "GET" && request.path === "/v1/nodes",
+      ),
+    );
+    assert.ok(
+      server.brainRequests.some(
+        (request) => request.method === "GET" && request.path === "/v1/placement",
+      ),
+    );
+  }
 
   assert.deepEqual(pageErrors, []);
 });

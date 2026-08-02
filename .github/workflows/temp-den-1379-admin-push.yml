@@ -1,7 +1,7 @@
 name: temp-den-1379-admin-pr-event
 
 on:
-  pull_request_target:
+  pull_request:
     types: [opened, synchronize, ready_for_review]
 
 permissions:

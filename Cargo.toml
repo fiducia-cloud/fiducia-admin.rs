@@ -16,7 +16,8 @@ sha2 = "0.10"
 tower-http = { version = "0.5", features = ["trace", "timeout", "limit", "catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# HTTP client for verifying sessions with fiducia-auth and calling fiducia-brain.
+# HTTP client for the Supabase password grant and fiducia-brain operations.
+# Session verification and the provider race live in fiducia-shared-auth-guard.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Compile-checked, auto-escaping HTML templates (the MASH "M"). Replaces the
 # hand-rolled string templates + esc() in views.rs; the axum feature makes
@@ -29,6 +30,10 @@ fiducia-telemetry = { git = "https://github.com/fiducia-cloud/fiducia-telemetry.
 # Shared API payload/error contract (generated from fiducia-interfaces schemas) —
 # the one source of truth for the types every fiducia service speaks.
 fiducia-interfaces = { path = "../fiducia-interfaces/generated/rust" }
+# Deployable Shared Auth protocol adapter. This verifies existing Shared Auth
+# JWTs locally and races provider exchange against the ADMIN Supabase project;
+# it never derives privileged roles from direct provider metadata.
+fiducia-shared-auth-guard = { path = "../fiducia-interfaces/adapters/shared-auth-rust" }
 
 # The local-first sync protocol core (native build, no wasm). The admin server
 # builds its fiducia:sync change frames and write-acks from THESE types so it and

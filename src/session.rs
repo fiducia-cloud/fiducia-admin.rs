@@ -382,10 +382,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(
-            session.user_id,
-            "11111111-1111-4111-8111-111111111111"
-        );
+        assert_eq!(session.user_id, "11111111-1111-4111-8111-111111111111");
         assert!(session.is_admin);
         assert!(session.is_browser_session());
         let debug = format!("{session:?}");
@@ -395,18 +392,14 @@ mod tests {
 
     #[test]
     fn customer_or_wrong_project_identity_cannot_create_admin_session() {
-        assert!(session_from_identity(
-            &identity("fiducia-admin", &["customer"]),
-            "token",
-            false,
-        )
-        .is_none());
-        assert!(session_from_identity(
-            &identity("fiducia-customer", &["admin"]),
-            "token",
-            false,
-        )
-        .is_none());
+        assert!(
+            session_from_identity(&identity("fiducia-admin", &["customer"]), "token", false,)
+                .is_none()
+        );
+        assert!(
+            session_from_identity(&identity("fiducia-customer", &["admin"]), "token", false,)
+                .is_none()
+        );
     }
 
     #[test]
@@ -435,7 +428,13 @@ mod tests {
 
     #[test]
     fn release_cookie_names_are_host_prefixed() {
-        assert_eq!(admin_session_cookie_name(true), "__Host-fiducia_admin_session");
-        assert_eq!(login_csrf_cookie_name(true), "__Host-fiducia_admin_login_csrf");
+        assert_eq!(
+            admin_session_cookie_name(true),
+            "__Host-fiducia_admin_session"
+        );
+        assert_eq!(
+            login_csrf_cookie_name(true),
+            "__Host-fiducia_admin_login_csrf"
+        );
     }
 }

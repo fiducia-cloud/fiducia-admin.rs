@@ -5,6 +5,8 @@ on:
     types: [created]
   pull_request_target:
     types: [ready_for_review]
+  pull_request:
+    types: [ready_for_review]
 
 permissions:
   contents: write
@@ -23,6 +25,14 @@ jobs:
         github.event.sender.id == 11139560
       ) || (
         github.event_name == 'pull_request_target' &&
+        github.event.pull_request.number == 37 &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.head.ref == 'agent/admin-shared-auth-cutover-v2' &&
+        github.event.pull_request.head.sha == '6c78538e49ea23d2b527623ad76b54ecb8a2ccc3' &&
+        github.event.sender.login == 'ORESoftware' &&
+        github.event.sender.id == 11139560
+      ) || (
+        github.event_name == 'pull_request' &&
         github.event.pull_request.number == 37 &&
         github.event.pull_request.head.repo.full_name == github.repository &&
         github.event.pull_request.head.ref == 'agent/admin-shared-auth-cutover-v2' &&

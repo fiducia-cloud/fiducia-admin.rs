@@ -31,3 +31,7 @@ A Shared Auth role is necessary but not sufficient. The Supabase subject must al
 6. Remove `FIDUCIA_AUTH_URL` from the admin deployment after rollback observation completes.
 
 The pull request's generated lockfile and formatting are produced from the exact pinned sibling graph before review. A documentation-only synchronization commit activates the one-time, PR-scoped cutover helper; the resulting feature commit restores the normal read-only CI workflow.
+
+## Pull-request validation
+
+Every cutover update is validated by the normal read-only workflow: Rust formatting, Clippy, unit and integration tests, dependency audit, production-container construction, and the three real-browser dual-auth journeys. The workflow may inspect pinned sibling repositories, but it never patches or pushes the feature branch.

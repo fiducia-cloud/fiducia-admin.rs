@@ -1,0 +1,39 @@
+name: TEMP DEN-1379 merge main into admin cutover
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: temp-den-1379-merge-main
+  cancel-in-progress: false
+
+jobs:
+  merge-main:
+    if: >-
+      github.event.issue.pull_request &&
+      github.event.issue.number == 23 &&
+      github.event.comment.body == '/merge-den-1379-main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the exact cutover branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: agent/den-1379-shared-auth-cutover
+          fetch-depth: 0
+      - name: Merge current main without discarding either history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch origin main
+          git merge --no-ff --no-edit origin/main
+          git rm --force .github/workflows/temp-den-1379-merge-main.yml
+          git commit -m 'chore: consume temporary DEN-1379 merge helper'
+          git push origin HEAD:agent/den-1379-shared-auth-cutover

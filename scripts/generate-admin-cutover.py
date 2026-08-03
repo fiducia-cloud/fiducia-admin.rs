@@ -8,7 +8,6 @@ committed to the feature branch.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 MAIN = Path("src/main.rs")
@@ -29,12 +28,10 @@ replace_once(
     "//! Shared Auth before any reusable browser session is persisted.\n",
     "module auth description",
 )
-replace_once(
-    "    auth_url: String,\n",
-    "    shared_auth_url: String,\n",
-    "AppState auth URL field",
-)
 
+# Keep the private AppState field name stable so existing router/unit fixtures do
+# not churn. Its source and semantics change: it now contains SHARED_AUTH_URL,
+# never the removed legacy FIDUCIA_AUTH_URL endpoint.
 state_marker = "    let state = Arc::new(AppState {\n"
 state_prefix = (
     "    let shared_auth_url = required_env(\"SHARED_AUTH_URL\")?;\n"
@@ -52,7 +49,7 @@ state_prefix = (
 replace_once(state_marker, state_prefix, "AppState initialization marker")
 replace_once(
     "        auth_url: required_env(\"FIDUCIA_AUTH_URL\")?,\n",
-    "        shared_auth_url,\n",
+    "        auth_url: shared_auth_url,\n",
     "legacy auth environment field",
 )
 replace_once(
@@ -66,12 +63,9 @@ replace_once(
     "Supabase publishable-key state field",
 )
 
-text = text.replace("&st.auth_url", "&st.shared_auth_url")
-text = re.sub(r"(?<!shared_)auth_url:", "shared_auth_url:", text)
-
 login_start_marker = (
     "    let Some(session) = "
-    "session::from_bearer(&st.shared_auth_url, &password_session.access_token).await\n"
+    "session::from_bearer(&st.auth_url, &password_session.access_token).await\n"
 )
 login_end_marker = (
     "    append_set_cookie(\n"
@@ -90,7 +84,7 @@ start = text.index(login_start_marker)
 end = text.index(login_end_marker, start) + len(login_end_marker)
 new_login = (
     "    let Some(verified) =\n"
-    "        session::from_bearer(&st.shared_auth_url, &password_session.access_token).await\n"
+    "        session::from_bearer(&st.auth_url, &password_session.access_token).await\n"
     "    else {\n"
     "        return login_page(\n"
     "            &st,\n"
@@ -125,11 +119,11 @@ text = text[:start] + new_login + text[end:]
 
 if "FIDUCIA_AUTH_URL" in text:
     raise SystemExit("legacy FIDUCIA_AUTH_URL remains in src/main.rs")
-if ".auth_url" in text:
-    raise SystemExit("legacy AppState auth_url access remains in src/main.rs")
 if "make_session_cookie(&password_session.access_token)" in text:
     raise SystemExit("raw provider token would still be persisted")
 if text.count("shared_auth_session_upgrade_missing") != 1:
     raise SystemExit("login no-upgrade fail-closed path is missing or duplicated")
+if text.count('required_env("SHARED_AUTH_URL")') != 1:
+    raise SystemExit("Shared Auth URL must be read exactly once during startup")
 
 MAIN.write_text(text, encoding="utf-8")

@@ -185,7 +185,10 @@ export async function startAdmin() {
       env: {
         FIDUCIA_ADMIN_DEV_SESSION: "admin",
         FIDUCIA_INSECURE_COOKIES: "1",
-        FIDUCIA_AUTH_URL: controlPlane.url,
+        SHARED_AUTH_URL: controlPlane.url,
+        SHARED_AUTH_ISSUER: "https://auth.fiducia.invalid",
+        SHARED_AUTH_AUDIENCE: "fiducia-admin",
+        SHARED_AUTH_INTROSPECT_SECRET: TEST_INTERNAL_SECRET,
         FIDUCIA_BRAIN_URL: controlPlane.url,
         FIDUCIA_INTERNAL_SECRET: TEST_INTERNAL_SECRET,
         SUPABASE_URL: controlPlane.url,

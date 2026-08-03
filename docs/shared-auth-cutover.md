@@ -30,4 +30,4 @@ A Shared Auth role is necessary but not sufficient. The Supabase subject must al
 5. Verify customer-project and disabled-operator negative cases.
 6. Remove `FIDUCIA_AUTH_URL` from the admin deployment after rollback observation completes.
 
-The pull request's generated lockfile and formatting are produced from the exact pinned sibling graph before review. The helper trigger is intentionally a documentation-only synchronization event.
+The pull request's generated lockfile and formatting are produced from the exact pinned sibling graph before review. A documentation-only synchronization commit activates the one-time, PR-scoped cutover helper; the resulting feature commit restores the normal read-only CI workflow.

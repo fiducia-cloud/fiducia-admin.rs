@@ -1,0 +1,126 @@
+name: import-admin-cutover-artifact
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  actions: read
+  pull-requests: read
+
+jobs:
+  import:
+    if: >-
+      github.event.issue.pull_request &&
+      github.event.issue.number == 37 &&
+      github.event.comment.body == '/import-admin-cutover-artifact-8845586010' &&
+      github.event.sender.login == 'ORESoftware' &&
+      github.event.sender.id == 11139560
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_BRANCH: agent/admin-shared-auth-cutover-v2
+      EXPECTED_HEAD: 6c78538e49ea23d2b527623ad76b54ecb8a2ccc3
+      ARTIFACT_ID: "8845586010"
+      ARTIFACT_ZIP_SHA256: cecd44f49937b34c78bdd4e99b4a57962fe70b3bd929834db415843e88de8315
+      ARTIFACT_TGZ_SHA256: 504d0561134b65487f54bc4588b506d92e4bde94b0e494f875700d2c5659e438
+      MAIN_RS_SHA256: 5b668ad9f79f7171dc23308f55a7a27566a5574371015f6a8f6cc2a05cc3df35
+      CARGO_LOCK_SHA256: 0162fc11447d64ed8531b593146c1de378b33edb642e4657826d8edaff310f02
+      CLEAN_MAIN: 89c80b65374390ce8ad03281889711b0be6c3546
+      INTERFACES_PIN: f64cefd987ed16173c526b33a92fb90cbdfcac45
+    steps:
+      - name: Verify immutable PR target
+        run: |
+          set -euo pipefail
+          pr_json=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/37")
+          test "$(jq -r '.head.repo.full_name' <<<"$pr_json")" = "$GITHUB_REPOSITORY"
+          test "$(jq -r '.head.ref' <<<"$pr_json")" = "$TARGET_BRANCH"
+          test "$(jq -r '.head.sha' <<<"$pr_json")" = "$EXPECTED_HEAD"
+          test "$(jq -r '.state' <<<"$pr_json")" = "open"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download and verify the exact generated artifact
+        run: |
+          set -euo pipefail
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            > artifact.zip
+          echo "${ARTIFACT_ZIP_SHA256}  artifact.zip" | sha256sum --check --strict
+          unzip -q artifact.zip -d artifact
+          echo "${ARTIFACT_TGZ_SHA256}  artifact/admin-cutover-generated.tgz" \
+            | sha256sum --check --strict
+          mkdir generated
+          tar -xzf artifact/admin-cutover-generated.tgz -C generated
+          echo "${MAIN_RS_SHA256}  generated/src/main.rs" | sha256sum --check --strict
+          echo "${CARGO_LOCK_SHA256}  generated/Cargo.lock" | sha256sum --check --strict
+
+      - name: Import generated source and restore final read-only CI
+        run: |
+          set -euo pipefail
+          cp generated/src/main.rs src/main.rs
+          cp generated/Cargo.lock Cargo.lock
+          git show "${CLEAN_MAIN}:.github/workflows/ci.yml" > .github/workflows/ci.yml
+          rm -f \
+            .github/workflows/admin-cutover-source-artifact.yml \
+            scripts/generate-admin-cutover.py
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          old_pins = {
+              "6081bc3f3b7cbe0312870968b61acc38ca91c66a",
+              "0ad257b6708117dcc3643a9fd15b0f92ca394c1f",
+          }
+          new_pin = "f64cefd987ed16173c526b33a92fb90cbdfcac45"
+          paths = [
+              Path("Dockerfile"),
+              Path("dependency-pins.json"),
+              Path(".github/workflows/ci.yml"),
+              Path(".github/workflows/docker.yml"),
+          ]
+          for path in paths:
+              value = path.read_text()
+              for old in old_pins:
+                  value = value.replace(old, new_pin)
+              if new_pin not in value:
+                  raise SystemExit(f"{path}: current interfaces pin is missing")
+              if any(old in value for old in old_pins):
+                  raise SystemExit(f"{path}: stale interfaces pin remains")
+              path.write_text(value)
+          PY
+
+          python3 -m json.tool dependency-pins.json >/dev/null
+          python3 scripts/check-sibling-pins.py
+          git diff --check
+          test ! -e .github/workflows/admin-cutover-source-artifact.yml
+          test ! -e scripts/generate-admin-cutover.py
+          ! grep -R --line-number --fixed-strings 'FIDUCIA_AUTH_URL' src tests docs Cargo.toml
+          grep -q --fixed-strings 'required_env("SHARED_AUTH_URL")' src/main.rs
+          grep -q --fixed-strings 'make_session_cookie(session_upgrade.access_token())' src/main.rs
+
+      - name: Commit only the verified cutover files
+        run: |
+          set -euo pipefail
+          rm -rf artifact artifact.zip generated
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            src/main.rs \
+            Cargo.lock \
+            Dockerfile \
+            dependency-pins.json \
+            .github/workflows/ci.yml \
+            .github/workflows/docker.yml \
+            .github/workflows/admin-cutover-source-artifact.yml \
+            scripts/generate-admin-cutover.py
+          git diff --cached --check
+          git commit -m "feat(auth): complete admin Shared Auth cutover"
+          git push origin "HEAD:${TARGET_BRANCH}"

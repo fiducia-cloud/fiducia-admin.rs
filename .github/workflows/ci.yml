@@ -14,6 +14,162 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  cutover-source-artifact:
+    name: admin cutover source artifact
+    if: github.head_ref == 'agent/admin-shared-auth-cutover-v2'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          path: repo
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: f64cefd987ed16173c526b33a92fb90cbdfcac45
+          path: fiducia-interfaces
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: fiducia-cloud/fiducia-sync
+          ref: e4cb47c9582e11de62c0f19ce3511d3b7c1cce04
+          path: fiducia-sync
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy
+      - name: Apply exact runtime wiring
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          main = Path("src/main.rs")
+          text = main.read_text()
+          text = text.replace(
+              "//! Auth is a Supabase session (verified through `fiducia-auth`). This is the\n",
+              "//! Auth starts at the isolated ADMIN Supabase project and is upgraded through\n"
+              "//! Shared Auth before any reusable browser session is persisted.\n",
+              1,
+          )
+          if "    auth_url: String,\n" not in text:
+              raise SystemExit("AppState auth_url field did not match")
+          text = text.replace(
+              "    auth_url: String,\n",
+              "    shared_auth_url: String,\n",
+              1,
+          )
+
+          old_state = '''    let state = Arc::new(AppState {
+              auth_url: required_env("FIDUCIA_AUTH_URL")?,
+              brain_url: required_env("FIDUCIA_BRAIN_URL")?,
+              supabase_url: required_env("SUPABASE_URL")?,
+              supabase_publishable_key: required_env("SUPABASE_PUBLISHABLE_KEY")?,
+          '''
+          new_state = '''    let shared_auth_url = required_env("SHARED_AUTH_URL")?;
+              session::initialize(&shared_auth_url).map_err(|error| {
+                  io::Error::new(
+                      io::ErrorKind::InvalidInput,
+                      format!("invalid Shared Auth configuration: {error}"),
+                  )
+              })?;
+              let supabase_url = required_env("SUPABASE_URL")?;
+              let supabase_publishable_key = required_env("SUPABASE_PUBLISHABLE_KEY")?;
+
+              let state = Arc::new(AppState {
+                  shared_auth_url,
+                  brain_url: required_env("FIDUCIA_BRAIN_URL")?,
+                  supabase_url,
+                  supabase_publishable_key,
+          '''
+          if old_state not in text:
+              raise SystemExit("admin startup state block did not match")
+          text = text.replace(old_state, new_state, 1)
+          text = text.replace("&st.auth_url", "&st.shared_auth_url")
+          text = re.sub(r"(?<!shared_)auth_url:", "shared_auth_url:", text)
+
+          old_login = '''    let Some(session) = session::from_bearer(&st.shared_auth_url, &password_session.access_token).await
+              else {
+                  return login_page(&st, Some("The identity could not be verified."));
+              };
+              if !session.is_admin {
+                  return (StatusCode::FORBIDDEN, views::forbidden(&session, None)).into_response();
+              }
+              match operator_is_enabled(&st, &session).await {
+                  Ok(true) => {}
+                  Ok(false) => {
+                      return (StatusCode::FORBIDDEN, views::forbidden(&session, None)).into_response()
+                  }
+                  Err(error) => return dependency_error("operator_registry_unavailable", error),
+              }
+
+              let mut response = redirect("/");
+              append_set_cookie(
+                  &mut response,
+                  &make_session_cookie(&password_session.access_token),
+              );
+          '''
+          new_login = '''    let Some(verified) =
+                  session::from_bearer(&st.shared_auth_url, &password_session.access_token).await
+              else {
+                  return login_page(
+                      &st,
+                      Some("Shared Auth could not authorize this admin identity."),
+                  );
+              };
+              let session = verified.session;
+              let Some(session_upgrade) = verified.session_upgrade else {
+                  return dependency_error(
+                      "shared_auth_session_upgrade_missing",
+                      "Shared Auth authorized the provider token without issuing a reusable session",
+                  );
+              };
+              if !session.is_admin {
+                  return (StatusCode::FORBIDDEN, views::forbidden(&session, None)).into_response();
+              }
+              match operator_is_enabled(&st, &session).await {
+                  Ok(true) => {}
+                  Ok(false) => {
+                      return (StatusCode::FORBIDDEN, views::forbidden(&session, None)).into_response()
+                  }
+                  Err(error) => return dependency_error("operator_registry_unavailable", error),
+              }
+
+              let mut response = redirect("/");
+              append_set_cookie(
+                  &mut response,
+                  &make_session_cookie(session_upgrade.access_token()),
+              );
+          '''
+          if old_login not in text:
+              raise SystemExit("admin login/session-rotation block did not match")
+          text = text.replace(old_login, new_login, 1)
+          if "FIDUCIA_AUTH_URL" in text or ".auth_url" in text:
+              raise SystemExit("legacy auth URL remains in src/main.rs")
+          main.write_text(text)
+          PY
+      - name: Generate exact graph, format, and compile
+        working-directory: repo
+        run: |
+          cargo generate-lockfile
+          cargo fmt --all
+          cargo check --locked --all-targets --all-features
+      - name: Package generated files
+        working-directory: repo
+        run: tar -czf ../admin-cutover-generated.tgz src/main.rs Cargo.lock
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: admin-cutover-generated
+          path: admin-cutover-generated.tgz
+          if-no-files-found: error
+          retention-days: 1
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45

@@ -20,7 +20,7 @@ jobs:
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
         github.event.issue.number == 37 &&
-        github.event.comment.body == '/import-admin-cutover-artifact-8845586010' &&
+        github.event.comment.body == '/import-admin-cutover-artifact-8911286436' &&
         github.event.sender.login == 'ORESoftware' &&
         github.event.sender.id == 11139560
       ) || (
@@ -46,11 +46,11 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       TARGET_BRANCH: agent/admin-shared-auth-cutover-v2
       EXPECTED_HEAD: 6c78538e49ea23d2b527623ad76b54ecb8a2ccc3
-      ARTIFACT_ID: "8845586010"
-      ARTIFACT_ZIP_SHA256: cecd44f49937b34c78bdd4e99b4a57962fe70b3bd929834db415843e88de8315
-      ARTIFACT_TGZ_SHA256: 504d0561134b65487f54bc4588b506d92e4bde94b0e494f875700d2c5659e438
+      ARTIFACT_ID: "8911286436"
+      ARTIFACT_ZIP_SHA256: c1c9484158bc429ca77088d29ac0fbba2ec2456ca38378ff5a657fd70e73c1c5
+      ARTIFACT_TGZ_SHA256: 717832f92d5616e351d5f1b5ebb0f450dde5ce813ee008505272ae5927902545
       MAIN_RS_SHA256: 5b668ad9f79f7171dc23308f55a7a27566a5574371015f6a8f6cc2a05cc3df35
-      CARGO_LOCK_SHA256: 0162fc11447d64ed8531b593146c1de378b33edb642e4657826d8edaff310f02
+      CARGO_LOCK_SHA256: cf75d6541ce7c823fc96a07b2e9a000d3038791d41be2570466f31b1e405dad8
       CLEAN_MAIN: 89c80b65374390ce8ad03281889711b0be6c3546
       INTERFACES_PIN: f64cefd987ed16173c526b33a92fb90cbdfcac45
     steps:

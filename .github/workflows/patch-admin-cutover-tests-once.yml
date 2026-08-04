@@ -139,9 +139,9 @@ jobs:
           cluster = Path("src/cluster_tests.rs")
           source = cluster.read_text()
           needle = 'Some("verified.jwt")'
-          if source.count(needle) != 9:
+          if source.count(needle) != 10:
               raise SystemExit(
-                  f"expected nine old cluster credentials, found {source.count(needle)}"
+                  f"expected ten old cluster credentials, found {source.count(needle)}"
               )
           source = source.replace(needle, 'Some("test-user:customer")', 2)
           source = source.replace(needle, 'Some("test-admin:dev-admin")')

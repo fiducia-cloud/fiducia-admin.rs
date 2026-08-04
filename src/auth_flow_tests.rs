@@ -16,32 +16,51 @@ pub(super) async fn spawn_mock(app: Router) -> (String, tokio::task::JoinHandle<
 }
 
 #[tokio::test]
-async fn login_requires_the_operator_registry_after_trusted_auth() {
+async fn login_requires_the_operator_registry_after_shared_auth_authorization() {
     let supabase = Router::new().route(
         "/auth/v1/token",
         post(|| async { Json(json!({ "access_token": "verified.jwt" })) }),
     );
-    let auth = Router::new().route(
-        "/v1/me",
-        get(|| async {
-            Json(json!({
-                "user": {
-                    "user_id": "00000000-0000-0000-0000-000000000001",
+    let auth = Router::new()
+        .route(
+            "/auth/exchange",
+            post(|| async {
+                Json(json!({
+                    "access_token": "shared-session-token",
+                    "shared_user_id": "shared-admin-operator",
+                    "provider": "supabase",
+                    "provider_tenant": "fiducia-admin",
+                    "provider_subject": "00000000-0000-4000-8000-000000000001",
+                    "roles": ["operator"]
+                }))
+            }),
+        )
+        .route(
+            "/auth/introspect",
+            post(|| async {
+                Json(json!({
+                    "active": true,
+                    "sub": "shared-admin-operator",
+                    "provider": "supabase",
+                    "provider_tenant": "fiducia-admin",
+                    "provider_subject": "00000000-0000-4000-8000-000000000001",
+                    "project": "fiducia-admin",
+                    "supabase_user_id": "00000000-0000-4000-8000-000000000001",
+                    "sid": "admin-session-id",
                     "email": "operator@example.com",
-                    "orgs": ["org_admin"],
-                    "roles": ["operator"],
-                    "authorization": {
-                        "version": 1,
-                        "surface_audiences": ["fiducia-admin"],
-                        "roles": ["operator"],
-                        "capabilities": ["admin:read", "admin:operate"]
-                    }
-                }
-            }))
-        }),
-    );
+                    "email_verified": true,
+                    "roles": ["operator"]
+                }))
+            }),
+        );
     let (supabase_url, supabase_task) = spawn_mock(supabase).await;
     let (auth_url, auth_task) = spawn_mock(auth).await;
+
+    std::env::set_var("SHARED_AUTH_ISSUER", "https://auth.fiducia.test");
+    std::env::set_var("SHARED_AUTH_AUDIENCE", "fiducia-admin");
+    std::env::set_var("SUPABASE_URL", &supabase_url);
+    std::env::set_var("SUPABASE_PUBLISHABLE_KEY", "public-publishable-key");
+    std::env::set_var("SHARED_AUTH_INTROSPECT_SECRET", "introspection-service");
 
     let state = Arc::new(AppState {
         auth_url,

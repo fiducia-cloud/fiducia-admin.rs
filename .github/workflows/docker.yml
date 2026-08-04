@@ -32,7 +32,7 @@ jobs:
         with:
           context: .
           build-args: |
-            INTERFACES_REF=6081bc3f3b7cbe0312870968b61acc38ca91c66a
+            INTERFACES_REF=f64cefd987ed16173c526b33a92fb90cbdfcac45
             SYNC_REF=e4cb47c9582e11de62c0f19ce3511d3b7c1cce04
           push: true
           pull: true

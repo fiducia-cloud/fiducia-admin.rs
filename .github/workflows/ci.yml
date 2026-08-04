@@ -36,7 +36,7 @@ jobs:
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-interfaces
-          ref: 6081bc3f3b7cbe0312870968b61acc38ca91c66a
+          ref: f64cefd987ed16173c526b33a92fb90cbdfcac45
           path: fiducia-interfaces
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -106,7 +106,7 @@ jobs:
         with:
           persist-credentials: false
           repository: fiducia-cloud/fiducia-interfaces
-          ref: 6081bc3f3b7cbe0312870968b61acc38ca91c66a
+          ref: f64cefd987ed16173c526b33a92fb90cbdfcac45
           path: fiducia-interfaces
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -160,6 +160,6 @@ jobs:
       - name: Build the non-publishing production image
         run: |
           docker build \
-            --build-arg INTERFACES_REF=6081bc3f3b7cbe0312870968b61acc38ca91c66a \
+            --build-arg INTERFACES_REF=f64cefd987ed16173c526b33a92fb90cbdfcac45 \
             --build-arg SYNC_REF=e4cb47c9582e11de62c0f19ce3511d3b7c1cce04 \
             --tag fiducia-admin:pr .

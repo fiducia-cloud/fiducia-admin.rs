@@ -4,7 +4,7 @@ FROM rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates
 WORKDIR /build
-ARG INTERFACES_REF=0ad257b6708117dcc3643a9fd15b0f92ca394c1f
+ARG INTERFACES_REF=f64cefd987ed16173c526b33a92fb90cbdfcac45
 ARG SYNC_REF=e4cb47c9582e11de62c0f19ce3511d3b7c1cce04
 RUN test "${#INTERFACES_REF}" -eq 40 \
     && case "$INTERFACES_REF" in *[!0-9a-f]*) exit 1;; esac \

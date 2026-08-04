@@ -5,7 +5,8 @@
 //! here, while customer accounts, API keys, preferences, and security sessions
 //! live in the separately deployed customer application.
 //!
-//! Auth is a Supabase session (verified through `fiducia-auth`). This is the
+//! Auth starts at the isolated ADMIN Supabase project and is upgraded through
+//! Shared Auth before any reusable browser session is persisted.
 //! authenticated app — distinct from `fiducia-backend`, which serves the public
 //! marketing site.
 //!
@@ -137,11 +138,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request_security = RequestSecurity::from_env(port)?;
     let (stream_tx, _) = broadcast::channel::<String>(256);
 
+    let shared_auth_url = required_env("SHARED_AUTH_URL")?;
+    session::initialize(&shared_auth_url).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid Shared Auth configuration: {error}"),
+        )
+    })?;
+    let supabase_url = required_env("SUPABASE_URL")?;
+    let supabase_publishable_key = required_env("SUPABASE_PUBLISHABLE_KEY")?;
+
     let state = Arc::new(AppState {
-        auth_url: required_env("FIDUCIA_AUTH_URL")?,
+        auth_url: shared_auth_url,
         brain_url: required_env("FIDUCIA_BRAIN_URL")?,
-        supabase_url: required_env("SUPABASE_URL")?,
-        supabase_publishable_key: required_env("SUPABASE_PUBLISHABLE_KEY")?,
+        supabase_url,
+        supabase_publishable_key,
         db: Some(db),
         stream_tx,
         request_security,
@@ -611,9 +622,19 @@ async fn login_submit(
         Ok(session) => session,
         Err(error) => return upstream_error("supabase_login_failed", "supabase", error),
     };
-    let Some(session) = session::from_bearer(&st.auth_url, &password_session.access_token).await
+    let Some(verified) = session::from_bearer(&st.auth_url, &password_session.access_token).await
     else {
-        return login_page(&st, Some("The identity could not be verified."));
+        return login_page(
+            &st,
+            Some("Shared Auth could not authorize this admin identity."),
+        );
+    };
+    let session = verified.session;
+    let Some(session_upgrade) = verified.session_upgrade else {
+        return dependency_error(
+            "shared_auth_session_upgrade_missing",
+            "Shared Auth authorized the provider token without issuing a reusable session",
+        );
     };
     if !session.is_admin {
         return (StatusCode::FORBIDDEN, views::forbidden(&session, None)).into_response();
@@ -629,7 +650,7 @@ async fn login_submit(
     let mut response = redirect("/");
     append_set_cookie(
         &mut response,
-        &make_session_cookie(&password_session.access_token),
+        &make_session_cookie(session_upgrade.access_token()),
     );
     append_set_cookie(&mut response, &clear_login_csrf_cookie());
     response

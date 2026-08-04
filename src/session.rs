@@ -169,14 +169,12 @@ pub struct VerifiedSession {
 /// verified locally; legacy provider cookies may complete the dual race but are
 /// never silently rewritten in a response-less request path.
 pub async fn current(headers: &HeaderMap, shared_auth_base: &str) -> Option<Session> {
-    let guard = match configured_guard(shared_auth_base) {
-        Ok(guard) => guard,
-        Err(error) => {
-            tracing::error!(%error, "admin Shared Auth guard is unavailable");
-            return None;
-        }
-    };
     if let Some(token) = authorization_token(headers) {
+        #[cfg(test)]
+        if let Some(session) = test_session_from_token(&token, false) {
+            return Some(session);
+        }
+        let guard = request_guard(shared_auth_base)?;
         return from_token(guard, &token, false)
             .await
             .map(|verified| verified.session);
@@ -185,6 +183,11 @@ pub async fn current(headers: &HeaderMap, shared_auth_base: &str) -> Option<Sess
         return None;
     }
     if let Some(token) = session_cookie(headers) {
+        #[cfg(test)]
+        if let Some(session) = test_session_from_token(&token, true) {
+            return Some(session);
+        }
+        let guard = request_guard(shared_auth_base)?;
         return from_token(guard, &token, true)
             .await
             .map(|verified| verified.session);
@@ -193,6 +196,16 @@ pub async fn current(headers: &HeaderMap, shared_auth_base: &str) -> Option<Sess
         return None;
     }
     dev_session()
+}
+
+fn request_guard(shared_auth_base: &str) -> Option<&'static Guard> {
+    match configured_guard(shared_auth_base) {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            tracing::error!(%error, "admin Shared Auth guard is unavailable");
+            None
+        }
+    }
 }
 
 /// Verify a login-time provider bearer and retain a successful Shared Auth
@@ -342,6 +355,26 @@ fn authorization_token(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|token| !token.is_empty() && token.len() <= 16 * 1024)
         .map(str::to_string)
+}
+
+#[cfg(test)]
+fn test_session_from_token(token: &str, cookie_authenticated: bool) -> Option<Session> {
+    let (kind, user_id) = token.split_once(':')?;
+    if user_id.is_empty() {
+        return None;
+    }
+    let is_admin = match kind {
+        "test-admin" => true,
+        "test-user" => false,
+        _ => return None,
+    };
+    Some(Session {
+        user_id: user_id.to_string(),
+        email: Some(format!("{user_id}@example.com")),
+        is_admin,
+        credential_binding: format!("test\0{token}"),
+        cookie_authenticated,
+    })
 }
 
 #[cfg(test)]

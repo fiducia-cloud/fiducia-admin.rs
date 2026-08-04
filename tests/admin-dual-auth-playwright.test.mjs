@@ -34,7 +34,7 @@ test("playwright upgrades an admin provider login to a Shared Auth browser sessi
   await submitLogin(page, server.url);
   await page.waitForURL(`${server.url}/`);
   await page.getByRole("heading", { name: "Dashboard" }).waitFor();
-  await page.getByText(browserAuthFixture.email).waitFor();
+  await page.getByText(browserAuthFixture.email, { exact: true }).waitFor();
 
   const cookies = await context.cookies(server.url);
   const sessionCookie = cookies.find((cookie) => cookie.name === ADMIN_COOKIE);

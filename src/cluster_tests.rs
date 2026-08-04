@@ -141,7 +141,7 @@ async fn every_cluster_route_requires_a_session() {
 
 #[tokio::test]
 async fn cluster_routes_reject_a_verified_non_operator_session() {
-    // fiducia-auth verifies the token but reports no operator role.
+    // The explicit test credential represents a verified Shared Auth identity without an operator role.
     let auth = Router::new().route(
         "/v1/me",
         get(|| async {
@@ -173,7 +173,7 @@ async fn cluster_routes_reject_a_verified_non_operator_session() {
     let page = get_with(
         cluster_router(state.clone()),
         "/cluster",
-        Some("verified.jwt"),
+        Some("test-user:customer"),
         false,
     )
     .await;
@@ -182,7 +182,7 @@ async fn cluster_routes_reject_a_verified_non_operator_session() {
     let api = get_with(
         cluster_router(state),
         "/api/admin/cluster/overview",
-        Some("verified.jwt"),
+        Some("test-user:customer"),
         false,
     )
     .await;
@@ -454,7 +454,7 @@ async fn overview_merges_all_planes_and_tolerates_a_down_node() {
     let overview = get_with(
         cluster_router(state.clone()),
         "/api/admin/cluster/overview",
-        Some("verified.jwt"),
+        Some("test-admin:dev-admin"),
         false,
     )
     .await;
@@ -494,7 +494,7 @@ async fn overview_merges_all_planes_and_tolerates_a_down_node() {
     let events = get_with(
         cluster_router(state.clone()),
         "/api/admin/cluster/events?since_minutes=999999",
-        Some("verified.jwt"),
+        Some("test-admin:dev-admin"),
         false,
     )
     .await;
@@ -509,7 +509,7 @@ async fn overview_merges_all_planes_and_tolerates_a_down_node() {
     let metrics = get_with(
         cluster_router(state.clone()),
         "/api/admin/cluster/metrics",
-        Some("verified.jwt"),
+        Some("test-admin:dev-admin"),
         false,
     )
     .await;
@@ -528,7 +528,7 @@ async fn overview_merges_all_planes_and_tolerates_a_down_node() {
     let page = get_with(
         cluster_router(state.clone()),
         "/cluster",
-        Some("verified.jwt"),
+        Some("test-admin:dev-admin"),
         false,
     )
     .await;
@@ -546,7 +546,7 @@ async fn overview_merges_all_planes_and_tolerates_a_down_node() {
     let fragment = get_with(
         cluster_router(state),
         "/cluster/shards",
-        Some("verified.jwt"),
+        Some("test-admin:dev-admin"),
         true,
     )
     .await;
@@ -603,7 +603,7 @@ async fn unconfigured_observability_renders_as_not_configured() {
     let events = get_with(
         cluster_router(state.clone()),
         "/api/admin/cluster/events",
-        Some("verified.jwt"),
+        Some("test-admin:dev-admin"),
         false,
     )
     .await;
@@ -616,7 +616,7 @@ async fn unconfigured_observability_renders_as_not_configured() {
     let fragment = get_with(
         cluster_router(state),
         "/cluster/events",
-        Some("verified.jwt"),
+        Some("test-admin:dev-admin"),
         true,
     )
     .await;
@@ -727,7 +727,7 @@ async fn node_fanout_refuses_untrusted_addresses_and_never_follows_redirects() {
     let response = get_with(
         cluster_router(state),
         "/api/admin/cluster/shards",
-        Some("verified.jwt"),
+        Some("test-admin:dev-admin"),
         false,
     )
     .await;

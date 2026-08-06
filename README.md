@@ -296,3 +296,53 @@ with rationale, `cargo audit` runs clean):
 ## Related
 
 - [`fiducia-auth.rs`](https://github.com/fiducia-cloud/fiducia-auth.rs) · [`fiducia-brain.rs`](https://github.com/fiducia-cloud/fiducia-brain.rs) · [`fiducia-customer.rs`](https://github.com/fiducia-cloud/fiducia-customer.rs)
+
+## Cross-surface delivery
+
+User-visible, operator, lock/lease/consensus/cron, node/shard, placement, audit,
+incident, notification, permission, navigation, or deep-link changes in this
+Rust admin dashboard must be evaluated for:
+
+- `fiducia-cloud/fiducia-flutter` on Android, iOS, Flutter Web/mobile web, and
+  Flutter desktop;
+- `fiducia-cloud/fiducia-desktop.rs`, the planned native GPUI operator app; and
+- Fiducia interfaces, generated clients, coordination/node/cluster/audit
+  schemas, route types, synthetic telemetry fixtures, and conformance tests.
+
+This is judgment-based coordination. Server-only deployment, schema,
+observability, and security hardening may remain server-only. Native dense
+telemetry, keyboard workflows, local incident tools, secure storage,
+notifications, and background operation may be native-specific. Lock/lease/
+consensus/cron state, node/shard health, placement, audit semantics, operator
+approvals, cluster events, permissions, errors, notifications, and navigation
+normally require coordinated updates or an explicit no-change rationale and
+parity follow-up.
+
+High-risk operator writes do not need to be exposed identically on mobile. They
+may remain desktop/web-only when the risk assessment says so, but Flutter must
+still receive safe status, notification, approval, or handoff behavior where
+appropriate. The admin and customer planes remain separate; do not widen the
+customer database, customer cookie, or customer API authority to implement an
+operator feature.
+
+Deep links are HTTPS-first:
+
+```text
+https://<verified-fiducia-owned-host>/open/<route>?<bounded-query>
+```
+
+with `fiducia://` fallback. Web, Flutter, and GPUI desktop must share versioned
+route types and fixtures and support cold start, already-running delivery,
+authentication resume, replay/expiry rejection, browser fallback, and explicit
+confirmation or reauthentication before scaling, membership changes, incident
+actions, lock/lease intervention, or other operator writes.
+
+Internal cluster secrets, node URLs revealing private topology, database
+credentials, operator cookies, CSRF material, bearer/refresh tokens, API keys,
+raw audit records, private telemetry, and privileged commands are prohibited in
+URLs. Use bounded identifiers or short-lived, single-use, audience-bound codes
+and validate route version, operator/org/node/shard/lock/lease/incident identity,
+action, authorization, assurance level, limits, and user intent.
+
+See [`docs/CROSS_SURFACE_DELIVERY.md`](docs/CROSS_SURFACE_DELIVERY.md) and the
+[portfolio policy](https://github.com/ORESoftware/project-registry/blob/main/docs/cross-surface-delivery.md).

@@ -402,6 +402,8 @@ mod tests {
             session_id: Some("22222222-2222-4222-8222-222222222222".to_string()),
             email: Some("operator@example.com".to_string()),
             email_verified: true,
+            assurance_level: 2,
+            auth_methods: vec!["password".to_string(), "totp".to_string()],
             roles: roles.iter().map(|role| (*role).to_string()).collect(),
             authority: Authority::SharedAuth,
         }

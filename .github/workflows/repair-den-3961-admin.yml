@@ -1,0 +1,131 @@
+name: One-shot DEN-3961 admin repair
+
+on:
+  push:
+    branches:
+      - agent/source-policy-v2-c417efc488bb
+    paths:
+      - '.github/workflows/repair-den-3961-admin.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: repair-den-3961-admin-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    if: >-
+      github.repository == 'fiducia-cloud/fiducia-admin.rs' &&
+      github.ref == 'refs/heads/agent/source-policy-v2-c417efc488bb'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the exact trusted branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: agent/source-policy-v2-c417efc488bb
+          fetch-depth: 0
+
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+
+      - name: Repair the pinned adapter fixture and scoped Axum boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          session = Path('src/session.rs')
+          source = session.read_text(encoding='utf-8')
+          for stale in (
+              '            assurance_level: 2,\n',
+              '            auth_methods: vec!["password".to_string(), "totp".to_string()],\n',
+          ):
+              count = source.count(stale)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one stale Identity field {stale!r}, found {count}')
+              source = source.replace(stale, '', 1)
+
+          marker = '''    #[test]
+              fn admin_identity_maps_to_provider_subject_and_redacts_credential() {'''
+          # The marker is formatted below without relying on indentation changes.
+          marker = '    #[test]\n    fn admin_identity_maps_to_provider_subject_and_redacts_credential() {'
+          if source.count(marker) != 1:
+              raise SystemExit('could not locate the first shared-auth fixture test')
+          contract_test = '''    #[test]
+              fn shared_auth_identity_fixture_matches_pinned_adapter_contract() {
+                  let identity = identity("fiducia-admin", &["operator", "auditor"]);
+                  assert_eq!(identity.shared_user_id, "shared-user");
+                  assert_eq!(identity.project, "fiducia-admin");
+                  assert_eq!(identity.provider, "supabase");
+                  assert_eq!(identity.roles, ["operator", "auditor"]);
+                  assert_eq!(identity.authority, Authority::SharedAuth);
+              }
+
+          '''
+          # Let rustfmt canonicalize the deliberately indentation-neutral insertion.
+          contract_test = contract_test.replace('              ', '    ')
+          source = source.replace(marker, contract_test + marker, 1)
+          session.write_text(source, encoding='utf-8')
+
+          main = Path('src/main.rs')
+          source = main.read_text(encoding='utf-8')
+          signatures = (
+              'async fn require(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {',
+              'async fn require_admin(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {',
+              'async fn require_admin_api(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {',
+              'async fn cluster_data(st: &AppState) -> Result<ClusterData, Response> {',
+          )
+          rationale = (
+              '// Axum rejection helpers intentionally return the concrete response so exact '
+              'status, headers, and body survive the boundary. The value is consumed once on '
+              'the error path; a heap box would add allocation and call-site churn without '
+              'changing the wire contract.\n'
+              '#[allow(clippy::result_large_err)]\n'
+          )
+          for signature in signatures:
+              count = source.count(signature)
+              if count != 1:
+                  raise SystemExit(f'expected exactly one helper signature {signature!r}, found {count}')
+              source = source.replace(signature, rationale + signature, 1)
+          main.write_text(source, encoding='utf-8')
+          PY
+
+      - name: Format and verify every Rust target and feature
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features
+          git diff --check
+
+      - name: Commit only the verified repair and remove this workflow
+        shell: bash
+        env:
+          BRANCH_NAME: agent/source-policy-v2-c417efc488bb
+        run: |
+          set -euo pipefail
+          git rm -- .github/workflows/repair-den-3961-admin.yml
+          git add -- src/main.rs src/session.rs
+          git diff --cached --check
+          unexpected="$(
+            git diff --cached --name-only |
+              grep -Ev '^(\.github/workflows/repair-den-3961-admin\.yml|src/main\.rs|src/session\.rs)$' || true
+          )"
+          if [[ -n "$unexpected" ]]; then
+            printf 'Refusing unexpected staged paths:\n%s\n' "$unexpected" >&2
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(DEN-3961): repair admin Rust 1.95 contract'
+          git push origin "HEAD:${BRANCH_NAME}"

@@ -402,11 +402,19 @@ mod tests {
             session_id: Some("22222222-2222-4222-8222-222222222222".to_string()),
             email: Some("operator@example.com".to_string()),
             email_verified: true,
-            assurance_level: 2,
-            auth_methods: vec!["password".to_string(), "totp".to_string()],
             roles: roles.iter().map(|role| (*role).to_string()).collect(),
             authority: Authority::SharedAuth,
         }
+    }
+
+    #[test]
+    fn shared_auth_identity_fixture_matches_pinned_adapter_contract() {
+        let identity = identity("fiducia-admin", &["operator", "auditor"]);
+        assert_eq!(identity.shared_user_id, "shared-user");
+        assert_eq!(identity.project, "fiducia-admin");
+        assert_eq!(identity.provider, "supabase");
+        assert_eq!(identity.roles, ["operator", "auditor"]);
+        assert_eq!(identity.authority, Authority::SharedAuth);
     }
 
     #[test]

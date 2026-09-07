@@ -28,6 +28,24 @@ jobs:
         with:
           ref: agent/source-policy-v2-c417efc488bb
           fetch-depth: 0
+          path: repo
+          persist-credentials: true
+
+      - name: Check out the pinned interface authority
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: fiducia-cloud/fiducia-interfaces
+          ref: f64cefd987ed16173c526b33a92fb90cbdfcac45
+          path: fiducia-interfaces
+          persist-credentials: false
+
+      - name: Check out the pinned sync protocol core
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: fiducia-cloud/fiducia-sync
+          ref: e4cb47c9582e11de62c0f19ce3511d3b7c1cce04
+          path: fiducia-sync
+          persist-credentials: false
 
       - name: Install Rust 1.95
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
@@ -36,6 +54,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Repair the pinned adapter fixture and scoped Axum boundaries
+        working-directory: repo
         shell: bash
         run: |
           set -euo pipefail
@@ -53,25 +72,21 @@ jobs:
                   raise SystemExit(f'expected exactly one stale Identity field {stale!r}, found {count}')
               source = source.replace(stale, '', 1)
 
-          marker = '''    #[test]
-              fn admin_identity_maps_to_provider_subject_and_redacts_credential() {'''
-          # The marker is formatted below without relying on indentation changes.
           marker = '    #[test]\n    fn admin_identity_maps_to_provider_subject_and_redacts_credential() {'
           if source.count(marker) != 1:
               raise SystemExit('could not locate the first shared-auth fixture test')
           contract_test = '''    #[test]
-              fn shared_auth_identity_fixture_matches_pinned_adapter_contract() {
-                  let identity = identity("fiducia-admin", &["operator", "auditor"]);
-                  assert_eq!(identity.shared_user_id, "shared-user");
-                  assert_eq!(identity.project, "fiducia-admin");
-                  assert_eq!(identity.provider, "supabase");
-                  assert_eq!(identity.roles, ["operator", "auditor"]);
-                  assert_eq!(identity.authority, Authority::SharedAuth);
-              }
+          fn shared_auth_identity_fixture_matches_pinned_adapter_contract() {
+              let identity = identity("fiducia-admin", &["operator", "auditor"]);
+              assert_eq!(identity.shared_user_id, "shared-user");
+              assert_eq!(identity.project, "fiducia-admin");
+              assert_eq!(identity.provider, "supabase");
+              assert_eq!(identity.roles, ["operator", "auditor"]);
+              assert_eq!(identity.authority, Authority::SharedAuth);
+          }
 
           '''
-          # Let rustfmt canonicalize the deliberately indentation-neutral insertion.
-          contract_test = contract_test.replace('              ', '    ')
+          contract_test = contract_test.replace('          ', '    ')
           source = source.replace(marker, contract_test + marker, 1)
           session.write_text(source, encoding='utf-8')
 
@@ -99,6 +114,7 @@ jobs:
           PY
 
       - name: Format and verify every Rust target and feature
+        working-directory: repo
         shell: bash
         run: |
           set -euo pipefail
@@ -109,6 +125,7 @@ jobs:
           git diff --check
 
       - name: Commit only the verified repair and remove this workflow
+        working-directory: repo
         shell: bash
         env:
           BRANCH_NAME: agent/source-policy-v2-c417efc488bb

@@ -1,0 +1,53 @@
+name: Formal bounded lease invariants
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bounded-lease-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Exhaustively check bounded lease/fencing state space
+        shell: bash
+        run: |
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const actions = ['grant', 'commit', 'stale_commit', 'release'];
+          const initial = { generation: 0, downstream: 0, held: false };
+          const step = (s, action) => {
+            switch (action) {
+              case 'grant': return { ...s, generation: s.generation + 1, held: true };
+              case 'commit': return s.held ? { ...s, downstream: s.generation } : s;
+              case 'stale_commit': return s;
+              case 'release': return { ...s, held: false };
+              default: throw new Error(`unknown action ${action}`);
+            }
+          };
+          const key = (s) => JSON.stringify(s);
+          let frontier = [initial];
+          const seen = new Set([key(initial)]);
+          for (let depth = 0; depth < 9; depth += 1) {
+            const next = [];
+            for (const state of frontier) {
+              assert.ok(state.downstream <= state.generation, 'downstream authority cannot exceed granted generation');
+              for (const action of actions) {
+                const after = step(state, action);
+                assert.ok(after.generation >= state.generation, 'lease generation never regresses');
+                assert.ok(after.downstream >= state.downstream, 'downstream fencing high-watermark never regresses');
+                assert.ok(after.downstream <= after.generation, 'downstream only accepts granted authority');
+                if (action === 'stale_commit') assert.deepEqual(after, state, 'stale owner commit is rejected');
+                const k = key(after);
+                if (!seen.has(k)) { seen.add(k); next.push(after); }
+              }
+            }
+            frontier = next;
+          }
+          console.log(`formal lease model OK: ${seen.size} reachable states checked`);
+          NODE

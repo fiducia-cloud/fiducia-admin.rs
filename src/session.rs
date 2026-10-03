@@ -408,6 +408,16 @@ mod tests {
     }
 
     #[test]
+    fn shared_auth_identity_fixture_matches_pinned_adapter_contract() {
+        let identity = identity("fiducia-admin", &["operator", "auditor"]);
+        assert_eq!(identity.shared_user_id, "shared-user");
+        assert_eq!(identity.project, "fiducia-admin");
+        assert_eq!(identity.provider, "supabase");
+        assert_eq!(identity.roles, ["operator", "auditor"]);
+        assert_eq!(identity.authority, Authority::SharedAuth);
+    }
+
+    #[test]
     fn admin_identity_maps_to_provider_subject_and_redacts_credential() {
         let session = session_from_identity(
             &identity("fiducia-admin", &["operator"]),

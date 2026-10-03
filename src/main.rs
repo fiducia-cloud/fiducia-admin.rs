@@ -485,6 +485,8 @@ async fn security_headers(request: Request, next: Next) -> Response {
 }
 
 /// Require any signed-in user, else redirect to /login.
+// Axum rejection helpers intentionally return the concrete response so exact status, headers, and body survive the boundary. The value is consumed once on the error path; a heap box would add allocation and call-site churn without changing the wire contract.
+#[allow(clippy::result_large_err)]
 async fn require(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {
     let session = session::current(headers, &st.auth_url)
         .await
@@ -496,6 +498,8 @@ async fn require(headers: &HeaderMap, st: &AppState) -> Result<Session, Response
 }
 
 /// Require the admin role, else 403.
+// Axum rejection helpers intentionally return the concrete response so exact status, headers, and body survive the boundary. The value is consumed once on the error path; a heap box would add allocation and call-site churn without changing the wire contract.
+#[allow(clippy::result_large_err)]
 async fn require_admin(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {
     let s = require(headers, st).await?;
     if !s.is_admin {
@@ -515,6 +519,8 @@ async fn require_admin(headers: &HeaderMap, st: &AppState) -> Result<Session, Re
 /// Require the admin role for JSON/API routes. Same gate as `require_admin` but
 /// returns a JSON error body (not an HTML page), so API callers get a machine-
 /// readable 401/403. Guards the `/api/admin/sync/*` write endpoints.
+// Axum rejection helpers intentionally return the concrete response so exact status, headers, and body survive the boundary. The value is consumed once on the error path; a heap box would add allocation and call-site churn without changing the wire contract.
+#[allow(clippy::result_large_err)]
 async fn require_admin_api(headers: &HeaderMap, st: &AppState) -> Result<Session, Response> {
     match require(headers, st).await {
         Ok(s) if s.is_admin => match operator_is_enabled(st, &s).await {
@@ -1008,6 +1014,8 @@ struct ClusterData {
     quorum: cluster_insight::ClusterQuorum,
 }
 
+// Axum rejection helpers intentionally return the concrete response so exact status, headers, and body survive the boundary. The value is consumed once on the error path; a heap box would add allocation and call-site churn without changing the wire contract.
+#[allow(clippy::result_large_err)]
 async fn cluster_data(st: &AppState) -> Result<ClusterData, Response> {
     let status = upstream::status(&st.brain_url)
         .await

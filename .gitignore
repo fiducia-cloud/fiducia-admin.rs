@@ -30,3 +30,7 @@ pkg/
 pkg-node/
 *-debug.log*
 **/.gradle/
+tmp
+temp
+tmp/worktrees
+temp/worktrees
